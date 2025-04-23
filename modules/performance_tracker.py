@@ -3,7 +3,6 @@ import csv
 import json
 from typing import List, Dict, Optional, Any
 import os
-import time
 import threading
 import tempfile
 import shutil
@@ -79,6 +78,7 @@ class PerformanceTracker:
     def average_trade_duration(self, trades: Optional[List[Dict]] = None) -> float:
         """
         Compute average trade duration in seconds.
+        Supports numeric, datetime, or ISO string timestamps (normalized via pd.to_datetime).
         """
         trades = trades if trades is not None else self.trades
         durations = []
@@ -87,7 +87,9 @@ class PerformanceTracker:
             exit_ = t.get('exit_timestamp') or t.get('exit_time') or t.get('close_timestamp')
             if entry and exit_:
                 try:
-                    durations.append(float(exit_) - float(entry))
+                    entry_dt = pd.to_datetime(entry)
+                    exit_dt = pd.to_datetime(exit_)
+                    durations.append((exit_dt - entry_dt).total_seconds())
                 except Exception:
                     continue
         return sum(durations) / len(durations) if durations else 0.0
@@ -216,4 +218,21 @@ class PerformanceTracker:
         """
         Return all trades as a pandas DataFrame for in-memory analysis.
         """
-        return pd.DataFrame(self.trades) 
+        return pd.DataFrame(self.trades)
+
+    @staticmethod
+    def persist_on_exception(tracker: 'PerformanceTracker'):
+        """
+        Call this in a top-level exception handler to ensure trades are persisted on crash.
+        Example usage:
+            try:
+                ...
+            except Exception:
+                PerformanceTracker.persist_on_exception(tracker)
+                raise
+        """
+        try:
+            tracker.close_session()
+        except Exception as exc:
+            if hasattr(tracker, 'logger'):
+                tracker.logger.error(f"Failed to persist trades on exception: {exc}") 
