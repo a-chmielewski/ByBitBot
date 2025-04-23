@@ -1,0 +1,8 @@
+ccxt
+pybit
+pandas
+numpy
+pandas-ta
+ta-lib
+requests
+python-dotenv 
