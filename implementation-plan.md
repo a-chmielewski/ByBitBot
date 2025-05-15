@@ -12,6 +12,7 @@ Added stateful, non-flooding logging to all strategies and the template. Logs no
 Done
 - Ensured all strategies return required keys ('side', 'size', 'price') in entry signals.
 - Added robust assertion checks and docstring clarifications to prevent missing key errors. 
+- Fixed UnboundLocalError in order_manager.py by initializing 'filled' before order type branching. For market orders, set filled = True and skip partial fill re-check. Ensures robust SL/TP logic and prevents crash.
 
 ### 2. Configuration Management
 
@@ -26,3 +27,7 @@ Done
 Done
 - OrderManager now enforces Bybit minimum order size for all trades, using get_min_order_amount from ExchangeConnector.
 - Strategies can specify a larger size, but never below the exchange minimum. 
+
+### 8. Main Bot Logic
+Done
+Enforced a hard minimum notional value of 5 USDT for every order in OrderManager. Adjusted order size logic and added assertion to guarantee compliance. 

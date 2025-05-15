@@ -82,31 +82,34 @@ def main():
                 latest_row = strat.data.iloc[-1].to_dict()
                 entry_signal = strat.check_entry()
                 if entry_signal:
-                    # Assert required keys are present
                     assert 'side' in entry_signal, f"Strategy {type(strat).__name__} did not return 'side' in entry_signal: {entry_signal}"
                     assert 'price' in entry_signal, f"Strategy {type(strat).__name__} did not return 'price' in entry_signal: {entry_signal}"
-                    # Use SL/TP from entry_signal if present, otherwise compute
+                    assert 'sl_pct' in entry_signal, f"Strategy {type(strat).__name__} did not return 'sl_pct' in entry_signal: {entry_signal}"
+                    assert 'tp_pct' in entry_signal, f"Strategy {type(strat).__name__} did not return 'tp_pct' in entry_signal: {entry_signal}"
+
                     order_details = entry_signal.copy()
-                    if 'stop_loss' not in order_details or 'take_profit' not in order_details:
-                        if hasattr(strat, 'get_risk_parameters') and strat.__class__.__name__ == 'StrategyDoubleEMAStochOsc':
-                            risk_params = strat.get_risk_parameters(current_price=entry_signal['price'], side=entry_signal['side'])
-                        else:
-                            risk_params = strat.get_risk_parameters()
-                        order_details['stop_loss'] = risk_params.get('stop_loss')
-                        order_details['take_profit'] = risk_params.get('take_profit')
+
+                    # The strategy should now always provide sl_pct and tp_pct.
+                    # The OrderManager will calculate absolute SL/TP prices based on actual fill price.
+                    # The old block for recalculating SL/TP if not in order_details is removed.
+
+                    logger.info(f"Order signal: {order_details}") # Log details before sending to OrderManager
+
                     order_manager.place_order_with_risk(
                         symbol=symbol,
                         side=order_details['side'],
-                        order_type='market',
+                        order_type='market', # Assuming market for now, can be from strategy
                         size=order_details['size'],
-                        price=order_details.get('price'),
-                        stop_loss=order_details.get('stop_loss'),
-                        take_profit=order_details.get('take_profit'),
-                        params=None,
-                        reduce_only=False,
-                        time_in_force='GoodTillCancel',
-                        stop_price=None
+                        signal_price=order_details.get('price'), # Price at the time of signal generation
+                        sl_pct=order_details['sl_pct'],
+                        tp_pct=order_details['tp_pct'],
+                        params=order_details.get('params'), # Pass any extra params from strategy
+                        reduce_only=order_details.get('reduce_only', False),
+                        time_in_force=order_details.get('time_in_force', 'GoodTillCancel')
                     )
+                    # Call on_order_update with the initial signal. Actual fill details will come from OrderManager/Exchange events later.
+                    # This might need refinement based on how OrderManager updates strategy about fills.
+                    # For now, let strategy know an attempt was made.
                     strat.on_order_update(order_details)
                 # Check for open position and exit
                 if strat.position and strat.check_exit(strat.position):

@@ -43,7 +43,7 @@ def get_logger(name: str = 'bot') -> logging.Logger:
         logger.setLevel(LOG_LEVEL)
         formatter = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
         # Rotating file handler
-        fh = RotatingFileHandler(LOG_PATH, maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT)
+        fh = RotatingFileHandler(LOG_PATH, maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT, encoding='utf-8')
         fh.setLevel(LOG_LEVEL)
         fh.setFormatter(formatter)
         logger.addHandler(fh)

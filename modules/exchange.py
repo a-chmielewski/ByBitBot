@@ -19,6 +19,7 @@ class ExchangeConnector:
         self.client = None
         self.max_retries = max_retries
         self.backoff_base = backoff_base
+        self._instrument_info_cache = {} # Cache for instrument details
         self._authenticate()
 
     def _authenticate(self):
@@ -232,32 +233,91 @@ class ExchangeConnector:
 
     def fetch_order(self, symbol: str, order_id: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Fetch a single order by order_id for a given symbol.
-        Args:
-            symbol: Trading pair (e.g., 'BTCUSDT')
-            order_id: The order ID to fetch
-            params: Additional parameters
-        Returns:
-            API response dict
+        Fetch a single order by order_id by pulling open orders (and optionally history).
         """
+        if not self.client:
+            raise ExchangeError("Client not authenticated")
+        norm = symbol.replace("/", "").upper()
+        category = params.get("category", "linear") if params else "linear"
+
+        # 1) Try open orders
+        resp = self._api_call_with_backoff(
+            self.client.get_open_orders,
+            symbol=norm,
+            category=category,
+            **(params or {})
+        )
+        resp = self._check_response(resp, context="fetch_open_orders for fetch_order")
+        orders = resp.get("result", {}).get("list", [])
+        for o in orders:
+            if o.get("orderId") == order_id:
+                return {
+                    "retCode": resp["retCode"],
+                    "retMsg": resp["retMsg"],
+                    "result": o
+                }
+
+        # 2) (Optional) Fallback to history if it's already been filled or cancelled
+        hist = self._api_call_with_backoff(
+            self.client.get_order_history,
+            symbol=norm,
+            category=category,
+            **(params or {})
+        )
+        hist = self._check_response(hist, context="fetch_order_history for fetch_order")
+        for o in hist.get("result", {}).get("list", []):
+            if o.get("orderId") == order_id:
+                return {
+                    "retCode": hist["retCode"],
+                    "retMsg": hist["retMsg"],
+                    "result": o
+                }
+
+        raise ExchangeError(f"Order {order_id} not found in open or history")
+
+    def _fetch_instrument_info(self, symbol: str, category: str = 'linear'):
+        norm_symbol = symbol.replace("/", "").upper()
+        cache_key = f"{norm_symbol}_{category}"
+        if cache_key in self._instrument_info_cache:
+            return self._instrument_info_cache[cache_key]
+        
         try:
-            if not self.client:
-                raise ExchangeError("Client not authenticated")
-            norm_symbol = symbol.replace("/", "").upper()
-            order_params = {
-                "symbol": norm_symbol,
-                "order_id": order_id,
-                "category": "linear"
-            }
-            if params:
-                order_params.update(params)
-            response = self._api_call_with_backoff(self.client.get_order, **order_params)
-            checked = self._check_response(response, context="fetch_order")
-            self.logger.info(f"Fetched order: {order_params} | Response: {checked}")
-            return checked
+            response = self._api_call_with_backoff(
+                self.client.get_instruments_info,
+                category=category,
+                symbol=norm_symbol
+            )
+            checked = self._check_response(response, context=f"fetch_instrument_info for {norm_symbol}")
+            instruments = checked.get('result', {}).get('list', [])
+            if instruments:
+                self._instrument_info_cache[cache_key] = instruments[0] # Assuming symbol is unique
+                return instruments[0]
+            else:
+                self.logger.error(f"No instrument info found for {norm_symbol} in category {category}.")
+                return None
         except Exception as e:
-            self.logger.error(f"Fetch order failed: {e}")
-            raise ExchangeError(f"Fetch order failed: {str(e)}")
+            self.logger.error(f"Failed to fetch instrument info for {norm_symbol}: {e}")
+            return None
+
+    def get_price_precision(self, symbol: str, category: str = 'linear') -> int:
+        info = self._fetch_instrument_info(symbol, category)
+        if info and info.get('priceFilter') and info['priceFilter'].get('tickSize'):
+            tick_size_str = str(info['priceFilter']['tickSize'])
+            if '.' in tick_size_str:
+                return len(tick_size_str.split('.')[1])
+            return 0 # No decimal places if integer or not found
+        self.logger.warning(f"Could not determine price precision for {symbol}, defaulting to 8.")
+        return 8 # Default precision
+
+    def get_qty_precision(self, symbol: str, category: str = 'linear') -> int:
+        info = self._fetch_instrument_info(symbol, category)
+        if info and info.get('lotSizeFilter') and info['lotSizeFilter'].get('qtyStep'):
+            qty_step_str = str(info['lotSizeFilter']['qtyStep'])
+            if '.' in qty_step_str:
+                return len(qty_step_str.split('.')[1])
+            return 0 # No decimal places
+        self.logger.warning(f"Could not determine qty precision for {symbol}, defaulting to 3.")
+        return 3 # Default precision
 
     def get_min_order_amount(self, symbol: str, category: str = 'linear') -> tuple:
         """
@@ -267,7 +327,7 @@ class ExchangeConnector:
             symbol: Trading pair (e.g., 'BTCUSDT')
             category: Bybit category ('linear' for perps, 'spot' for spot)
         Returns:
-            Tuple: (Minimum order quantity as float, Minimum notional value as float)
+            Tuple: (Minimum order quantity as float, Minimum notional value as float, Quantity step as float)
         Raises:
             ExchangeError if fetch fails or info is missing
         """
@@ -285,12 +345,14 @@ class ExchangeConnector:
             instruments = checked["result"]["list"]
             assert instruments, f"No instrument info found for {symbol}"
             instrument_info = instruments[0]
-            flt = instrument_info["lotSizeFilter"]
-            min_order_qty    = float(flt["minOrderQty"])
-            min_notional     = float(flt.get("minOrderAmt", 0))
-            qty_step         = float(flt.get("qtyStep", min_order_qty))
+            lot_filter = instrument_info["lotSizeFilter"]
+            min_order_qty = float(lot_filter["minOrderQty"])
+            min_notional = float(lot_filter.get("minOrderAmt", 0))
+            qty_step = float(lot_filter.get("qtyStep", min_order_qty))
             self._min_order_cache[cache_key] = (min_order_qty, min_notional, qty_step)
             return min_order_qty, min_notional, qty_step
         except Exception as error:
-            self.logger.error(f"Error fetching minimum order amount for {symbol}: {error}")
-            raise ExchangeError(f"Error fetching minimum order amount for {symbol}: {error}") 
+            # Remove non-ASCII characters from error message for Windows console compatibility
+            safe_error = str(error).encode('ascii', errors='ignore').decode('ascii')
+            self.logger.error(f"Error fetching minimum order amount for {symbol}: {safe_error}")
+            raise ExchangeError(f"Error fetching minimum order amount for {symbol}: {safe_error}") 

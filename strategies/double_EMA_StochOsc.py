@@ -277,12 +277,20 @@ class StrategyDoubleEMAStochOsc(StrategyTemplate):
         else:
             self.log_state_change('waiting_for_entry', f"{type(self).__name__}: Waiting for entry opportunity.")
         if order_details:
-            risk_params = self.get_risk_parameters(current_price=current_price, side=order_details["side"])
-            # Map risk_params keys to 'stop_loss' and 'take_profit' for bot.py compatibility
-            if "stop_loss_price" in risk_params:
-                order_details["stop_loss"] = risk_params["stop_loss_price"]
-            if "take_profit_price" in risk_params:
-                order_details["take_profit"] = risk_params["take_profit_price"]
+            # Get risk percentages
+            risk_percentages = self.get_risk_parameters(current_price=current_price, side=order_details["side"])
+            order_details["sl_pct"] = risk_percentages.get("sl_pct")
+            order_details["tp_pct"] = risk_percentages.get("tp_pct")
+            
+            # Keep absolute prices for logging/potential immediate use if needed by other parts (though OrderManager will recalc)
+            # These will be based on the signal price, not the fill price.
+            if order_details["side"] == "buy":
+                order_details["stop_loss_signal_price"] = current_price * (1 - order_details["sl_pct"]) if order_details["sl_pct"] else None
+                order_details["take_profit_signal_price"] = current_price * (1 + order_details["tp_pct"]) if order_details["tp_pct"] else None
+            elif order_details["side"] == "sell":
+                order_details["stop_loss_signal_price"] = current_price * (1 + order_details["sl_pct"]) if order_details["sl_pct"] else None
+                order_details["take_profit_signal_price"] = current_price * (1 - order_details["tp_pct"]) if order_details["tp_pct"] else None
+
             self.logger.info(f"Prepared order: {order_details}")
 
         return order_details
@@ -366,45 +374,27 @@ class StrategyDoubleEMAStochOsc(StrategyTemplate):
 
     def get_risk_parameters(self, current_price: float, side: str) -> Dict[str, Any]:
         """
-        Return risk parameters (stop-loss price, take-profit price) for the strategy.
-        These are determined at the point of entry based on percentages.
+        Return risk parameters as percentages for the strategy.
         Args:
-            current_price: The price at which the entry is being considered.
+            current_price: The price at which the entry is being considered (can be used for dynamic adjustments if needed).
             side: "buy" or "sell", indicating the direction of the trade.
         Returns:
-            dict: {"stop_loss_price": float, "take_profit_price": float}
-                  Returns an empty dict if side is invalid.
+            dict: {"sl_pct": float, "tp_pct": float}
+                  Returns an empty dict if side is invalid, though side isn't strictly needed for fixed percentages.
         """
         sl_pct = self.strategy_config["stop_loss_pct"]
         tp_pct = self.strategy_config["take_profit_pct"]
+
+        if side not in ["buy", "sell"]:
+            self.logger.error(f"Invalid side '{side}' provided for get_risk_parameters. Using default percentages.")
+            # Still return percentages as they are fixed for this strategy version
         
-        # The original strategy's backtest code used swing_high/low for SL in some cases.
-        # This refactored version uses percentage-based SL/TP from the entry price
-        # as per the simplified parameters derived from the original params.
-        # If swing-based SL/TP is desired, self.data would need to be analyzed here
-        # to find recent swing points, or they'd need to be tracked continuously.
-
-        stop_loss_price = None
-        take_profit_price = None
-
-        if side == "buy":
-            stop_loss_price = current_price * (1 - sl_pct)
-            take_profit_price = current_price * (1 + tp_pct)
-        elif side == "sell":
-            stop_loss_price = current_price * (1 + sl_pct)
-            take_profit_price = current_price * (1 - tp_pct)
-        else:
-            self.logger.error(f"Invalid side '{side}' provided for get_risk_parameters. Cannot calculate SL/TP.")
-            return {} # Return empty if side is unrecognized
-
-        # Rounding to a reasonable number of decimal places (e.g., 8 for crypto)
-        # The exact precision might depend on the trading pair.
-        # Consider making precision configurable or deriving from exchange info.
-        price_precision = self.strategy_config.get("price_precision", 8)
-
+        # This method now primarily returns the configured percentages.
+        # The 'current_price' and 'side' are kept for potential future use
+        # if SL/TP percentages become dynamic based on market conditions or side.
         return {
-            "stop_loss_price": round(stop_loss_price, price_precision),
-            "take_profit_price": round(take_profit_price, price_precision)
+            "sl_pct": sl_pct,
+            "tp_pct": tp_pct
         }
 
     def on_order_update(self, order: Dict[str, Any]) -> None:

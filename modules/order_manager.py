@@ -21,6 +21,7 @@ class OrderManager:
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self.active_orders = {}
+        self.MIN_NOTIONAL_USDT = 5.0  # Minimum notional value enforced by bot
 
     POLL_INTERVAL_SECONDS = 1
     FILL_TIMEOUT_SECONDS = 30
@@ -40,77 +41,90 @@ class OrderManager:
                 order_id=order_id
             )
         except Exception as cancel_exc:
-            self.logger.error(f"Failed to cancel unfilled main order {order_id}: {cancel_exc}")
+            msg = str(cancel_exc)
+            # Remove non-ASCII characters for Windows console compatibility
+            safe_msg = msg.encode('ascii', errors='ignore').decode('ascii')
+            # ErrCode 110001 = too late / order not exists
+            if '110001' in safe_msg:
+                self.logger.info(f"Cancel failed with 110001: order likely already filled—ignoring.")
+            else:
+                self.logger.error(f"Failed to cancel unfilled main order {order_id}: {safe_msg}")
         order_responses['stop_loss_order'] = None
         order_responses['take_profit_order'] = None
         return order_responses
 
-    def place_order_with_risk(self, symbol: str, side: str, order_type: str, size: float, price: Optional[float], stop_loss: float, take_profit: float, params: Optional[Dict[str, Any]] = None, reduce_only: bool = False, time_in_force: str = "GoodTillCancel", stop_price: Optional[float] = None) -> Dict[str, Any]:
+    def place_order_with_risk(self, symbol: str, side: str, order_type: str, size: float, 
+                              signal_price: Optional[float], sl_pct: Optional[float], tp_pct: Optional[float],
+                              params: Optional[Dict[str, Any]] = None, 
+                              reduce_only: bool = False, time_in_force: str = "GoodTillCancel") -> Dict[str, Any]:
         """
         Place a main order and, after it is filled, place associated stop-loss and take-profit orders.
-        Implements OCO logic: monitors SL/TP, cancels the other when one is filled.
+        SL/TP are calculated based on actual fill price and provided percentages.
         Args:
             symbol: Trading pair symbol.
             side: 'buy' or 'sell'.
             order_type: 'market' or 'limit'.
             size: Order size.
-            price: Limit price (if applicable).
-            stop_loss: Stop-loss price or percent (absolute price for now).
-            take_profit: Take-profit price or percent (absolute price for now).
+            signal_price: Price at the time of signal generation (used as fallback or for limit orders).
+            sl_pct: Stop-loss percentage (e.g., 0.01 for 1%).
+            tp_pct: Take-profit percentage (e.g., 0.02 for 2%).
             params: Additional order parameters.
             reduce_only: Whether the order should be reduce-only.
             time_in_force: Time in force for the order.
-            stop_price: The stop trigger price (for stop/TP orders).
         Returns:
             Dict summarizing all order responses.
         Raises:
-            OrderExecutionError: If any order placement fails after retries.
+            OrderExecutionError: If any order placement fails after retries or critical info is missing.
         """
         order_responses = {}
-        oco_order_ids = {}  # Local map for SL/TP order IDs in this call
+        # oco_order_ids = {} # Commented out as full OCO monitoring logic is not yet implemented here
+        filled = False
+        main_order_id = None
+        actual_fill_price = None
+        category = 'linear' # Assuming USDT Perpetual
+
         try:
-            # Determine Bybit category (assume USDT Perp for now)
-            category = 'linear'
             order_link_id = params.get('orderLinkId') if params else None
 
-            # Enforce minimum order size and notional value
             min_order_qty, min_notional_value, qty_step = \
                 self.exchange.get_min_order_amount(symbol, category=category)
-            # assert min_order_qty is not None, f"min_order_qty could not be determined for {symbol}."
-            if size is None:
-                size = min_order_qty
-            else:
-                size = max(size, min_order_qty)
-            # Determine effective price for notional check
-            effective_price = price
-            if order_type.lower() == 'market' or effective_price is None:
-                # Fetch latest close price from OHLCV data
-                try:
-                    ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe='1m', limit=1)
-                    # Bybit V5 returns list of dicts or list of lists; handle both
-                    if isinstance(ohlcv, list) and len(ohlcv) > 0:
-                        last_candle = ohlcv[-1]
-                        if isinstance(last_candle, dict):
-                            effective_price = float(last_candle.get('close', 0))
-                        elif isinstance(last_candle, list) and len(last_candle) >= 5:
-                            effective_price = float(last_candle[4])
-                        else:
-                            effective_price = 0
+            
+            effective_price_for_notional_check = signal_price
+            if effective_price_for_notional_check is None and order_type.lower() == 'market':
+                try: # Fetch current price for notional check if signal_price is None for market order
+                    ohlcv_resp = self.exchange.fetch_ohlcv(symbol, timeframe='1m', limit=1)
+                    ohlcv_list = ohlcv_resp.get("result", {}).get("list", [])
+                    if ohlcv_list and isinstance(ohlcv_list[0], list) and len(ohlcv_list[0]) >= 5:
+                        effective_price_for_notional_check = float(ohlcv_list[0][4]) # Close price of latest candle
                     else:
-                        effective_price = 0
+                        self.logger.warning("Could not fetch latest price for notional pre-check, proceeding with caution.")
                 except Exception as e:
-                    self.logger.error(f"Failed to fetch latest price for notional check: {e}")
-                    effective_price = 0
-            if min_notional_value and effective_price:
-                # compute the raw size needed to reach the min‐notional
-                size = math.ceil(min_notional_value / effective_price / qty_step) * qty_step
-                # never go below the exchange’s min order quantity
-                size = max(size, min_order_qty)
-                self.logger.warning(f"Adjusted order size to {size} to meet Bybit minNotional={min_notional_value}USDT (step={qty_step} {symbol}, price={effective_price}).")
-            if size == min_order_qty:
-                self.logger.warning(f"Requested order size was None or below Bybit minimum {min_order_qty} for {symbol}. Using minimum size {min_order_qty}.")
+                    self.logger.warning(f"Failed to fetch latest price for notional pre-check: {e}, proceeding with caution.")
 
-            # Place main order
+            if size is None: size = min_order_qty
+            else: size = max(size, min_order_qty)
+
+            if effective_price_for_notional_check: # Only if we have a price for check
+                current_notional = size * effective_price_for_notional_check
+                # Enforce Bybit's min notional value if available
+                if min_notional_value and current_notional < min_notional_value:
+                    raw_size = min_notional_value / effective_price_for_notional_check
+                    size = math.ceil(raw_size / qty_step) * qty_step
+                    size = max(size, min_order_qty)
+                    self.logger.warning(f"Adjusted order size to {size} to meet Bybit minNotional={min_notional_value}USDT (price={effective_price_for_notional_check}). New notional: {size * effective_price_for_notional_check:.2f}")
+                
+                current_notional = size * effective_price_for_notional_check # Recalculate notional with potentially adjusted size
+                # Enforce bot's hard minimum notional value
+                if current_notional < self.MIN_NOTIONAL_USDT:
+                    raw_size = self.MIN_NOTIONAL_USDT / effective_price_for_notional_check
+                    size = math.ceil(raw_size / qty_step) * qty_step
+                    size = max(size, min_order_qty)
+                    self.logger.warning(f"Adjusted order size to {size} to meet bot minimum notional {self.MIN_NOTIONAL_USDT} USDT (price={effective_price_for_notional_check}). New notional: {size * effective_price_for_notional_check:.2f}")
+            
+            qty_precision = self.exchange.get_qty_precision(symbol, category)
+            size = round(size, qty_precision)
+
+
             main_order_params = {
                 'category': category,
                 'symbol': symbol,
@@ -120,210 +134,213 @@ class OrderManager:
                 'reduceOnly': reduce_only,
                 'timeInForce': time_in_force,
             }
-            # Only include price for limit orders
-            if order_type.lower() == 'limit' and price is not None:
-                main_order_params['price'] = str(price)
+            if order_type.lower() == 'limit' and signal_price is not None:
+                price_precision = self.exchange.get_price_precision(symbol, category)
+                main_order_params['price'] = str(round(signal_price, price_precision))
             if order_link_id:
                 main_order_params['orderLinkId'] = order_link_id
-            if params:
+            if params: # Merge other params
                 for k, v in params.items():
-                    if k not in main_order_params:
+                    if k not in main_order_params and k not in ['sl_pct', 'tp_pct', 'signal_price']: # Avoid overriding core params
                         main_order_params[k] = v
-
-            self.logger.info(
-                f"Placing main order: {main_order_params}"
-            )
-            main_order_response = self._retry_with_backoff(
-                self.exchange.place_order,
-                **main_order_params
-            )
+            
+            self.logger.info(f"Placing main order: {main_order_params}")
+            main_order_response = self._retry_with_backoff(self.exchange.place_order, **main_order_params)
             self.log_order_status(main_order_response)
             order_responses['main_order'] = main_order_response
-            main_order_id = main_order_response.get('result', {}).get('order_id') or main_order_response.get('order_id')
-            if main_order_id:
-                self.active_orders[main_order_id] = {'type': 'main', 'symbol': symbol, 'side': side}
+            
+            res_result = main_order_response.get('result', {})
+            main_order_id = res_result.get('orderId') or res_result.get('order_id')
 
-            # Wait for main order to fill before placing SL/TP
-            order_id = main_order_id
-            if not order_id:
-                raise Exception("Main order did not return an order_id.")
-            self.logger.info(f"Waiting for main order {order_id} to fill before placing SL/TP...")
-            filled = False
-            elapsed = 0
-            while elapsed < self.FILL_TIMEOUT_SECONDS:
-                order_status_resp = self._retry_with_backoff(
-                    self.exchange.fetch_order,
-                    symbol=symbol,
-                    order_id=order_id
-                )
-                status = order_status_resp.get('result', {}).get('order_status') or order_status_resp.get('order_status')
-                self.logger.debug(f"Order {order_id} status: {status}")
-                if status in ('Filled', 'PartiallyFilled', 'filled', 'partially_filled'):
-                    filled = True
-                    break
-                time.sleep(self.POLL_INTERVAL_SECONDS)
-                elapsed += self.POLL_INTERVAL_SECONDS
-            if not filled:
-                return self._cancel_unfilled_main_and_return(symbol, order_id, order_responses)
+            if not main_order_id:
+                raise OrderExecutionError("Main order placement did not return an order_id.")
+            self.active_orders[main_order_id] = {'type': 'main', 'symbol': symbol, 'side': side, 'size': size, 'order_response': main_order_response}
 
-            filled_qty = size
-            partial_fill = False
-            if filled:
-                # Check for partial fill and adjust SL/TP size
-                order_status_resp = self._retry_with_backoff(
-                    self.exchange.fetch_order,
-                    symbol=symbol,
-                    order_id=order_id
-                )
-                filled_qty = (
-                    order_status_resp.get('result', {}).get('cum_exec_qty')
-                    or order_status_resp.get('cum_exec_qty')
-                    or order_status_resp.get('result', {}).get('qty')
-                    or order_status_resp.get('qty')
-                    or size
-                )
+            # Determine actual fill price and filled quantity
+            filled_qty = 0.0
+
+            if order_type.lower() == 'market':
+                self.logger.info("Market order placed. Attempting to fetch fill details.")
+                time.sleep(self.POLL_INTERVAL_SECONDS) # Small delay for order to propagate
                 try:
-                    filled_qty = float(filled_qty)
-                except Exception:
-                    filled_qty = size
-                partial_fill = (filled_qty != size)
-                self.logger.info(f"Using filled quantity for SL/TP: {filled_qty}")
-
-            # Place stop-loss order
-            stop_side = 'Sell' if side.lower() == 'buy' else 'Buy'
-            stop_loss_params = {
-                'category': category,
-                'symbol': symbol,
-                'side': stop_side,
-                'orderType': 'Market',
-                'qty': str(filled_qty),
-                'reduceOnly': True,
-                'timeInForce': time_in_force,
-                'stopLoss': str(stop_loss),
-                'slOrderType': 'Market',
-                'tpslMode': 'Partial' if partial_fill else 'Full',
-            }
-            if stop_price is not None:
-                stop_loss_params['triggerPrice'] = str(stop_price)
-            if order_link_id:
-                stop_loss_params['orderLinkId'] = order_link_id + "-sl"
-            self.logger.info(
-                f"Placing stop-loss order: {stop_loss_params}"
-            )
-            stop_loss_response = self._retry_with_backoff(
-                self.exchange.place_order,
-                **stop_loss_params
-            )
-            self.log_order_status(stop_loss_response)
-            order_responses['stop_loss_order'] = stop_loss_response
-            stop_loss_id = stop_loss_response.get('result', {}).get('order_id') or stop_loss_response.get('order_id')
-            if stop_loss_id:
-                oco_order_ids['stop_loss'] = stop_loss_id
-
-            # Place take-profit order
-            take_profit_params = {
-                'category': category,
-                'symbol': symbol,
-                'side': stop_side,
-                'orderType': 'Market',
-                'qty': str(filled_qty),
-                'reduceOnly': True,
-                'timeInForce': time_in_force,
-                'takeProfit': str(take_profit),
-                'tpOrderType': 'Market',
-                'tpslMode': 'Partial' if partial_fill else 'Full',
-            }
-            if stop_price is not None:
-                take_profit_params['triggerPrice'] = str(stop_price)
-            if order_link_id:
-                take_profit_params['orderLinkId'] = order_link_id + "-tp"
-            self.logger.info(
-                f"Placing take-profit order: {take_profit_params}"
-            )
-            take_profit_response = self._retry_with_backoff(
-                self.exchange.place_order,
-                **take_profit_params
-            )
-            self.log_order_status(take_profit_response)
-            order_responses['take_profit_order'] = take_profit_response
-            take_profit_id = take_profit_response.get('result', {}).get('order_id') or take_profit_response.get('order_id')
-            if take_profit_id:
-                oco_order_ids['take_profit'] = take_profit_id
-
-            # Ensure stop_loss_id and take_profit_id are always defined before OCO loop
-            stop_loss_id = oco_order_ids.get('stop_loss')
-            take_profit_id = oco_order_ids.get('take_profit')
-
-            # OCO logic: monitor both SL and TP, cancel the other when one is filled
-            self.logger.info(f"Monitoring OCO: stop_loss_id={stop_loss_id}, take_profit_id={take_profit_id}")
-            oco_elapsed = 0
-            oco_filled = False
-            while oco_elapsed < self.OCO_TIMEOUT_SECONDS and not oco_filled:
-                # Check both orders
-                sl_status = None
-                tp_status = None
-                if oco_order_ids.get('stop_loss'):
-                    sl_resp = self._retry_with_backoff(
+                    order_status_resp = self._retry_with_backoff(
                         self.exchange.fetch_order,
                         symbol=symbol,
-                        order_id=oco_order_ids['stop_loss']
+                        order_id=main_order_id,
+                        category=category
                     )
-                    sl_status = sl_resp.get('result', {}).get('order_status') or sl_resp.get('order_status')
-                if oco_order_ids.get('take_profit'):
-                    tp_resp = self._retry_with_backoff(
+                    order_data = order_status_resp.get('result', {})
+                    self.logger.info(f"Fetched market order status: {order_data}")
+                    
+                    if order_data.get('avgPrice') and float(order_data['avgPrice']) > 0:
+                        actual_fill_price = float(order_data['avgPrice'])
+                    else: # Fallback if avgPrice is zero or missing
+                        actual_fill_price = signal_price # Use signal_price as a last resort
+                        self.logger.warning(f"avgPrice not available or zero for market order {main_order_id}. Using signal_price {signal_price} for SL/TP calc.")
+
+                    if order_data.get('cumExecQty') and float(order_data['cumExecQty']) > 0:
+                        filled_qty = float(order_data['cumExecQty'])
+                    else: # Fallback for filled quantity
+                        filled_qty = size 
+                        self.logger.warning(f"cumExecQty not available or zero for market order {main_order_id}. Assuming full fill size {size} for SL/TP.")
+                    
+                    if order_data.get('orderStatus', '').lower() in ['filled', 'partiallyfilled']:
+                        filled = True
+                    elif order_data.get('orderStatus', '').lower() == 'new' or order_data.get('orderStatus', '').lower() == 'partiallyfilled': # Bybit might still be processing
+                         self.logger.info(f"Market order {main_order_id} status is {order_data.get('orderStatus')}. Assuming fill for SL/TP placement.")
+                         filled = True # Proceed with SL/TP placement optimistically
+                    else:
+                         self.logger.error(f"Market order {main_order_id} status is {order_data.get('orderStatus')}. Not filled.")
+                         # Potentially cancel or handle as error, for now, we might not place SL/TP
+                         return self._cancel_unfilled_main_and_return(symbol, main_order_id, order_responses)
+
+
+                except Exception as e:
+                    self.logger.error(f"Failed to fetch market order {main_order_id} details: {e}. Using signal_price and initial size for SL/TP.")
+                    actual_fill_price = signal_price # Fallback
+                    filled_qty = size # Fallback
+                    filled = True # Optimistically assume filled to attempt SL/TP
+
+            elif order_type.lower() == 'limit':
+                self.logger.info(f"Limit order {main_order_id} placed. Waiting for fill...")
+                actual_fill_price = signal_price # For limit, SL/TP are based on the limit price
+                elapsed = 0
+                while elapsed < self.FILL_TIMEOUT_SECONDS:
+                    order_status_resp = self._retry_with_backoff(
                         self.exchange.fetch_order,
                         symbol=symbol,
-                        order_id=oco_order_ids['take_profit']
+                        order_id=main_order_id,
+                        category=category
                     )
-                    tp_status = tp_resp.get('result', {}).get('order_status') or tp_resp.get('order_status')
-                self.logger.debug(f"OCO status: SL={sl_status}, TP={tp_status}")
-                if sl_status in ('Filled', 'filled') and tp_status not in ('Filled', 'filled'):
-                    # Cancel TP
-                    self.logger.info(f"Stop-loss filled. Cancelling take-profit order {oco_order_ids.get('take_profit')}.")
-                    if oco_order_ids.get('take_profit'):
-                        self._retry_with_backoff(
-                            self.exchange.cancel_order,
-                            symbol=symbol,
-                            order_id=oco_order_ids['take_profit']
-                        )
-                        oco_order_ids.pop('take_profit', None)
-                    oco_filled = True
-                elif tp_status in ('Filled', 'filled') and sl_status not in ('Filled', 'filled'):
-                    # Cancel SL
-                    self.logger.info(f"Take-profit filled. Cancelling stop-loss order {oco_order_ids.get('stop_loss')}.")
-                    if oco_order_ids.get('stop_loss'):
-                        self._retry_with_backoff(
-                            self.exchange.cancel_order,
-                            symbol=symbol,
-                            order_id=oco_order_ids['stop_loss']
-                        )
-                        oco_order_ids.pop('stop_loss', None)
-                    oco_filled = True
-                elif sl_status in ('Filled', 'filled') and tp_status in ('Filled', 'filled'):
-                    oco_filled = True
-                else:
-                    time.sleep(self.OCO_POLL_INTERVAL_SECONDS)
-                    oco_elapsed += self.OCO_POLL_INTERVAL_SECONDS
-            if not oco_filled:
-                self.logger.warning(f"OCO monitoring timed out for stop_loss_id={stop_loss_id}, take_profit_id={take_profit_id}")
-                # Attempt to cancel any remaining open SL/TP orders
-                for leg, oid in list(oco_order_ids.items()):
-                    if oid:
-                        try:
-                            self.logger.info(f"OCO timeout: Cancelling remaining {leg} order {oid}.")
-                            self._retry_with_backoff(
-                                self.exchange.cancel_order,
-                                symbol=symbol,
-                                order_id=oid
-                            )
-                        except Exception as cancel_exc:
-                            self.logger.error(f"Failed to cancel {leg} order {oid} after OCO timeout: {cancel_exc}")
-                oco_order_ids.clear()
-            # No need to persist oco_order_ids after this call
-            return order_responses
-        except Exception as exc:
-            self.logger.error(f"Order placement with risk failed: {exc}")
-            raise OrderExecutionError(f"Order placement with risk failed: {exc}") from exc
+                    status_data = order_status_resp.get('result', {})
+                    current_status = status_data.get('orderStatus', '').lower()
+                    
+                    if current_status == 'filled':
+                        filled = True
+                        filled_qty = float(status_data.get('cumExecQty', size))
+                        if status_data.get('avgPrice') and float(status_data['avgPrice']) > 0 : # Update with actual avg fill price if available
+                           actual_fill_price = float(status_data['avgPrice'])
+                        break
+                    if current_status == 'partiallyfilled':
+                        filled = True # Partially filled is also considered for SL/TP on the filled amount
+                        filled_qty = float(status_data.get('cumExecQty', 0))
+                        if status_data.get('avgPrice') and float(status_data['avgPrice']) > 0 :
+                           actual_fill_price = float(status_data['avgPrice'])
+                        self.logger.info(f"Limit order {main_order_id} partially filled ({filled_qty}). Placing SL/TP for this amount.")
+                        break
+                    if current_status in ['rejected', 'cancelled', 'expired']:
+                         self.logger.error(f"Limit order {main_order_id} failed with status: {current_status}")
+                         return order_responses # Return without SL/TP
+
+                    time.sleep(self.POLL_INTERVAL_SECONDS)
+                    elapsed += self.POLL_INTERVAL_SECONDS
+                
+                if not filled:
+                    return self._cancel_unfilled_main_and_return(symbol, main_order_id, order_responses)
+            
+            if not actual_fill_price or actual_fill_price <= 0: # Final check for a valid fill price
+                self.logger.error(f"Could not determine a valid fill price for order {main_order_id}. Signal price: {signal_price}. Cannot proceed with SL/TP.")
+                # Depending on policy, might try to cancel main_order_id if it's not confirmed closed/rejected
+                raise OrderExecutionError("Failed to determine actual fill price for SL/TP calculation.")
+
+            if filled_qty <= 0:
+                self.logger.error(f"Order {main_order_id} resulted in zero filled quantity. Cannot place SL/TP.")
+                raise OrderExecutionError("Main order filled quantity is zero.")
+
+            # Calculate SL/TP prices based on actual_fill_price and percentages
+            stop_loss_price_calculated = None
+            take_profit_price_calculated = None
+            price_precision = self.exchange.get_price_precision(symbol, category)
+
+            if sl_pct is not None:
+                if side.lower() == "buy":
+                    stop_loss_price_calculated = actual_fill_price * (1 - sl_pct)
+                elif side.lower() == "sell":
+                    stop_loss_price_calculated = actual_fill_price * (1 + sl_pct)
+                if stop_loss_price_calculated is not None:
+                    stop_loss_price_calculated = round(stop_loss_price_calculated, price_precision)
+            
+            if tp_pct is not None:
+                if side.lower() == "buy":
+                    take_profit_price_calculated = actual_fill_price * (1 + tp_pct)
+                elif side.lower() == "sell":
+                    take_profit_price_calculated = actual_fill_price * (1 - tp_pct)
+                if take_profit_price_calculated is not None:
+                    take_profit_price_calculated = round(take_profit_price_calculated, price_precision)
+
+            # Place stop-loss order if SL percentage was provided
+            if sl_pct is not None and stop_loss_price_calculated is not None and stop_loss_price_calculated > 0:
+                stop_side = 'Sell' if side.lower() == 'buy' else 'Buy'
+                sl_params = {
+                    'category': category,
+                    'symbol': symbol,
+                    'side': stop_side,
+                    'orderType': 'Market', # Bybit SL/TP orders are often Market triggered by price
+                    'qty': str(filled_qty), # Use actual filled quantity
+                    'reduceOnly': True,
+                    'tpslMode': 'Partial', # Assuming partial SL/TP mode for now
+                    'slOrderType': 'Market', # Type of order created when SL is triggered
+                    'stopLoss': str(stop_loss_price_calculated)
+                }
+                if order_link_id: sl_params['orderLinkId'] = order_link_id + "-sl"
+                
+                self.logger.info(f"Placing stop-loss order: {sl_params}")
+                stop_loss_response = self._retry_with_backoff(self.exchange.place_order, **sl_params)
+                self.log_order_status(stop_loss_response, "Stop-loss order")
+                order_responses['stop_loss_order'] = stop_loss_response
+                sl_order_id = stop_loss_response.get('result', {}).get('orderId')
+                if sl_order_id: self.active_orders[sl_order_id] = {'type': 'sl', 'main_order_id': main_order_id, 'symbol': symbol}
+            else:
+                self.logger.info(f"Stop-loss not placed (sl_pct: {sl_pct}, calculated_price: {stop_loss_price_calculated})")
+                order_responses['stop_loss_order'] = None
+
+            # Place take-profit order if TP percentage was provided
+            if tp_pct is not None and take_profit_price_calculated is not None and take_profit_price_calculated > 0:
+                tp_side = 'Sell' if side.lower() == 'buy' else 'Buy'
+                tp_params = {
+                    'category': category,
+                    'symbol': symbol,
+                    'side': tp_side,
+                    'orderType': 'Market', # Bybit SL/TP orders are often Market triggered by price
+                    'qty': str(filled_qty), # Use actual filled quantity
+                    'reduceOnly': True,
+                    'tpslMode': 'Partial',
+                    'tpOrderType': 'Market', # Type of order created when TP is triggered
+                    'takeProfit': str(take_profit_price_calculated)
+                }
+                if order_link_id: tp_params['orderLinkId'] = order_link_id + "-tp"
+
+                self.logger.info(f"Placing take-profit order: {tp_params}")
+                take_profit_response = self._retry_with_backoff(self.exchange.place_order, **tp_params)
+                self.log_order_status(take_profit_response, "Take-profit order")
+                order_responses['take_profit_order'] = take_profit_response
+                tp_order_id = take_profit_response.get('result', {}).get('orderId')
+                if tp_order_id: self.active_orders[tp_order_id] = {'type': 'tp', 'main_order_id': main_order_id, 'symbol': symbol}
+            else:
+                self.logger.info(f"Take-profit not placed (tp_pct: {tp_pct}, calculated_price: {take_profit_price_calculated})")
+                order_responses['take_profit_order'] = None
+            
+            # Basic OCO simulation: If one SL/TP fills, cancel the other.
+            # This needs a more robust monitoring loop elsewhere if orders are not linked on exchange side.
+            # For Bybit, stopLoss/takeProfit params on main order or separate SL/TP orders might be handled by exchange.
+            # The current placement is separate SL and TP market trigger orders.
+
+        except OrderExecutionError as oee: # Catch specific execution errors
+            self.logger.error(f"OrderExecutionError in place_order_with_risk: {oee}")
+            # Ensure main_order_response is in dict even on failure for consistent return structure
+            if 'main_order' not in order_responses: order_responses['main_order'] = None
+            if 'stop_loss_order' not in order_responses: order_responses['stop_loss_order'] = None
+            if 'take_profit_order' not in order_responses: order_responses['take_profit_order'] = None
+            # Optionally re-raise or handle by returning error state in dict
+            raise
+        except Exception as e:
+            self.logger.error(f"Unexpected error in place_order_with_risk: {e}", exc_info=True)
+            if 'main_order' not in order_responses: order_responses['main_order'] = None
+            if 'stop_loss_order' not in order_responses: order_responses['stop_loss_order'] = None
+            if 'take_profit_order' not in order_responses: order_responses['take_profit_order'] = None
+            raise OrderExecutionError(f"Unexpected error: {str(e)}") from e
+        
+        return order_responses
 
     def _retry_with_backoff(self, func, *args, **kwargs) -> Any:
         """
@@ -349,11 +366,12 @@ class OrderManager:
         self.logger.error(f"All retries failed for {getattr(func, '__name__', str(func))}: {last_exception}")
         raise OrderExecutionError(f"All retries failed for {getattr(func, '__name__', str(func))}: {last_exception}") from last_exception
 
-    def log_order_status(self, order_response: Dict[str, Any]):
+    def log_order_status(self, order_response: Dict[str, Any], order_type: str):
         """
         Log the status of an order.
         Args:
             order_response: The response dict from the exchange.
+            order_type: The type of the order.
         """
         if not isinstance(order_response, dict):
             self.logger.error(f"Order response is not a dict: {order_response}")
@@ -365,15 +383,18 @@ class OrderManager:
         qty = order_response.get('result', {}).get('qty') or order_response.get('qty')
         price = order_response.get('result', {}).get('price') or order_response.get('price')
         error_msg = order_response.get('ret_msg')
-        ret_code = order_response.get('ret_code')
+        # Remove non-ASCII characters for Windows console compatibility
+        if error_msg:
+            error_msg = str(error_msg).encode('ascii', errors='ignore').decode('ascii')
+        ret_code = order_response.get('retCode', order_response.get('ret_code'))
 
         if ret_code == 0:
             self.logger.info(
-                f"Order placed: id={order_id}, status={status}, side={side}, type={order_type}, size={qty}, price={price}"
+                f"{order_type} order placed: id={order_id}, status={status}, side={side}, type={order_type}, size={qty}, price={price}"
             )
         else:
             self.logger.error(
-                f"Order failed: id={order_id}, status={status}, side={side}, type={order_type}, size={qty}, price={price}, error={error_msg}"
+                f"{order_type} order failed: id={order_id}, status={status}, side={side}, type={order_type}, size={qty}, price={price}, error={error_msg}"
             )
 
     def sync_active_orders_with_exchange(self, symbol: str):
