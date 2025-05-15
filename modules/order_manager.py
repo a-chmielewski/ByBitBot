@@ -1,6 +1,7 @@
 import logging
 from typing import Any, Dict, Optional
 import time
+import math
 
 class OrderExecutionError(Exception):
     """Custom exception for order execution errors."""
@@ -72,6 +73,43 @@ class OrderManager:
             category = 'linear'
             order_link_id = params.get('orderLinkId') if params else None
 
+            # Enforce minimum order size and notional value
+            min_order_qty, min_notional_value, qty_step = \
+                self.exchange.get_min_order_amount(symbol, category=category)
+            # assert min_order_qty is not None, f"min_order_qty could not be determined for {symbol}."
+            if size is None:
+                size = min_order_qty
+            else:
+                size = max(size, min_order_qty)
+            # Determine effective price for notional check
+            effective_price = price
+            if order_type.lower() == 'market' or effective_price is None:
+                # Fetch latest close price from OHLCV data
+                try:
+                    ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe='1m', limit=1)
+                    # Bybit V5 returns list of dicts or list of lists; handle both
+                    if isinstance(ohlcv, list) and len(ohlcv) > 0:
+                        last_candle = ohlcv[-1]
+                        if isinstance(last_candle, dict):
+                            effective_price = float(last_candle.get('close', 0))
+                        elif isinstance(last_candle, list) and len(last_candle) >= 5:
+                            effective_price = float(last_candle[4])
+                        else:
+                            effective_price = 0
+                    else:
+                        effective_price = 0
+                except Exception as e:
+                    self.logger.error(f"Failed to fetch latest price for notional check: {e}")
+                    effective_price = 0
+            if min_notional_value and effective_price:
+                # compute the raw size needed to reach the min‐notional
+                size = math.ceil(min_notional_value / effective_price / qty_step) * qty_step
+                # never go below the exchange’s min order quantity
+                size = max(size, min_order_qty)
+                self.logger.warning(f"Adjusted order size to {size} to meet Bybit minNotional={min_notional_value}USDT (step={qty_step} {symbol}, price={effective_price}).")
+            if size == min_order_qty:
+                self.logger.warning(f"Requested order size was None or below Bybit minimum {min_order_qty} for {symbol}. Using minimum size {min_order_qty}.")
+
             # Place main order
             main_order_params = {
                 'category': category,
@@ -82,12 +120,12 @@ class OrderManager:
                 'reduceOnly': reduce_only,
                 'timeInForce': time_in_force,
             }
-            if price is not None:
+            # Only include price for limit orders
+            if order_type.lower() == 'limit' and price is not None:
                 main_order_params['price'] = str(price)
             if order_link_id:
                 main_order_params['orderLinkId'] = order_link_id
             if params:
-                # Merge any additional params, but camelCase only
                 for k, v in params.items():
                     if k not in main_order_params:
                         main_order_params[k] = v

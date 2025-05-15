@@ -24,14 +24,27 @@ class StrategyExample(StrategyTemplate):
         # Example entry logic: Buy if price crosses above SMA
         if isinstance(self.data, pd.DataFrame):
             if self.data['close'].iloc[-1] > self.data['sma'].iloc[-1]:
-                return {"side": "buy", "size": 1.0, "price": self.data['close'].iloc[-1]}
+                self.log_state_change('entry_signal', f"{type(self).__name__}: Entry conditions met, placing order.")
+                # Do not set a default order size here; OrderManager will enforce Bybit minimum
+                order_details = {"side": "buy", "size": self.config.get("order_size"), "price": self.data['close'].iloc[-1]}
+                risk_params = self.get_risk_parameters()
+                if "stop_loss" in risk_params:
+                    order_details["stop_loss"] = risk_params["stop_loss"]
+                if "take_profit" in risk_params:
+                    order_details["take_profit"] = risk_params["take_profit"]
+                return order_details
+            else:
+                self.log_state_change('waiting_for_entry', f"{type(self).__name__}: Waiting for entry opportunity.")
         return None
 
     def check_exit(self, position: Any) -> bool:
         # Example exit logic: Exit if price crosses below SMA
         if isinstance(self.data, pd.DataFrame):
             if self.data['close'].iloc[-1] < self.data['sma'].iloc[-1]:
+                self.log_state_change('exit_signal', f"{type(self).__name__}: Exit conditions met, closing position.")
                 return True
+            else:
+                self.log_state_change('waiting_for_exit', f"{type(self).__name__}: In position, monitoring for exit.")
         return False
 
     def get_risk_parameters(self) -> Dict[str, Any]:

@@ -1,5 +1,4 @@
 import os
-import sys
 import importlib
 import json
 from modules.logger import get_logger
@@ -9,6 +8,8 @@ from modules.order_manager import OrderManager
 from modules.performance_tracker import PerformanceTracker
 from datetime import datetime
 import time
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 CONFIG_PATH = 'config.json'
 STRATEGY_DIR = 'strategies'
@@ -48,12 +49,13 @@ def main():
     exchange = ExchangeConnector(api_key=ex_cfg['api_key'], api_secret=ex_cfg['api_secret'], testnet=False, logger=logger)
     # Data fetcher
     default_cfg = config['default']
-    symbol = default_cfg['coin_pair']
+    symbol = default_cfg['coin_pair'].replace('/', '').upper()
     timeframe = default_cfg['timeframe']
     data_fetcher = LiveDataFetcher(exchange, symbol, timeframe, logger=logger)
     data = data_fetcher.fetch_initial_data()
     # Start WebSocket for live data
     data_fetcher.start_websocket()
+    logger.info(f"Fetched initial OHLCV data: {len(data)} rows for {symbol} {timeframe}")
     # Order manager
     order_manager = OrderManager(exchange, logger=logger)
     # Performance tracker
@@ -74,17 +76,32 @@ def main():
             # Sync active orders with exchange
             order_manager.sync_active_orders_with_exchange(symbol)
             for strat in strategies:
+                strat.data = data  # Ensure strategy uses latest data
+                strat.update_indicators_for_new_row()  # Efficiently update indicators for new data
+                # Debug: log the latest row's indicator values
+                latest_row = strat.data.iloc[-1].to_dict()
                 entry_signal = strat.check_entry()
                 if entry_signal:
-                    risk_params = strat.get_risk_parameters()
-                    order_details = order_manager.place_order_with_risk(
+                    # Assert required keys are present
+                    assert 'side' in entry_signal, f"Strategy {type(strat).__name__} did not return 'side' in entry_signal: {entry_signal}"
+                    assert 'price' in entry_signal, f"Strategy {type(strat).__name__} did not return 'price' in entry_signal: {entry_signal}"
+                    # Use SL/TP from entry_signal if present, otherwise compute
+                    order_details = entry_signal.copy()
+                    if 'stop_loss' not in order_details or 'take_profit' not in order_details:
+                        if hasattr(strat, 'get_risk_parameters') and strat.__class__.__name__ == 'StrategyDoubleEMAStochOsc':
+                            risk_params = strat.get_risk_parameters(current_price=entry_signal['price'], side=entry_signal['side'])
+                        else:
+                            risk_params = strat.get_risk_parameters()
+                        order_details['stop_loss'] = risk_params.get('stop_loss')
+                        order_details['take_profit'] = risk_params.get('take_profit')
+                    order_manager.place_order_with_risk(
                         symbol=symbol,
-                        side=entry_signal['side'],
+                        side=order_details['side'],
                         order_type='market',
-                        size=entry_signal['size'],
-                        price=entry_signal.get('price'),
-                        stop_loss=risk_params['stop_loss'],
-                        take_profit=risk_params['take_profit'],
+                        size=order_details['size'],
+                        price=order_details.get('price'),
+                        stop_loss=order_details.get('stop_loss'),
+                        take_profit=order_details.get('take_profit'),
                         params=None,
                         reduce_only=False,
                         time_in_force='GoodTillCancel',

@@ -1,5 +1,7 @@
 import logging
 from typing import Any, Dict, Optional
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 import pandas as pd
 from pybit.unified_trading import WebSocket
 import threading
@@ -23,16 +25,49 @@ class LiveDataFetcher:
         window_size: Number of bars to keep in the rolling window.
         logger: Logger instance for this fetcher.
     """
+    def _normalize_timeframe_to_bybit_interval(self, timeframe: str) -> str:
+        """
+        Convert CCXT-style timeframe (e.g., '1m', '1h', '1d') to ByBit interval.
+        ByBit intervals: 1, 3, 5, 15, 30, 60, 120, 240, 360, 720 (minutes), D, W, M.
+        """
+        tf = timeframe.strip()
+        # monthly (CCXT = '1M')
+        if tf.endswith('M') and tf[:-1].isdigit():
+            return 'M'
+        # minutes (e.g. '1m', '15m')
+        if tf.endswith('m') and tf[:-1].isdigit():
+            return tf[:-1]
+        # hours (e.g. '1h', '4h')
+        if tf.endswith(('h','H')) and tf[:-1].isdigit():
+            return str(int(tf[:-1]) * 60)
+        # days / weeks
+        if tf.lower() == '1d':
+            return 'D'
+        if tf.lower() == '1w':
+            return 'W'
+        # bare number = minutes
+        if tf.isdigit():
+            return tf
+        self.logger.warning(f"Unsupported timeframe '{timeframe}', sending raw to API.")
+
+        # Default to trying to convert to int, assuming it's minutes if no suffix
+        try:
+            return str(int(timeframe))
+        except ValueError:
+            self.logger.warning(f"Unsupported timeframe format '{timeframe}'. Using as is. This may cause API errors.")
+            return timeframe # Fallback, might cause issues.
+
     def __init__(self, exchange, symbol: str, timeframe: str, window_size: int = DEFAULT_WINDOW_SIZE, logger: Optional[logging.Logger] = None):
         assert exchange is not None, "Exchange connector must be provided."
         assert isinstance(symbol, str) and symbol, "Symbol must be a non-empty string."
         assert isinstance(timeframe, str) and timeframe, "Timeframe must be a non-empty string."
         assert isinstance(window_size, int) and window_size > 0, "Window size must be a positive integer."
+        self.logger = logger or logging.getLogger(self.__class__.__name__)
         self.exchange = exchange
         self.symbol = symbol.upper().replace("/", "")
-        self.timeframe = timeframe
+        self.timeframe_orig = timeframe # Keep original for logging/display if needed
+        self.bybit_interval = self._normalize_timeframe_to_bybit_interval(timeframe)
         self.window_size = window_size
-        self.logger = logger or logging.getLogger(self.__class__.__name__)
         self.data = pd.DataFrame()
         self.ws_client = None
         self.ws_running = False
@@ -66,7 +101,7 @@ class LiveDataFetcher:
             DataFetchError: If data fetch fails or no data is returned.
         """
         try:
-            response = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, self.window_size)
+            response = self.exchange.fetch_ohlcv(self.symbol, self.bybit_interval, self.window_size)
             ohlcv_raw = response.get('result', {}).get('list', [])
             if not ohlcv_raw:
                 raise DataFetchError("No OHLCV data returned from exchange.")
@@ -74,7 +109,7 @@ class LiveDataFetcher:
             if len(df) > self.window_size:
                 df = df.iloc[-self.window_size:]
             self.data = df.reset_index(drop=True)
-            self.logger.info(f"Fetched initial OHLCV data: {len(self.data)} rows for {self.symbol} {self.timeframe}")
+            self.logger.info(f"Fetched initial OHLCV data: {len(self.data)} rows for {self.symbol} {self.timeframe_orig}")
             return self.data.copy()
         except Exception as exc:
             self.logger.error(f"Initial data fetch failed: {exc}")
@@ -89,7 +124,7 @@ class LiveDataFetcher:
             DataFetchError: If data update fails.
         """
         try:
-            response = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=2)
+            response = self.exchange.fetch_ohlcv(self.symbol, self.bybit_interval, limit=2)
             ohlcv_raw = response.get('result', {}).get('list', [])
             if not ohlcv_raw:
                 raise DataFetchError("No OHLCV data returned from exchange.")
@@ -100,7 +135,7 @@ class LiveDataFetcher:
                 elif df_new['timestamp'].iloc[-1] == self.data['timestamp'].iloc[-1]:
                     self.data.iloc[-1] = df_new.iloc[-1]
                 self.remove_old_data()
-            self.logger.info(f"Updated OHLCV data: {len(self.data)} rows for {self.symbol} {self.timeframe}")
+            self.logger.debug(f"Updated OHLCV data: {len(self.data)} rows for {self.symbol} {self.timeframe_orig}")
             return self.data.copy()
         except Exception as exc:
             self.logger.error(f"Data update failed: {exc}")
@@ -125,7 +160,7 @@ class LiveDataFetcher:
             if not self.data.empty and len(self.data) > self.window_size:
                 old_len = len(self.data)
                 self.data = self.data.iloc[-self.window_size:].reset_index(drop=True)
-                self.logger.info(f"Removed old data: trimmed from {old_len} to {len(self.data)} rows.")
+                self.logger.debug(f"Removed old data: trimmed from {old_len} to {len(self.data)} rows.")
         except Exception as exc:
             self.logger.error(f"Remove old data failed: {exc}")
             raise
@@ -151,11 +186,11 @@ class LiveDataFetcher:
                         )
                         self.ws_client.kline_stream(
                             symbol=self.symbol,
-                            interval=self.timeframe,
+                            interval=self.bybit_interval,
                             callback=self.on_kline_message
                         )
-                        self.logger.info(f"WebSocket started for {self.symbol} {self.timeframe}")
-                        while self.ws_running and self.ws_client.is_alive():
+                        self.logger.info(f"WebSocket started for {self.symbol} {self.timeframe_orig}")
+                        while self.ws_running:
                             time.sleep(0.1)
                     except Exception as exc:
                         self.logger.error(f"WebSocket error: {exc}")
@@ -188,7 +223,7 @@ class LiveDataFetcher:
                 self.ws_client = None
             if self._ws_thread and self._ws_thread.is_alive():
                 self._ws_thread.join(timeout=2)
-            self.logger.info(f"WebSocket stopped for {self.symbol} {self.timeframe}")
+            self.logger.info(f"WebSocket stopped for {self.symbol} {self.timeframe_orig}")
         except Exception as exc:
             self.logger.error(f"Failed to stop WebSocket: {exc}")
             raise
@@ -201,8 +236,10 @@ class LiveDataFetcher:
         """
         try:
             kline = message.get('data')
-            if not kline:
+            data_list = message.get('data') or []
+            if not isinstance(data_list, list) or not data_list:
                 return
+            kline = data_list[-1]
             row = {
                 'timestamp': pd.to_datetime(kline['start'], unit='ms'),
                 'open': float(kline['open']),
@@ -217,6 +254,6 @@ class LiveDataFetcher:
                 elif row['timestamp'] == self.data['timestamp'].iloc[-1]:
                     self.data.iloc[-1] = list(row.values())
                 self.remove_old_data()
-            self.logger.debug(f"WebSocket kline update: {row['timestamp']} {self.symbol} {self.timeframe}")
+            self.logger.debug(f"WebSocket kline update: {row['timestamp']} {self.symbol} {self.timeframe_orig}")
         except Exception as exc:
             self.logger.error(f"Failed to process kline message: {exc}") 

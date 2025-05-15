@@ -1,7 +1,7 @@
 import logging
 import time
 from typing import Any, Dict, Optional
-from pybit import HTTP
+from pybit.unified_trading import HTTP
 
 class ExchangeError(Exception):
     pass
@@ -26,12 +26,10 @@ class ExchangeConnector:
         Authenticate with ByBit using provided credentials via Pybit.
         """
         try:
-            endpoint = "https://api-testnet.bybit.com" if self.testnet else "https://api.bybit.com"
             self.client = HTTP(
-                endpoint,
+                testnet=self.testnet,
                 api_key=self.api_key,
-                api_secret=self.api_secret,
-                request_timeout=10
+                api_secret=self.api_secret
             )
             self.logger.info(f"Authenticated to ByBit ({'testnet' if self.testnet else 'mainnet'}) successfully.")
         except Exception as e:
@@ -41,15 +39,37 @@ class ExchangeConnector:
     def _check_response(self, response: dict, context: str = "API call") -> dict:
         """
         Helper to check Bybit API response for errors.
-        Raises ExchangeError if ret_code is not 0.
+        Raises ExchangeError if ret_code or retCode is not 0.
         """
         if not isinstance(response, dict):
             self.logger.error(f"{context} failed: Response is not a dict: {response}")
             raise ExchangeError(f"{context} failed: Invalid response format.")
-        if response.get("ret_code", 0) != 0:
-            msg = response.get("ret_msg", "Unknown error")
-            self.logger.error(f"{context} failed: {msg} | Response: {response}")
-            raise ExchangeError(f"{context} failed: {msg}")
+
+        # Prioritize retCode (Unified API)
+        api_ret_code = response.get("retCode")
+        api_ret_msg = response.get("retMsg")
+
+        if api_ret_code is not None:  # retCode is present
+            if api_ret_code != 0:
+                msg_to_log = api_ret_msg or "Unified API Error (no specific message)"
+                self.logger.error(f"{context} failed (retCode={api_ret_code}): {msg_to_log} | Response: {response}")
+                raise ExchangeError(f"{context} failed: {msg_to_log} (retCode: {api_ret_code})")
+            # If api_ret_code is 0, it's success, proceed to return response
+        else:  # retCode is NOT present, try ret_code (Older API / other endpoints)
+            api_ret_code = response.get("ret_code")
+            api_ret_msg = response.get("ret_msg")
+            if api_ret_code is not None:  # ret_code is present
+                if api_ret_code != 0:
+                    msg_to_log = api_ret_msg or "Legacy API Error (no specific message)"
+                    self.logger.error(f"{context} failed (ret_code={api_ret_code}): {msg_to_log} | Response: {response}")
+                    raise ExchangeError(f"{context} failed: {msg_to_log} (ret_code: {api_ret_code})")
+                # If api_ret_code (from ret_code field) is 0, it's success, proceed to return response
+            else:
+                # Neither retCode nor ret_code is present.
+                # This could be a successful response from an endpoint that doesn't use this convention,
+                # or a malformed response. For now, log and pass through.
+                self.logger.debug(f"{context}: No standard retCode/ret_code found. Assuming success or non-standard response. Response: {response}")
+
         return response
 
     def _api_call_with_backoff(self, func, *args, **kwargs):
@@ -148,7 +168,7 @@ class ExchangeConnector:
                 limit=limit
             )
             checked = self._check_response(response, context=f"fetch_ohlcv {symbol} {timeframe}")
-            self.logger.info(f"Fetched OHLCV for {symbol} ({timeframe}): {checked}")
+            self.logger.debug(f"Fetched OHLCV for {symbol} ({timeframe}): {checked}")
             return checked
         except Exception as e:
             self.logger.error(f"Fetch OHLCV failed: {e}")
@@ -204,7 +224,7 @@ class ExchangeConnector:
                 open_params.update(params)
             response = self._api_call_with_backoff(self.client.get_open_orders, **open_params)
             checked = self._check_response(response, context="fetch_open_orders")
-            self.logger.info(f"Fetched open orders: {open_params} | Response: {checked}")
+            self.logger.debug(f"Fetched open orders: {open_params} | Response: {checked}")
             return checked
         except Exception as e:
             self.logger.error(f"Fetch open orders failed: {e}")
@@ -237,4 +257,40 @@ class ExchangeConnector:
             return checked
         except Exception as e:
             self.logger.error(f"Fetch order failed: {e}")
-            raise ExchangeError(f"Fetch order failed: {str(e)}") 
+            raise ExchangeError(f"Fetch order failed: {str(e)}")
+
+    def get_min_order_amount(self, symbol: str, category: str = 'linear') -> tuple:
+        """
+        Fetch the minimum order amount and minimum notional value for a given symbol from Bybit.
+        Caches the result for efficiency.
+        Args:
+            symbol: Trading pair (e.g., 'BTCUSDT')
+            category: Bybit category ('linear' for perps, 'spot' for spot)
+        Returns:
+            Tuple: (Minimum order quantity as float, Minimum notional value as float)
+        Raises:
+            ExchangeError if fetch fails or info is missing
+        """
+        if not hasattr(self, '_min_order_cache'):
+            self._min_order_cache = {}
+        cache_key = (symbol, category)
+        if cache_key in self._min_order_cache:
+            return self._min_order_cache[cache_key]
+        try:
+            response = self.client.get_instruments_info(
+                category=category,
+                symbol=symbol
+            )
+            checked = self._check_response(response, context="get_instruments_info")
+            instruments = checked["result"]["list"]
+            assert instruments, f"No instrument info found for {symbol}"
+            instrument_info = instruments[0]
+            flt = instrument_info["lotSizeFilter"]
+            min_order_qty    = float(flt["minOrderQty"])
+            min_notional     = float(flt.get("minOrderAmt", 0))
+            qty_step         = float(flt.get("qtyStep", min_order_qty))
+            self._min_order_cache[cache_key] = (min_order_qty, min_notional, qty_step)
+            return min_order_qty, min_notional, qty_step
+        except Exception as error:
+            self.logger.error(f"Error fetching minimum order amount for {symbol}: {error}")
+            raise ExchangeError(f"Error fetching minimum order amount for {symbol}: {error}") 

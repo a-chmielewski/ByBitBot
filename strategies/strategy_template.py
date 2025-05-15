@@ -22,6 +22,7 @@ class StrategyTemplate(ABC):
         self.logger = logger or logging.getLogger(self.__class__.__name__)
         self.position = None  # Track current position state
         self.active_orders = []  # Track open orders
+        self.last_state = None  # Track last logged state
         self.on_init()
         self.init_indicators()
 
@@ -44,7 +45,10 @@ class StrategyTemplate(ABC):
         """
         Check entry conditions. Return dict with order details if entry signal, else None.
         Returns:
-            dict | None: {"side": "buy"/"sell", "size": float, "price": float, ...} or None
+            dict | None: Must include keys: 'side', 'price'.
+            'size' can be None or omitted; OrderManager will enforce Bybit minimum. To use a larger size, set 'order_size' in config or strategy_config.
+            Should include: 'stop_loss', 'take_profit' if available.
+            Example: {"side": "buy", "size": 1.0, "price": 123.45, "stop_loss": 120.0, "take_profit": 130.0} or None
         """
         pass
 
@@ -101,4 +105,15 @@ class StrategyTemplate(ABC):
             exception: The exception instance.
         Default: logs a warning.
         """
-        self.logger.warning(f"Strategy {self.__class__.__name__} encountered an error: {exception}") 
+        self.logger.warning(f"Strategy {self.__class__.__name__} encountered an error: {exception}")
+
+    def log_state_change(self, new_state: str, message: str) -> None:
+        """
+        Log only when the strategy state changes to avoid log flooding.
+        Args:
+            new_state: The new state string.
+            message: Informative log message for the state.
+        """
+        if self.last_state != new_state:
+            self.logger.info(message)
+            self.last_state = new_state 
