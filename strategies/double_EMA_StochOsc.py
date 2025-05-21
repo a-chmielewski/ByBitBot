@@ -10,6 +10,12 @@ class StrategyDoubleEMAStochOsc(StrategyTemplate):
     Strategy using Double EMA crossover and Stochastic Oscillator for entry/exit signals.
     """
 
+    def __init__(self,
+                 config: Dict[str, Any],
+                 data: pd.DataFrame,
+                 logger: logging.Logger):
+        super().__init__(config=config, data=data, logger=logger)
+
     def on_init(self) -> None:
         super().on_init() # Call base on_init
         self.logger.info(f"{self.__class__.__name__} on_init called.")

@@ -78,18 +78,18 @@ def test_update_data_adds_new_row(fetcher, mock_exchange):
 
 def test_update_data_replaces_last_row(fetcher, mock_exchange):
     ohlcv = [
-        [1000, 1, 2, 0.5, 1.5, 10, 100],
-        [2000, 1.5, 2.5, 1, 2, 20, 200],
-        [3000, 2, 3, 1.5, 2.5, 30, 300],
-        [4000, 2.5, 3.5, 2, 3, 40, 400],
-        [5000, 3, 4, 2.5, 3.5, 50, 500],
+        [1710000000000, 1, 2, 0.5, 1.5, 10, 100],
+        [1710000001000, 1.5, 2.5, 1, 2, 20, 200],
+        [1710000002000, 2, 3, 1.5, 2.5, 30, 300],
+        [1710000003000, 2.5, 3.5, 2, 3, 40, 400],
+        [1710000004000, 3, 4, 2.5, 3.5, 50, 500],
     ]
     mock_exchange.fetch_ohlcv.return_value = {'result': {'list': ohlcv}}
     fetcher.fetch_initial_data()
     # Same last bar (should replace)
     new_ohlcv = [
-        [4000, 2.5, 3.5, 2, 3, 40, 400],
-        [5000, 3.1, 4.1, 2.6, 3.6, 51, 501],
+        [1710000003000, 2.5, 3.5, 2, 3, 40, 400],
+        [1710000004000, 3.1, 4.1, 2.6, 3.6, 51, 501],
     ]
     mock_exchange.fetch_ohlcv.return_value = {'result': {'list': new_ohlcv}}
     df = fetcher.update_data()

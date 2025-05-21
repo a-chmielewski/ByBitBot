@@ -55,7 +55,7 @@ class LiveDataFetcher:
             return str(int(timeframe))
         except ValueError:
             self.logger.warning(f"Unsupported timeframe format '{timeframe}'. Using as is. This may cause API errors.")
-            return timeframe # Fallback, might cause issues.
+            return timeframe  # Fallback, might cause issues.
 
     def __init__(self, exchange, symbol: str, timeframe: str, window_size: int = DEFAULT_WINDOW_SIZE, logger: Optional[logging.Logger] = None):
         assert exchange is not None, "Exchange connector must be provided."
@@ -65,7 +65,7 @@ class LiveDataFetcher:
         self.logger = logger or logging.getLogger(self.__class__.__name__)
         self.exchange = exchange
         self.symbol = symbol.upper().replace("/", "")
-        self.timeframe_orig = timeframe # Keep original for logging/display if needed
+        self.timeframe_orig = timeframe  # Keep original for logging/display if needed
         self.bybit_interval = self._normalize_timeframe_to_bybit_interval(timeframe)
         self.window_size = window_size
         self.data = pd.DataFrame()
@@ -84,12 +84,15 @@ class LiveDataFetcher:
         """
         if not ohlcv_raw:
             return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        # Reverse if list is newest-first; sorting will ensure correct order in all cases
         ohlcv_raw = ohlcv_raw[::-1]
         df = pd.DataFrame(ohlcv_raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
         df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
+        # Ensure data is ordered from oldest to newest
+        df = df.sort_values('timestamp').reset_index(drop=True)
         return df
 
     def fetch_initial_data(self) -> pd.DataFrame:
@@ -130,10 +133,12 @@ class LiveDataFetcher:
                 raise DataFetchError("No OHLCV data returned from exchange.")
             df_new = self._ohlcv_to_df(ohlcv_raw)
             with self._ws_lock:
+                # Compare newest entries based on timestamp
                 if self.data.empty or df_new['timestamp'].iloc[-1] > self.data['timestamp'].iloc[-1]:
                     self.data = pd.concat([self.data, df_new.iloc[[-1]]], ignore_index=True)
                 elif df_new['timestamp'].iloc[-1] == self.data['timestamp'].iloc[-1]:
-                    self.data.iloc[-1] = df_new.iloc[-1]
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        self.data.at[self.data.index[-1], col] = df_new.iloc[-1][col]
                 self.remove_old_data()
             self.logger.debug(f"Updated OHLCV data: {len(self.data)} rows for {self.symbol} {self.timeframe_orig}")
             return self.data.copy()
@@ -256,4 +261,4 @@ class LiveDataFetcher:
                 self.remove_old_data()
             self.logger.debug(f"WebSocket kline update: {row['timestamp']} {self.symbol} {self.timeframe_orig}")
         except Exception as exc:
-            self.logger.error(f"Failed to process kline message: {exc}") 
+            self.logger.error(f"Failed to process kline message: {exc}")  
