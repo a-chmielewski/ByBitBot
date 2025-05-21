@@ -322,7 +322,7 @@ class StrategyDoubleEMAStochOsc(StrategyTemplate):
             order_side = "sell"
 
         if order_side:
-            self.log_state_change('entry_signal', f"{type(self).__name__}: {order_side.upper()} entry conditions met.")
+            self.log_state_change(symbol, 'entry_conditions_met', f"{type(self).__name__} for {symbol}: {order_side.upper()} entry conditions met.")
             
             strat_order_size = self.config.get('strategy_configs', {}).get(self.__class__.__name__, {}).get('order_size')
             
