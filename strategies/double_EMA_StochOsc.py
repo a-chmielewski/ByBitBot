@@ -337,26 +337,25 @@ class StrategyDoubleEMAStochOsc(StrategyTemplate):
         self.logger.debug(f"{type(self).__name__}: No entry conditions met for {symbol} at {vals.get('current_bar_datetime')} (Price: {vals.get('current_price')}).")
         return None
 
-    def check_exit(self, position_data_from_bot: Dict[str, Any]) -> bool:
+    def check_exit(self, symbol: str = None, **kwargs) -> bool:
         """
-        Check exit conditions for an open position.
+        Check exit conditions for an open position for a specific symbol.
         Args:
-            position_data_from_bot: Current open position details (passed by the bot, should reflect self.position set by base class).
+            symbol: The trading symbol (e.g., 'BTCUSDT')
         Returns:
             bool: True if exit signal, else False.
         """
-        if not position_data_from_bot: # No active position according to strategy state
-            self.log_state_change('no_position_for_exit_check', f"{type(self).__name__}: No position to check for exit.")
-            return False
-        
-        # position_data_from_bot is the dictionary stored in self.position[symbol]
-        # It now directly contains 'side', 'size', 'entry_price', etc.
-        position_side = position_data_from_bot.get('side', '').lower()
-        # position_size = position_data_from_bot.get('size') # If needed
-        # entry_price = position_data_from_bot.get('entry_price') # If needed
+        if symbol is None:
+            raise ValueError(f"{self.__class__.__name__}.check_exit() requires a 'symbol' argument.")
 
+        position_data = self.position.get(symbol)
+        if not position_data:
+            self.log_state_change(symbol, 'no_position_for_exit_check', f"{type(self).__name__}: No position to check for exit.")
+            return False
+
+        position_side = position_data.get('side', '').lower()
         if not position_side:
-            self.logger.error(f"{self.__class__.__name__}: Cannot determine position side from position_data_from_bot. Details: {position_data_from_bot}. Expected 'side' key.")
+            self.logger.error(f"{self.__class__.__name__}: Cannot determine position side from position_data. Details: {position_data}. Expected 'side' key.")
             return False
 
         vals = self._get_current_values()
@@ -378,13 +377,11 @@ class StrategyDoubleEMAStochOsc(StrategyTemplate):
         if self.entry_bar_index is not None:
             current_df_index = len(self.data) - 1 
             num_bars_held = current_df_index - self.entry_bar_index
-            
             if num_bars_held >= self.time_stop_bars:
                 exit_signal = True
                 reason = "time_stop"
                 self.logger.info(f"Exit (time_stop): Position held for {num_bars_held} bars (limit: {self.time_stop_bars}). Current price: {current_price:.2f}")
         else:
-            # If entry_bar_index is None, time stop cannot be evaluated. This might be okay if the position was just opened.
             self.logger.debug("Time-based stop skipped as entry_bar_index is None.")
 
         # 2. Price crosses EMA against the trade direction (if not already triggered by time stop)
@@ -399,11 +396,8 @@ class StrategyDoubleEMAStochOsc(StrategyTemplate):
                 self.logger.info(f"Exit (price_cross_ema_short_exit): Price {current_price:.2f} > EMAFast {ema_fast:.2f}")
         
         if exit_signal:
-            self.log_state_change('exit_signal', f"{type(self).__name__}: Exit conditions met ({reason}), closing position.")
-            return True # Bot.py handles constructing the exit order details
-            
-        # else:
-            # self.log_state_change('in_position', f"{type(self).__name__}: In position ({position_side}), monitoring for exit. Price:{current_price:.2f}, EMAF:{ema_fast:.2f}")
+            self.log_state_change(symbol, 'exit_signal', f"{type(self).__name__}: Exit conditions met ({reason}), closing position.")
+            return True
         return False
 
     def get_risk_parameters(self) -> Dict[str, Any]:
