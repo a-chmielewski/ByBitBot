@@ -189,7 +189,7 @@ class LiveDataFetcher:
                             interval=self.bybit_interval,
                             callback=self.on_kline_message
                         )
-                        self.logger.info(f"WebSocket started for {self.symbol} {self.timeframe_orig}")
+                        self.logger.debug(f"\nWebSocket started for {self.symbol} {self.timeframe_orig}")
                         while self.ws_running:
                             time.sleep(0.1)
                     except Exception as exc:

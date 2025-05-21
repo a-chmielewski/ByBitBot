@@ -16,26 +16,81 @@ class ExchangeConnector:
         self.api_secret = api_secret
         self.testnet = testnet
         self.logger = logger or logging.getLogger(self.__class__.__name__)
-        self.client = None
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self._instrument_info_cache = {} # Cache for instrument details
-        self._authenticate()
+        self._time_offset = 0  # Track time difference with server
+        self.client = None
+        
+        # Initialize with a larger recv_window
+        self._initialize_client()
+        # Initial time sync after client is initialized
+        self._sync_time()
 
-    def _authenticate(self):
-        """
-        Authenticate with ByBit using provided credentials via Pybit.
-        """
+    def _initialize_client(self):
+        """Initialize the HTTP client with proper configuration."""
         try:
             self.client = HTTP(
                 testnet=self.testnet,
                 api_key=self.api_key,
-                api_secret=self.api_secret
+                api_secret=self.api_secret,
+                recv_window=30000  # Increased to 30 seconds
             )
-            self.logger.info(f"Authenticated to ByBit ({'testnet' if self.testnet else 'mainnet'}) successfully.")
+            self.logger.info(f"Initialized ByBit client ({'testnet' if self.testnet else 'mainnet'})")
         except Exception as e:
-            self.logger.error(f"Authentication failed: {e}")
-            raise ExchangeError("Authentication failed")
+            self.logger.error(f"Client initialization failed: {e}")
+            raise ExchangeError("Client initialization failed")
+
+    def _sync_time(self):
+        """Synchronize local time with ByBit v5 server time (with full fallbacks)."""
+        if not self.client:
+            self.logger.error("Cannot sync time: Client not initialized")
+            return
+
+        try:
+            resp = self.client.get_server_time()
+            if not isinstance(resp, dict):
+                raise ValueError(f"Unexpected response type: {resp!r}")
+
+            # 1) Try top-level 'time' (ms)
+            server_ms = resp.get("time")
+
+            # 2) Fallback to result.timeNano (ns → ms)
+            if not server_ms:
+                result = resp.get("result", {})
+                time_nano = result.get("timeNano")
+                if time_nano:
+                    server_ms = int(int(time_nano) / 1_000_000)
+
+            # 3) Fallback to result.timeSecond (s → ms)
+            if not server_ms:
+                result = resp.get("result", {})
+                time_sec = result.get("timeSecond")
+                if time_sec:
+                    server_ms = int(float(time_sec) * 1000)
+
+            if not server_ms:
+                self.logger.error(f"Unable to parse server time from: {resp}")
+                return
+
+            local_ms = int(time.time() * 1000)
+            # Offset in seconds
+            self._time_offset = (server_ms - local_ms) / 1000.0
+
+            self.logger.info(
+                f"Time synchronized with ByBit server. Offset: {self._time_offset:.3f}s"
+            )
+            self.logger.debug(
+                f"  server_ms={server_ms}  local_ms={local_ms}"
+            )
+
+        except Exception as e:
+            self.logger.error(f"Failed to sync time with ByBit server: {e}")
+            # Don't raise so your bot can still run, but your next _api_call will retry
+
+    def _get_adjusted_timestamp(self) -> int:
+        """Get timestamp adjusted for server time offset."""
+        return int((time.time() + self._time_offset) * 1000)
 
     def _check_response(self, response: dict, context: str = "API call") -> dict:
         """
@@ -77,20 +132,39 @@ class ExchangeConnector:
         retries = 0
         while True:
             try:
+                # Add timestamp to kwargs if not present
+                if 'timestamp' not in kwargs:
+                    kwargs['timestamp'] = self._get_adjusted_timestamp()
+                
                 response = func(*args, **kwargs)
+                
                 # Check for HTTP error codes in response if available
                 if hasattr(response, 'status_code') and response.status_code in (429, 500):
                     raise ExchangeError(f"HTTP error {response.status_code}")
+                    
                 return response
+                
             except Exception as e:
-                # Check for HTTP 429/500 in exception message
                 err_msg = str(e)
-                if ("429" in err_msg or "rate limit" in err_msg or "500" in err_msg) and retries < self.max_retries:
+                
+                # Handle timestamp errors
+                if "timestamp" in err_msg.lower() and retries < self.max_retries:
+                    self.logger.warning(f"Timestamp error detected. Resyncing time with server...")
+                    self._sync_time()  # Resync time
+                    wait = self.backoff_base * (2 ** retries)
+                    self.logger.warning(f"Retrying in {wait:.2f}s (attempt {retries+1}/{self.max_retries})...")
+                    time.sleep(wait)
+                    retries += 1
+                    continue
+                    
+                # Handle rate limits and server errors
+                elif ("429" in err_msg or "rate limit" in err_msg or "500" in err_msg) and retries < self.max_retries:
                     wait = self.backoff_base * (2 ** retries)
                     self.logger.warning(f"Rate limit/server error encountered. Retrying in {wait:.2f}s (attempt {retries+1}/{self.max_retries})...")
                     time.sleep(wait)
                     retries += 1
                     continue
+                    
                 self.logger.error(f"API call failed after {retries} retries: {e}")
                 raise
 
@@ -107,7 +181,8 @@ class ExchangeConnector:
                 raise ExchangeError("Client not authenticated")
             response = self._api_call_with_backoff(self.client.place_order, **kwargs)
             checked = self._check_response(response, context="place_order")
-            self.logger.info(f"Order placed: {kwargs} | Response: {checked}")
+            self.logger.info(f"Order placed")
+            self.logger.debug(f"Order placed: {kwargs} | Response: {checked}")
             return checked
         except Exception as e:
             self.logger.error(f"Order placement failed: {e}")
@@ -231,49 +306,85 @@ class ExchangeConnector:
             self.logger.error(f"Fetch open orders failed: {e}")
             raise ExchangeError(f"Fetch open orders failed: {str(e)}")
 
-    def fetch_order(self, symbol: str, order_id: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def fetch_order(self, symbol: str, order_id: str, category: str = "linear", params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Fetch a single order by order_id by pulling open orders (and optionally history).
+        Fetch a single order by order_id for a given symbol and category.
+        Args:
+            symbol: Trading pair (e.g., 'BTCUSDT')
+            order_id: The order ID to fetch.
+            category: The category of the product (e.g., 'linear', 'spot'). Defaults to 'linear'.
+            params: Optional additional parameters for the API call (e.g., {'orderLinkId': '...'}).
+                    This should not include 'symbol', 'orderId', or 'category' as they are handled directly.
+        Returns:
+            API response dict for the found order.
+        Raises:
+            ExchangeError if the order is not found or an API error occurs.
         """
         if not self.client:
             raise ExchangeError("Client not authenticated")
-        norm = symbol.replace("/", "").upper()
-        category = params.get("category", "linear") if params else "linear"
+        
+        norm_symbol = symbol.replace("/", "").upper()
+        
+        # Base parameters for pybit call
+        base_call_params = {
+            "category": category,
+            "symbol": norm_symbol,
+            "orderId": order_id
+        }
+        
+        # Merge additional unique params, ensuring no overlap with base_call_params keys
+        if params:
+            for key, value in params.items():
+                if key not in base_call_params or base_call_params[key] is None:
+                    base_call_params[key] = value
+                elif base_call_params[key] != value:
+                    raise ExchangeError(f"Parameter conflict in fetch_order: Cannot override primary param '{key}' (value: '{base_call_params[key]}') with different value '{value}' from params dictionary.")
 
-        # 1) Try open orders
-        resp = self._api_call_with_backoff(
-            self.client.get_open_orders,
-            symbol=norm,
-            category=category,
-            **(params or {})
-        )
-        resp = self._check_response(resp, context="fetch_open_orders for fetch_order")
-        orders = resp.get("result", {}).get("list", [])
-        for o in orders:
-            if o.get("orderId") == order_id:
-                return {
-                    "retCode": resp["retCode"],
-                    "retMsg": resp["retMsg"],
-                    "result": o
-                }
+        # First try get_order_history since it accepts orderId
+        try:
+            self.logger.debug(f"Attempting to fetch order {order_id} using get_order_history with params: {base_call_params}")
+            response = self._api_call_with_backoff(self.client.get_order_history, **base_call_params)
+            checked_response = self._check_response(response, context="fetch_order via get_order_history")
+            
+            order_list = checked_response.get("result", {}).get("list", [])
+            if order_list:
+                found_order_data = order_list[0]
+                if found_order_data.get('orderId') == order_id:
+                    self.logger.info(f"Order {order_id} found in order history.")
+                    self.logger.debug(f"Order {order_id} found in order history. Data: {found_order_data}")
+                    return {
+                        "retCode": checked_response.get("retCode", 0),
+                        "retMsg": checked_response.get("retMsg", "OK"),
+                        "result": found_order_data,
+                        "retExtInfo": checked_response.get("retExtInfo", {}),
+                        "time": checked_response.get("time", time.time() * 1000)
+                    }
+        except Exception as e:
+            self.logger.debug(f"Order {order_id} not found in history: {e}")
 
-        # 2) (Optional) Fallback to history if it's already been filled or cancelled
-        hist = self._api_call_with_backoff(
-            self.client.get_order_history,
-            symbol=norm,
-            category=category,
-            **(params or {})
-        )
-        hist = self._check_response(hist, context="fetch_order_history for fetch_order")
-        for o in hist.get("result", {}).get("list", []):
-            if o.get("orderId") == order_id:
-                return {
-                    "retCode": hist["retCode"],
-                    "retMsg": hist["retMsg"],
-                    "result": o
-                }
+        # If not found in history, try get_open_orders without orderId and filter client-side
+        try:
+            open_params = {k: v for k, v in base_call_params.items() if k != 'orderId'}
+            self.logger.debug(f"Attempting to fetch order {order_id} from open orders with params: {open_params}")
+            response = self._api_call_with_backoff(self.client.get_open_orders, **open_params)
+            checked_response = self._check_response(response, context="fetch_order via get_open_orders")
+            
+            order_list = checked_response.get("result", {}).get("list", [])
+            for order in order_list:
+                if order.get('orderId') == order_id:
+                    self.logger.info(f"Order {order_id} found in open orders. Data: {order}")
+                    return {
+                        "retCode": checked_response.get("retCode", 0),
+                        "retMsg": checked_response.get("retMsg", "OK"),
+                        "result": order,
+                        "retExtInfo": checked_response.get("retExtInfo", {}),
+                        "time": checked_response.get("time", time.time() * 1000)
+                    }
+        except Exception as e:
+            self.logger.debug(f"Order {order_id} not found in open orders: {e}")
 
-        raise ExchangeError(f"Order {order_id} not found in open or history")
+        self.logger.error(f"Order {order_id} for symbol {symbol} (category {category}) not found after checking history and open orders.")
+        raise ExchangeError(f"Order {order_id} not found after checking history and open orders.")
 
     def _fetch_instrument_info(self, symbol: str, category: str = 'linear'):
         norm_symbol = symbol.replace("/", "").upper()

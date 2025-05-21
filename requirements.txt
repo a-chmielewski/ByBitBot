@@ -5,4 +5,5 @@ numpy
 pandas-ta
 ta-lib
 requests
-python-dotenv 
+python-dotenv
+colorama 

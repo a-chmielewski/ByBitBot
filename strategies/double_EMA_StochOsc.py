@@ -10,63 +10,77 @@ class StrategyDoubleEMAStochOsc(StrategyTemplate):
     Strategy using Double EMA crossover and Stochastic Oscillator for entry/exit signals.
     """
 
-    def __init__(self, data: pd.DataFrame, config: Dict[str, Any], logger: Optional[logging.Logger] = None):
-        """
-        Initialize the strategy with data, configuration, and a logger.
-
-        Args:
-            data: DataFrame containing OHLCV market data.
-            config: Dictionary with strategy-specific and global parameters.
-            logger: Optional logger instance for strategy-specific logging.
-        """
-        # Default strategy-specific parameters
-        self.strategy_config = {
-            "ema_slow_period": config.get("ema_slow_period", 150),
-            "ema_fast_period": config.get("ema_fast_period", 50),
-            "stoch_k_period": config.get("stoch_k_period", 5),
-            "stoch_d_period": config.get("stoch_d_period", 3),
-            "stoch_slowing_period": config.get("stoch_slowing_period", 3),
-            "stop_loss_pct": config.get("stop_loss_pct", 0.01),
-            "take_profit_pct": config.get("take_profit_pct", 0.02),
-            "stoch_overbought": config.get("stoch_overbought", 80),
-            "stoch_oversold": config.get("stoch_oversold", 20),
-            "time_stop_bars": config.get("time_stop_bars", 30),
-            "ema_proximity_pct": config.get("ema_proximity_pct", 0.003)
-        }
-        super().__init__(data, self.strategy_config, logger)
-        
-        self.entry_bar_index: Optional[int] = None
-
     def on_init(self) -> None:
+        super().on_init() # Call base on_init
         self.logger.info(f"{self.__class__.__name__} on_init called.")
-        if len(self.data) < max(self.strategy_config["ema_slow_period"], self.strategy_config["ema_fast_period"]):
+        
+        # Access parameters from self.config (which is the config dict passed to __init__)
+        # It's assumed these parameters are now directly in the config object
+        # or nested under a strategy-specific key in the main config.json
+        # For consistency with StrategyExample, let's assume they are fetched like this:
+        strategy_specific_params = self.config.get('strategy_configs', {}).get(self.__class__.__name__, {})
+
+        self.ema_slow_period = strategy_specific_params.get("ema_slow_period", 150)
+        self.ema_fast_period = strategy_specific_params.get("ema_fast_period", 50)
+        self.stoch_k_period = strategy_specific_params.get("stoch_k_period", 5)
+        self.stoch_d_period = strategy_specific_params.get("stoch_d_period", 3)
+        self.stoch_slowing_period = strategy_specific_params.get("stoch_slowing_period", 3)
+        # Risk parameters (sl_pct, tp_pct) are handled by get_risk_parameters
+        self.stoch_overbought = strategy_specific_params.get("stoch_overbought", 80)
+        self.stoch_oversold = strategy_specific_params.get("stoch_oversold", 20)
+        self.time_stop_bars = strategy_specific_params.get("time_stop_bars", 30) # Used in check_exit
+        self.ema_proximity_pct = strategy_specific_params.get("ema_proximity_pct", 0.003)
+
+        # Cache risk parameters
+        self.sl_pct = strategy_specific_params.get('sl_pct',
+                    strategy_specific_params.get('stop_loss_pct', 0.01))
+        self.tp_pct = strategy_specific_params.get('tp_pct',
+                    strategy_specific_params.get('take_profit_pct', 0.02))
+        if 'sl_pct' not in strategy_specific_params and 'stop_loss_pct' not in strategy_specific_params:
+            self.logger.info(f"{self.__class__.__name__}: No stop loss config found for 'sl_pct' or 'stop_loss_pct'. Using default value: {self.sl_pct}")
+        if 'tp_pct' not in strategy_specific_params and 'take_profit_pct' not in strategy_specific_params:
+            self.logger.info(f"{self.__class__.__name__}: No take profit config found for 'tp_pct' or 'take_profit_pct'. Using default value: {self.tp_pct}")
+
+        self.logger.info(f"{self.__class__.__name__} parameters: EMA Fast={self.ema_fast_period}, EMA Slow={self.ema_slow_period}, Stoch K={self.stoch_k_period}, D={self.stoch_d_period}, Slowing={self.stoch_slowing_period}")
+
+        if len(self.data) < max(self.ema_slow_period, self.ema_fast_period):
             self.logger.warning("Initial data may be too short for reliable EMA calculation.")
+        
+        self.entry_bar_index: Optional[int] = None # This seems specific to time-based exits
 
     def init_indicators(self) -> None:
         """
         Initialize indicators required by the strategy.
-        This method is called by the parent StrategyTemplate's __init__.
         """
         if self.data is None or self.data.empty:
-            self.logger.error("Data is not available for indicator initialization.")
-            # Potentially raise an error or set a flag to prevent trading
+            self.logger.error(f"'{self.__class__.__name__}': Data is not available for indicator initialization.")
+            # Create empty columns if data is a DataFrame, to prevent key errors later
+            if isinstance(self.data, pd.DataFrame):
+                for col_name in ['ema_fast', 'ema_slow', 'stoch_k', 'stoch_d']:
+                    self.data[col_name] = pd.Series(dtype='float64')
             return
 
+        if 'close' not in self.data.columns:
+            self.logger.error(f"'{self.__class__.__name__}': 'close' column missing from data. Cannot init indicators.")
+            # Create empty columns to prevent key errors later
+            for col_name in ['ema_fast', 'ema_slow', 'stoch_k', 'stoch_d']:
+                self.data[col_name] = pd.Series(dtype='float64')
+            return
+            
         try:
             self.logger.debug(f"Initializing indicators with data columns: {self.data.columns.tolist()} and length: {len(self.data)}")
             # EMA Fast and Slow
-            self.data['ema_fast'] = self.data.ta.ema(close=self.data['close'], length=self.strategy_config["ema_fast_period"])
-            self.data['ema_slow'] = self.data.ta.ema(close=self.data['close'], length=self.strategy_config["ema_slow_period"])
+            self.data['ema_fast'] = self.data.ta.ema(close=self.data['close'], length=self.ema_fast_period)
+            self.data['ema_slow'] = self.data.ta.ema(close=self.data['close'], length=self.ema_slow_period)
 
             # Stochastic Oscillator
             stoch_df = self.data.ta.stoch(
                 high='high', low='low', close='close',
-                k=self.strategy_config["stoch_k_period"],
-                d=self.strategy_config["stoch_d_period"],
-                smooth_k=self.strategy_config["stoch_slowing_period"]
+                k=self.stoch_k_period,
+                d=self.stoch_d_period,
+                smooth_k=self.stoch_slowing_period,
             )
             
-            # Dynamically find column names for stochastic K and D lines
             k_col_name = next((col for col in stoch_df.columns if col.lower().startswith('stochk')), None)
             d_col_name = next((col for col in stoch_df.columns if col.lower().startswith('stochd')), None)
 
@@ -75,55 +89,139 @@ class StrategyDoubleEMAStochOsc(StrategyTemplate):
                 self.data['stoch_d'] = stoch_df[d_col_name]
                 self.logger.debug(f"Stochastic K ({k_col_name}) and D ({d_col_name}) lines added to data.")
             else:
+                self.logger.error("Could not find Stochastic K or D columns in pandas_ta output.")
+                # Create empty series that will contain NaN values
                 self.data['stoch_k'] = pd.Series(index=self.data.index, dtype='float64')
                 self.data['stoch_d'] = pd.Series(index=self.data.index, dtype='float64')
 
-            self.logger.info(f"{self.__class__.__name__} indicators initialized. Data length now: {len(self.data)}")
-            if self.data[['ema_fast', 'ema_slow', 'stoch_k', 'stoch_d']].isnull().all().all():
-                 self.logger.warning("All indicator columns are NaN after initialization. Check data and periods.")
-            elif self.data[['ema_fast', 'ema_slow', 'stoch_k', 'stoch_d']].isnull().any().any():
-                 self.logger.info("Some NaN values present in indicator columns, typically at the start of the series.")
+            self.logger.debug(f"{self.__class__.__name__} indicators initialized. Data length now: {len(self.data)}")
+            # Log information about the warm-up period
+            nan_counts = self.data[['ema_fast', 'ema_slow', 'stoch_k', 'stoch_d']].isnull().sum()
+            self.logger.debug(f"Indicator warm-up periods (NaN counts): {nan_counts.to_dict()}")
+            # Determine the maximum warm-up period needed
+            max_warmup = max(nan_counts)
+            self.logger.debug(f"Maximum warm-up period needed: {max_warmup} bars")
 
         except AttributeError as ae:
             if 'ta' in str(ae).lower():
-                 self.logger.error(f"Pandas_TA extension 'ta' not available on DataFrame. Ensure pandas_ta is correctly installed and imported. Error: {ae}", exc_info=True)
+                 self.logger.error(f"Pandas_TA extension 'ta' not available on DataFrame. Error: {ae}", exc_info=True)
             else:
                  self.logger.error(f"AttributeError during indicator initialization: {ae}", exc_info=True)
-            raise
+            # Avoid raising here if data columns were created, allow bot to proceed but strategy won't signal.
         except Exception as e:
             self.logger.error(f"Error initializing indicators: {e}", exc_info=True)
-            raise
+            # Avoid raising here.
 
     def update_indicators_for_new_row(self) -> None:
         """
         Efficiently update indicators only for the latest row in self.data.
-        Should be called after a new row is appended to the rolling window.
+        Called by bot.py after a new row is appended to the rolling window.
+        EMAs are calculated incrementally.
+        Stochastic Oscillator is calculated using pandas_ta on a tail of the data.
         """
-        if self.data is None or self.data.empty:
+        if self.data is None or self.data.empty or 'close' not in self.data.columns:
+            self.logger.debug(f"'{self.__class__.__name__}': Data not ready for update_indicators_for_new_row (data is None, empty, or 'close' column missing).")
             return
-        idx = self.data.index[-1]
-        # EMA Fast and Slow (using pandas_ta for consistency)
-        fast_period = self.strategy_config["ema_fast_period"]
-        slow_period = self.strategy_config["ema_slow_period"]
-        # Only recalculate for the window needed for EMA
-        self.data['ema_fast'] = self.data.ta.ema(length=fast_period)
-        self.data['ema_slow'] = self.data.ta.ema(length=slow_period)
-        # Stochastic Oscillator (calculate for the window needed)
-        stoch_k_period = self.strategy_config["stoch_k_period"]
-        stoch_d_period = self.strategy_config["stoch_d_period"]
-        stoch_slowing_period = self.strategy_config["stoch_slowing_period"]
-        stoch_df = self.data.ta.stoch(
-            high='high', low='low', close='close',
-            k=stoch_k_period, d=stoch_d_period, smooth_k=stoch_slowing_period
-        )
-        k_col_name = next((col for col in stoch_df.columns if col.lower().startswith('stochk')), None)
-        d_col_name = next((col for col in stoch_df.columns if col.lower().startswith('stochd')), None)
-        if k_col_name and d_col_name:
-            self.data.loc[:, 'stoch_k'] = stoch_df[k_col_name]
-            self.data.loc[:, 'stoch_d'] = stoch_df[d_col_name]
-        else:
-            self.data.loc[:, 'stoch_k'] = pd.Series(index=self.data.index, dtype='float64')
-            self.data.loc[:, 'stoch_d'] = pd.Series(index=self.data.index, dtype='float64')
+
+        if len(self.data) < 2:
+            self.logger.debug(f"'{self.__class__.__name__}': Not enough data for incremental update (need at least 2 rows). Current rows: {len(self.data)}. Falling back to full init_indicators.")
+            # Fallback to full init for safety if data is too short, though ideally this path isn't hit often
+            # if DataFetcher ensures sufficient initial data and then appends one by one.
+            self.init_indicators() 
+            return
+
+        try:
+            # --- Incremental EMA Calculation ---
+            latest_idx = self.data.index[-1]
+            prev_idx = self.data.index[-2]
+
+            current_close = self.data.loc[latest_idx, 'close']
+            
+            # EMA Fast
+            prev_ema_fast = self.data.loc[prev_idx, 'ema_fast']
+            if pd.isna(prev_ema_fast):
+                # Use SMA of first ema_fast_period closes as seed if enough data, else fallback to current close
+                if len(self.data) >= self.ema_fast_period:
+                    sma_seed = self.data['close'].iloc[-self.ema_fast_period:].mean()
+                    self.logger.debug(f"Previous fast EMA is NaN, initializing with SMA({self.ema_fast_period}) seed: {sma_seed}")
+                    prev_ema_fast = sma_seed
+                else:
+                    self.logger.debug(f"Previous fast EMA is NaN, not enough data for SMA seed, using current close price: {current_close}")
+                    prev_ema_fast = current_close
+            alpha_fast = 2 / (self.ema_fast_period + 1)
+            new_ema_fast = (current_close * alpha_fast) + (prev_ema_fast * (1 - alpha_fast))
+            self.data.loc[latest_idx, 'ema_fast'] = new_ema_fast
+
+            # EMA Slow
+            prev_ema_slow = self.data.loc[prev_idx, 'ema_slow']
+            if pd.isna(prev_ema_slow):
+                # Use SMA of first ema_slow_period closes as seed if enough data, else fallback to current close
+                if len(self.data) >= self.ema_slow_period:
+                    sma_seed = self.data['close'].iloc[-self.ema_slow_period:].mean()
+                    self.logger.debug(f"Previous slow EMA is NaN, initializing with SMA({self.ema_slow_period}) seed: {sma_seed}")
+                    prev_ema_slow = sma_seed
+                else:
+                    self.logger.debug(f"Previous slow EMA is NaN, not enough data for SMA seed, using current close price: {current_close}")
+                    prev_ema_slow = current_close
+            alpha_slow = 2 / (self.ema_slow_period + 1)
+            new_ema_slow = (current_close * alpha_slow) + (prev_ema_slow * (1 - alpha_slow))
+            self.data.loc[latest_idx, 'ema_slow'] = new_ema_slow
+            
+            # --- Stochastic Oscillator Calculation (on data tail) ---
+            # Throttle recalculation to every 3 bars for performance
+            if not hasattr(self, '_last_stoch_calc_bar'):
+                self._last_stoch_calc_bar = -1
+                self._last_stoch_values = {'k': 0.0, 'd': 0.0}
+            stoch_recalc_interval = 3
+            min_stoch_data_len = self.stoch_k_period + self.stoch_slowing_period + self.stoch_d_period + 5 
+            current_bar = len(self.data) - 1
+            if len(self.data) >= min_stoch_data_len and (current_bar % stoch_recalc_interval == 0 or self._last_stoch_calc_bar == -1):
+                stoch_input_df = self.data.tail(min_stoch_data_len).copy()
+                stoch_df_tail = stoch_input_df.ta.stoch(
+                    high='high', low='low', close='close',
+                    k=self.stoch_k_period,
+                    d=self.stoch_d_period,
+                    smooth_k=self.stoch_slowing_period,
+                )
+                if stoch_df_tail is not None and not stoch_df_tail.empty:
+                    k_col_name_tail = next((col for col in stoch_df_tail.columns if col.lower().startswith('stochk')), None)
+                    d_col_name_tail = next((col for col in stoch_df_tail.columns if col.lower().startswith('stochd')), None)
+                    if k_col_name_tail and d_col_name_tail:
+                        k_val = stoch_df_tail[k_col_name_tail].iloc[-1]
+                        d_val = stoch_df_tail[d_col_name_tail].iloc[-1]
+                        self.data.loc[latest_idx, 'stoch_k'] = k_val
+                        self.data.loc[latest_idx, 'stoch_d'] = d_val
+                        self._last_stoch_values = {'k': k_val, 'd': d_val}
+                        self._last_stoch_calc_bar = current_bar
+                    else:
+                        self.logger.warning(f"'{self.__class__.__name__}': Could not find Stochastic K or D columns in pandas_ta output on tail data. Setting to 0 for latest row.")
+                        self.data.loc[latest_idx, 'stoch_k'] = 0.0
+                        self.data.loc[latest_idx, 'stoch_d'] = 0.0
+                        self._last_stoch_values = {'k': 0.0, 'd': 0.0}
+                        self._last_stoch_calc_bar = current_bar
+                else:
+                    self.logger.warning(f"'{self.__class__.__name__}': pandas_ta.stoch on tail data returned None or empty. Setting to 0 for latest row.")
+                    self.data.loc[latest_idx, 'stoch_k'] = 0.0
+                    self.data.loc[latest_idx, 'stoch_d'] = 0.0
+                    self._last_stoch_values = {'k': 0.0, 'd': 0.0}
+                    self._last_stoch_calc_bar = current_bar
+            elif len(self.data) >= min_stoch_data_len:
+                # Use cached values
+                self.data.loc[latest_idx, 'stoch_k'] = self._last_stoch_values['k']
+                self.data.loc[latest_idx, 'stoch_d'] = self._last_stoch_values['d']
+            else:
+                self.logger.debug(f"'{self.__class__.__name__}': Not enough data ({len(self.data)} rows) for Stoch tail calculation (need {min_stoch_data_len}). Setting Stoch K/D to 0 for latest row.")
+                self.data.loc[latest_idx, 'stoch_k'] = 0.0
+                self.data.loc[latest_idx, 'stoch_d'] = 0.0
+
+        except KeyError as ke:
+            self.logger.error(f"'{self.__class__.__name__}': KeyError in update_indicators_for_new_row: {ke}. This might happen if 'ema_fast', 'ema_slow' or 'close' are missing from previous rows, or if self.data was modified unexpectedly.", exc_info=True)
+            # Fallback to full init if something is wrong with assumptions for incremental
+            self.init_indicators()
+        except Exception as e:
+            self.logger.error(f"'{self.__class__.__name__}': Error in update_indicators_for_new_row: {e}", exc_info=True)
+            # Fallback for other errors
+            self.init_indicators()
 
     def _get_current_values(self) -> Optional[Dict[str, Any]]:
         """ Helper to get the latest (and previous for some fields) values from the data. """
@@ -131,33 +229,31 @@ class StrategyDoubleEMAStochOsc(StrategyTemplate):
             self.logger.debug("Data is None or empty in _get_current_values.")
             return None
         
-        # Ensure enough data for current and previous values
-        if len(self.data) < 2:
+        if len(self.data) < 2: # Need at least 2 for previous values
             self.logger.debug(f"Not enough data for current and previous values. Have {len(self.data)} rows.")
-            # Allow proceeding if only 1 row, but prev_ values will be same as current
-            # return None # Stricter: requires at least 2 rows
+            return None
 
         latest = self.data.iloc[-1]
         # Use previous if available, otherwise use latest (for the very first bar after warmup)
-        previous = self.data.iloc[-2] if len(self.data) >= 2 else latest
+        previous = self.data.iloc[-2] if len(self.data) >= 2 else latest # This should be fine now
 
         required_cols = ['close', 'ema_fast', 'ema_slow', 'stoch_k', 'stoch_d']
-        # Check if all required columns exist in the DataFrame
         if not all(col in self.data.columns for col in required_cols):
             missing_cols = [col for col in required_cols if col not in self.data.columns]
-            self.logger.warning(f"Missing one or more required columns in data for _get_current_values: {missing_cols}. Available: {self.data.columns.tolist()}")
+            self.logger.warning(f"Missing one or more required columns: {missing_cols}. Available: {self.data.columns.tolist()}")
             return None
         
         # Check for NaN values in critical indicators for the latest bar
+        # fillna(0) was used, so NaNs here mean the column wasn't even created properly or all data was bad.
         if latest[required_cols].isnull().any():
-            self.logger.debug(f"NaN values detected in critical indicators for the latest bar. Data: {latest[required_cols].to_dict()}")
-            return None
+            self.logger.info(f"NaN values detected in latest bar indicators: {latest[required_cols].to_dict()}")
+            # This might indicate an issue if fillna(0) was expected to handle it.
+            # However, if source 'close'/'high'/'low' is NaN, output can be NaN.
+            return None 
         
-        # Previous values might have NaNs if it's at the very beginning of the series after indicator calculation
-        # This is often acceptable for crossover conditions.
-        # if previous[required_cols].isnull().any().any() and len(self.data) >=2:
-        #     self.logger.debug(f"NaN values detected in critical indicators for the previous bar. Data: {previous[required_cols].to_dict()}")
-            # Depending on strategy, might return None or proceed with caution
+        # Check previous for NaNs for crossover logic
+        prev_stoch_k_val = previous['stoch_k'] if 'stoch_k' in previous else float('nan')
+        prev_stoch_d_val = previous['stoch_d'] if 'stoch_d' in previous else float('nan')
 
         return {
             "current_price": latest['close'],
@@ -165,27 +261,20 @@ class StrategyDoubleEMAStochOsc(StrategyTemplate):
             "ema_slow": latest['ema_slow'],
             "stoch_k": latest['stoch_k'],
             "stoch_d": latest['stoch_d'],
-            "prev_stoch_k": previous['stoch_k'], # Can be NaN if len(self.data) < k_period or similar
-            "prev_stoch_d": previous['stoch_d'], # Can be NaN
-            "current_bar_datetime": latest.name # Assuming datetime index for self.data
+            "prev_stoch_k": prev_stoch_k_val,
+            "prev_stoch_d": prev_stoch_d_val,
+            "current_bar_datetime": latest.name 
         }
 
-    def check_entry(self) -> Optional[Dict[str, Any]]:
+    def _check_entry_conditions(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
-        Check entry conditions.
+        Check entry conditions for a given symbol.
         Returns:
             dict | None: Order details if entry signal, else None.
-                         Example: {"side": "buy", "size": 0.001, "type": "market",
-                                   "stop_loss_price": 12300.0, "take_profit_price": 12400.0}
         """
-        if self.position:  # Already in a position, no new entry
-            self.log_state_change('in_position', f"{type(self).__name__}: In position, monitoring for exit.")
-            return None
-
         vals = self._get_current_values()
         if not vals:
-            self.log_state_change('waiting_for_entry', f"{type(self).__name__}: Waiting for entry opportunity (insufficient data).")
-            self.logger.info(f"Waiting for entry: insufficient data or indicators. Latest close: {self.data['close'].iloc[-1] if not self.data.empty else 'N/A'}")
+            self.logger.debug(f"{type(self).__name__}: No entry conditions met for {symbol} at {vals.get('current_bar_datetime')}.")
             return None
 
         current_price = vals["current_price"]
@@ -196,235 +285,168 @@ class StrategyDoubleEMAStochOsc(StrategyTemplate):
         prev_stoch_k = vals["prev_stoch_k"]
         prev_stoch_d = vals["prev_stoch_d"]
 
-        # Handle potential NaN in prev_stoch values for crossover detection
-        # If previous stochastic values are NaN (e.g. at the start of data series),
-        # a crossover cannot be reliably determined.
-        if pd.isna(prev_stoch_k) or pd.isna(prev_stoch_d):
-            self.logger.info(f"Waiting for entry: prev_stoch_k or prev_stoch_d is NaN. prev_stoch_k={prev_stoch_k}, prev_stoch_d={prev_stoch_d}")
-            return None 
+        # Check if we have all required values (not in warm-up period)
+        required_values = [current_price, ema_fast, ema_slow, stoch_k, stoch_d, prev_stoch_k, prev_stoch_d]
+        if any(pd.isna(val) for val in required_values):
+            self.logger.info("One or more indicators still in warm-up period or missing data, skipping entry check.")
+            return None
 
         # --- Entry Conditions ---
-        # Long entry conditions based on original logic:
-        # ema_uptrend: EMA_fast > EMA_slow
-        # price_at_ema: Price is near fast EMA (within proximity %)
-        # stoch_oversold: Current Stochastic K is below oversold level
-        # stoch_crossing_up: Stochastic K crossed above Stochastic D (K[-1] < D[-1] and K[0] > D[0])
-
         ema_uptrend = ema_fast > ema_slow
-        price_near_fast_ema = abs(current_price - ema_fast) < (self.strategy_config["ema_proximity_pct"] * current_price)
-        
-        stoch_k_is_oversold = stoch_k < self.strategy_config["stoch_oversold"]
+        price_near_fast_ema = abs(current_price - ema_fast) < (self.ema_proximity_pct * current_price)
+        stoch_k_is_oversold = stoch_k < self.stoch_oversold
         stoch_crossing_up = (prev_stoch_k < prev_stoch_d) and (stoch_k > stoch_d)
         
         long_condition = (
             ema_uptrend and
             price_near_fast_ema and
-            stoch_k_is_oversold and # Original: self.stoch.percK[-1] < self.p.stoch_oversold (prev K) and self.stoch.percK[0] > self.stoch.percD[0] (current K > current D)
-                                  # The original also had stoch K[0] > D[0] which is part of crossing_up
+            stoch_k_is_oversold and
             stoch_crossing_up
         )
 
-        # Short entry conditions based on original logic:
-        # ema_downtrend: EMA_fast < EMA_slow
-        # price_at_ema: Price is near fast EMA
-        # stoch_overbought: Current Stochastic K is above overbought level
-        # stoch_crossing_down: Stochastic K crossed below Stochastic D (K[-1] > D[-1] and K[0] < D[0])
-
         ema_downtrend = ema_fast < ema_slow
-        # price_near_fast_ema is the same condition for proximity
-        
-        stoch_k_is_overbought = stoch_k > self.strategy_config["stoch_overbought"]
+        stoch_k_is_overbought = stoch_k > self.stoch_overbought
         stoch_crossing_down = (prev_stoch_k > prev_stoch_d) and (stoch_k < stoch_d)
 
         short_condition = (
             ema_downtrend and
             price_near_fast_ema and
-            stoch_k_is_overbought and # Original: self.stoch.percK[-1] > self.p.stoch_overbought (prev K) and self.stoch.percK[0] < self.stoch.percD[0] (current K < current D)
+            stoch_k_is_overbought and
             stoch_crossing_down
         )
 
-        # Always log the current state and entry condition components
-        self.logger.debug(
-            f"Waiting for entry: price={current_price}, ema_fast={ema_fast}, ema_slow={ema_slow}, "
-            f"stoch_k={stoch_k}, stoch_d={stoch_d}, "
-            f"ema_uptrend={ema_uptrend}, price_near_fast_ema={price_near_fast_ema}, "
-            f"stoch_k_is_oversold={stoch_k_is_oversold}, stoch_crossing_up={stoch_crossing_up}, "
-            f"ema_downtrend={ema_downtrend}, stoch_k_is_overbought={stoch_k_is_overbought}, stoch_crossing_down={stoch_crossing_down}"
-        )
-
-        order_details = None
+        order_side = None
         if long_condition:
-            self.log_state_change('entry_signal', f"{type(self).__name__}: Long entry conditions met, placing order.")
-            self.logger.info(f"Long entry signal detected at price {current_price}. EMAFast={ema_fast:.2f}, EMASlow={ema_slow:.2f}, StochK={stoch_k:.2f}, StochD={stoch_d:.2f}")
-            order_details = {
-                "side": "buy",
-                "type": "market", 
-                # Do not set a default order size here; OrderManager will enforce Bybit minimum
-                "size": self.strategy_config.get("order_size"),
-                "price": current_price
-            }
-
+            order_side = "buy"
         elif short_condition:
-            self.log_state_change('entry_signal', f"{type(self).__name__}: Short entry conditions met, placing order.")
-            self.logger.info(f"Short entry signal detected at price {current_price}. EMAFast={ema_fast:.2f}, EMASlow={ema_slow:.2f}, StochK={stoch_k:.2f}, StochD={stoch_d:.2f}")
-            order_details = {
-                "side": "sell",
-                "type": "market",
-                # Do not set a default order size here; OrderManager will enforce Bybit minimum
-                "size": self.strategy_config.get("order_size"),
-                "price": current_price
-            }
-        else:
-            self.log_state_change('waiting_for_entry', f"{type(self).__name__}: Waiting for entry opportunity.")
-        if order_details:
-            # Get risk percentages
-            risk_percentages = self.get_risk_parameters(current_price=current_price, side=order_details["side"])
-            order_details["sl_pct"] = risk_percentages.get("sl_pct")
-            order_details["tp_pct"] = risk_percentages.get("tp_pct")
+            order_side = "sell"
+
+        if order_side:
+            self.log_state_change('entry_signal', f"{type(self).__name__}: {order_side.upper()} entry conditions met.")
             
-            # Keep absolute prices for logging/potential immediate use if needed by other parts (though OrderManager will recalc)
-            # These will be based on the signal price, not the fill price.
-            if order_details["side"] == "buy":
-                order_details["stop_loss_signal_price"] = current_price * (1 - order_details["sl_pct"]) if order_details["sl_pct"] else None
-                order_details["take_profit_signal_price"] = current_price * (1 + order_details["tp_pct"]) if order_details["tp_pct"] else None
-            elif order_details["side"] == "sell":
-                order_details["stop_loss_signal_price"] = current_price * (1 + order_details["sl_pct"]) if order_details["sl_pct"] else None
-                order_details["take_profit_signal_price"] = current_price * (1 - order_details["tp_pct"]) if order_details["tp_pct"] else None
+            strat_order_size = self.config.get('strategy_configs', {}).get(self.__class__.__name__, {}).get('order_size')
+            
+            order_details = {
+                "side": order_side,
+                "price": current_price, 
+                "size": strat_order_size 
+            }
+            return order_details
+        
+        # If neither long_condition nor short_condition was met
+        self.logger.debug(f"{type(self).__name__}: No entry conditions met for {symbol} at {vals.get('current_bar_datetime')} (Price: {vals.get('current_price')}).")
+        return None
 
-            self.logger.info(f"Prepared order: {order_details}")
-
-        return order_details
-
-    def check_exit(self, position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def check_exit(self, position_data_from_bot: Dict[str, Any]) -> bool:
         """
         Check exit conditions for an open position.
         Args:
-            position: Current open position details (passed by the bot, should match self.position).
-                      Example: {"side": "buy", "entry_price": 12345.6, "size": 1.0, 
-                                "order_id": "...", "entry_timestamp": "..."}
+            position_data_from_bot: Current open position details (passed by the bot, should reflect self.position set by base class).
         Returns:
-            dict | None: Exit order details if exit signal, else None.
-                         Example: {"reason": "time_stop", "size": 1.0, "type": "market", "side": "sell"}
+            bool: True if exit signal, else False.
         """
-        if not self.position: # No active position to exit
-            # This check might be redundant if bot only calls check_exit when a position exists,
-            # but good for robustness.
-            self.log_state_change('waiting_for_entry', f"{type(self).__name__}: Waiting for entry opportunity.")
-            return None
+        if not position_data_from_bot: # No active position according to strategy state
+            self.log_state_change('no_position_for_exit_check', f"{type(self).__name__}: No position to check for exit.")
+            return False
         
-        # Ensure the passed 'position' arg matches the strategy's internal state if needed for consistency checks
-        # For now, we rely on self.position and self.entry_bar_index which are set by on_order_update
-        if not self.entry_bar_index:
-            self.logger.warning("check_exit: self.entry_bar_index is not set. Cannot evaluate time-based exit.")
-            # Decide if to proceed with other exit checks or return. For now, let's allow other checks.
+        # position_data_from_bot is the dictionary stored in self.position[symbol]
+        # It now directly contains 'side', 'size', 'entry_price', etc.
+        position_side = position_data_from_bot.get('side', '').lower()
+        # position_size = position_data_from_bot.get('size') # If needed
+        # entry_price = position_data_from_bot.get('entry_price') # If needed
+
+        if not position_side:
+            self.logger.error(f"{self.__class__.__name__}: Cannot determine position side from position_data_from_bot. Details: {position_data_from_bot}. Expected 'side' key.")
+            return False
 
         vals = self._get_current_values()
         if not vals:
             self.logger.debug("check_exit: Not enough data or NaN values from _get_current_values.")
-            return None
+            return False
 
         current_price = vals["current_price"]
         ema_fast = vals["ema_fast"]
-        # current_bar_datetime = vals["current_bar_datetime"] # If using datetime for bar counting
-        # current_bar_df_index = self.data.index.get_loc(current_bar_datetime) # If self.data.index is DatetimeIndex
+
+        if pd.isna(current_price) or pd.isna(ema_fast):
+            self.logger.debug("check_exit: Current price or EMA fast is NaN.")
+            return False
 
         exit_signal = False
         reason = None
 
         # 1. Time-based stop
         if self.entry_bar_index is not None:
-            # Assuming self.entry_bar_index is the integer index of the entry bar in the self.data DataFrame
-            # And self.data is continuously updated, so len(self.data)-1 is the current bar index.
             current_df_index = len(self.data) - 1 
             num_bars_held = current_df_index - self.entry_bar_index
             
-            if num_bars_held >= self.strategy_config["time_stop_bars"]:
+            if num_bars_held >= self.time_stop_bars:
                 exit_signal = True
                 reason = "time_stop"
-                self.logger.info(f"Exit (time_stop): Position held for {num_bars_held} bars (limit: {self.strategy_config['time_stop_bars']}). Current price: {current_price}")
+                self.logger.info(f"Exit (time_stop): Position held for {num_bars_held} bars (limit: {self.time_stop_bars}). Current price: {current_price:.2f}")
         else:
-            self.logger.debug("Time-based stop skipped as entry_bar_index is not set.")
+            # If entry_bar_index is None, time stop cannot be evaluated. This might be okay if the position was just opened.
+            self.logger.debug("Time-based stop skipped as entry_bar_index is None.")
 
         # 2. Price crosses EMA against the trade direction (if not already triggered by time stop)
         if not exit_signal:
-            if self.position['side'] == 'buy' and current_price < ema_fast:
+            if position_side == 'buy' and current_price < ema_fast:
                 exit_signal = True
                 reason = "price_cross_ema_long_exit"
                 self.logger.info(f"Exit (price_cross_ema_long_exit): Price {current_price:.2f} < EMAFast {ema_fast:.2f}")
-            elif self.position['side'] == 'sell' and current_price > ema_fast:
+            elif position_side == 'sell' and current_price > ema_fast:
                 exit_signal = True
                 reason = "price_cross_ema_short_exit"
                 self.logger.info(f"Exit (price_cross_ema_short_exit): Price {current_price:.2f} > EMAFast {ema_fast:.2f}")
         
         if exit_signal:
             self.log_state_change('exit_signal', f"{type(self).__name__}: Exit conditions met ({reason}), closing position.")
-            # Determine side for the closing order
-            close_side = "sell" if self.position['side'] == 'buy' else "buy"
-            return {
-                "reason": reason,
-                "size": self.position.get("size"),  # Exit the full size of the current position
-                "type": "market",
-                "side": close_side
-                # Add order_id of the position to close if OrderManager needs it: "position_order_id": self.position.get("order_id")
-            }
+            return True # Bot.py handles constructing the exit order details
             
-        else:
-            self.log_state_change('in_position', f"{type(self).__name__}: In position, monitoring for exit.")
-            return None
+        # else:
+            # self.log_state_change('in_position', f"{type(self).__name__}: In position ({position_side}), monitoring for exit. Price:{current_price:.2f}, EMAF:{ema_fast:.2f}")
+        return False
 
-    def get_risk_parameters(self, current_price: float, side: str) -> Dict[str, Any]:
+    def get_risk_parameters(self) -> Dict[str, Any]:
         """
         Return risk parameters as percentages for the strategy.
-        Args:
-            current_price: The price at which the entry is being considered (can be used for dynamic adjustments if needed).
-            side: "buy" or "sell", indicating the direction of the trade.
         Returns:
-            dict: {"sl_pct": float, "tp_pct": float}
-                  Returns an empty dict if side is invalid, though side isn't strictly needed for fixed percentages.
+            dict: {"sl_pct": float_or_None, "tp_pct": float_or_None}
         """
-        sl_pct = self.strategy_config["stop_loss_pct"]
-        tp_pct = self.strategy_config["take_profit_pct"]
-
-        if side not in ["buy", "sell"]:
-            self.logger.error(f"Invalid side '{side}' provided for get_risk_parameters. Using default percentages.")
-            # Still return percentages as they are fixed for this strategy version
-        
-        # This method now primarily returns the configured percentages.
-        # The 'current_price' and 'side' are kept for potential future use
-        # if SL/TP percentages become dynamic based on market conditions or side.
         return {
-            "sl_pct": sl_pct,
-            "tp_pct": tp_pct
+            "sl_pct": self.sl_pct,
+            "tp_pct": self.tp_pct
         }
 
-    def on_order_update(self, order: Dict[str, Any]) -> None:
-        self.logger.debug(f"on_order_update received: {order}")
-        # Basic implementation, will be detailed later
-        order_status = order.get('status', order.get('main_order', {}).get('result', {}).get('order_status'))
-        if order_status in ('Filled', 'filled', 'FILLED'):
-            if not self.position:
-                self.position = {
-                    "side": order.get("side"),
-                    "entry_price": order.get("price", order.get("average")),
-                    "size": order.get("filled", order.get("amount")),
-                    "entry_timestamp": order.get("timestamp", pd.Timestamp.now(tz='UTC').isoformat()),
-                    "order_id": order.get("id")
-                }
-                if self.data is not None and not self.data.empty:
-                    self.entry_bar_index = len(self.data) - 1
-                    self.logger.info(f"Position opened: {self.position}. Entry bar index: {self.entry_bar_index}")
-                else:
-                    self.logger.warning("Could not set entry_bar_index as data is empty/None.")
-        elif order_status in ('Canceled', 'canceled', 'Rejected', 'rejected', 'Expired', 'expired'):
-            self.logger.info(f"Order {order.get('id')} ended without fill: {order_status}")
+    # Override on_order_update to set entry_bar_index
+    def on_order_update(self, order_responses: Dict[str, Any], symbol: str) -> None:
+        super().on_order_update(order_responses, symbol) # Call base class method first
+        
+        # After base class processing, if a position was opened, set entry_bar_index
+        if self.position and not self.order_pending: # Position is set and order is no longer pending (i.e., filled)
+            # Check if entry_bar_index was already set for this position (e.g. from a partial fill then full fill)
+            # For simplicity, we set/reset it if position is confirmed.
+            if self.data is not None and not self.data.empty:
+                self.entry_bar_index = len(self.data) - 1
+                self.logger.info(f"{self.__class__.__name__}: Position confirmed. Entry bar index set to: {self.entry_bar_index}")
+            else:
+                self.logger.warning(f"{self.__class__.__name__}: Could not set entry_bar_index as data is empty/None after position confirmation.")
+        elif not self.position and not self.order_pending and self.active_order_id is None:
+            # This case implies an order failed or was cancelled, and no position was taken.
+            # Base class on_order_update handles resetting self.order_pending and self.active_order_id.
+            # Ensure entry_bar_index is also reset if it was somehow set for a pending order that failed.
+            if self.entry_bar_index is not None:
+                self.logger.info(f"{self.__class__.__name__}: Order did not result in a position. Resetting entry_bar_index.")
+                self.entry_bar_index = None
 
-
-    def on_trade_update(self, trade: Dict[str, Any]) -> None:
-        self.logger.debug(f"on_trade_update received: {trade}")
-        if trade.get('status') == 'closed' or trade.get('exit_order') or trade.get('exit'):
-            self.logger.info(f"Trade closed. PnL: {trade.get('pnl')}, Reason: {trade.get('exit_reason', 'N/A')}. Resetting position.")
-            self.position = None
-            self.entry_bar_index = None
+    # Override on_trade_update to reset entry_bar_index
+    def on_trade_update(self, trade: Dict[str, Any], symbol: str) -> None:
+        super().on_trade_update(trade, symbol) # Call base class method first
+        
+        # After base class processing (which clears self.position), clear entry_bar_index
+        if trade.get('exit'): # If it was an exit
+            if self.entry_bar_index is not None:
+                self.logger.info(f"{self.__class__.__name__}: Trade closed. Resetting entry_bar_index.")
+                self.entry_bar_index = None
 
     def on_error(self, exception: Exception) -> None:
         self.logger.error(f"Strategy {self.__class__.__name__} encountered an error: {exception}", exc_info=True)
