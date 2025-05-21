@@ -11,10 +11,10 @@ class StrategyDoubleEMAStochOsc(StrategyTemplate):
     """
 
     def __init__(self,
-                 config: Dict[str, Any],
                  data: pd.DataFrame,
+                 config: Dict[str, Any],
                  logger: logging.Logger):
-        super().__init__(config=config, data=data, logger=logger)
+        super().__init__(data=data, config=config, logger=logger)
 
     def on_init(self) -> None:
         super().on_init() # Call base on_init
