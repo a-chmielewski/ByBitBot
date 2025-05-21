@@ -580,7 +580,7 @@ class OrderManager:
                     continue
 
                 if order_id not in self.active_orders:
-                    self.logger.warning(
+                    self.logger.info(
                         f"Order {order_id} for {symbol} (Status: {ex_order.get('orderStatus')}) is open on exchange "
                         f"but not tracked locally. Adopting it."
                     )
@@ -902,47 +902,38 @@ class OrderManager:
         # Check for active position
         position_size = 0.0
         try:
-            # Assuming fetch_positions in exchange module can take 'category'
-            # CCXT often returns a list of positions.
+            # Call fetch_positions with symbol and category (per ExchangeConnector interface)
             positions_response = self._retry_with_backoff(
-                self.exchange.fetch_positions, # For CCXT, usually just fetch_positions([symbol])
-                symbols=[symbol] # CCXT usually takes a list of symbols
+                self.exchange.fetch_positions,
+                symbol=symbol,
+                category=category
             )
-            
-            # If Pybit V5 structure:
-            # positions_response = self._retry_with_backoff(
-            #     self.exchange.fetch_positions, # For Pybit V5
-            #     symbol=symbol,
-            #     category=category
-            # )
-            # self._raise_on_retcode(positions_response, f"Fetching positions for {symbol}") # No retcode in CCXT fetch_positions
 
             active_position = None
-            if isinstance(positions_response, list): # Standard CCXT response
+            # Bybit V5 style: {'result': {'list': [...]}}
+            if isinstance(positions_response, dict) and 'result' in positions_response and 'list' in positions_response['result']:
+                positions_list = positions_response['result']['list']
+                if positions_list:
+                    for pos_data in positions_list:
+                        if pos_data.get('symbol') == symbol:
+                            pos_size_str = pos_data.get('size', '0')
+                            if pos_size_str is not None:
+                                position_size = float(pos_size_str)
+                                if position_size > 0:
+                                    active_position = pos_data
+                                    break
+            # Fallback for other formats (e.g., CCXT)
+            elif isinstance(positions_response, list):
                 for pos in positions_response:
-                    if pos.get('symbol') == symbol: # Ensure it's the correct symbol
-                        # CCXT position 'contracts' or 'contractSize' for linear, 'info'.'size' for Bybit
-                        # 'side' can be 'long' or 'short'. Size is usually positive.
-                        pos_size_str = pos.get('contracts') # Unified field
-                        if pos_size_str is None: # Fallback for some exchanges or if 'contracts' is not populated
-                             pos_size_str = pos.get('info', {}).get('size', '0')
-
+                    if pos.get('symbol') == symbol:
+                        pos_size_str = pos.get('contracts')
+                        if pos_size_str is None:
+                            pos_size_str = pos.get('info', {}).get('size', '0')
                         if pos_size_str is not None:
                             position_size = float(pos_size_str)
-                            if position_size > 0: # Only consider if there's an actual position
-                                active_position = pos 
+                            if position_size > 0:
+                                active_position = pos
                                 break
-            # elif isinstance(positions_response, dict) and 'result' in positions_response and 'list' in positions_response['result']:
-            #     # Pybit V5 style
-            #     positions_list = positions_response['result']['list']
-            #     if positions_list:
-            #         for pos_data in positions_list:
-            #             if pos_data.get('symbol') == symbol:
-            #                 position_size = float(pos_data.get('size', '0'))
-            #                 if position_size > 0:
-            #                     active_position = pos_data
-            #                     break
-            
             self.logger.debug(f"Current position size for {symbol}: {position_size}")
 
         except Exception as e:

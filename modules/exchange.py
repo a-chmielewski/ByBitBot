@@ -205,18 +205,22 @@ class ExchangeConnector:
             self.logger.error(f"Fetch balance failed: {e}")
             raise ExchangeError(f"Fetch balance failed: {str(e)}")
 
-    def fetch_positions(self) -> Dict[str, Any]:
+    def fetch_positions(self, symbol: str, category: str = "linear") -> Dict[str, Any]:
         """
-        Fetch open positions from ByBit.
+        Fetch open positions for a symbol from ByBit.
+        Args:
+            symbol: Trading pair (e.g., 'BTCUSDT')
+            category: Bybit category (default 'linear')
         Returns:
             Positions dict
         """
         try:
             if not self.client:
                 raise ExchangeError("Client not authenticated")
-            response = self._api_call_with_backoff(self.client.get_positions, category="linear")
+            norm_symbol = symbol.replace("/", "").upper()
+            response = self._api_call_with_backoff(self.client.get_positions, category=category, symbol=norm_symbol)
             checked = self._check_response(response, context="fetch_positions")
-            self.logger.info(f"Fetched positions: {checked}")
+            self.logger.debug(f"Fetched positions for {norm_symbol}: {checked}")
             return checked
         except Exception as e:
             self.logger.error(f"Fetch positions failed: {e}")
