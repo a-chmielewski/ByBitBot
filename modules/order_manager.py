@@ -36,6 +36,84 @@ class OrderManager:
     OCO_POLL_INTERVAL_SECONDS = 1
     OCO_TIMEOUT_SECONDS = 60
 
+    def _cancel_existing_conditional_orders(self, symbol: str, category: str = 'linear') -> None:
+        """
+        Cancels all existing open conditional (stop-loss/take-profit) orders for a given symbol.
+        """
+        self.logger.info(f"Attempting to cancel all existing conditional orders for {symbol} in category {category}.")
+        try:
+            # Fetch all open stop orders (includes SL/TP for Bybit)
+            # Bybit API uses 'stopOrderType' to filter, or just fetches all conditional if not specified.
+            # We want to cancel both StopLoss and TakeProfit, which are conditional.
+            # The get_open_orders can filter by status 'Untriggered' for conditional orders.
+            open_orders_response = self._retry_with_backoff(
+                self.exchange.get_open_orders,
+                symbol=symbol,
+                category=category,
+                # status='Untriggered' # This might be too specific if some conditional orders have other statuses but are still active.
+                                        # Best to fetch all active conditional and filter by type if needed, or rely on Bybit's stop order types
+            )
+            self._raise_on_retcode(open_orders_response, f"Fetching open orders for {symbol} to cancel existing conditional orders")
+            
+            orders_to_cancel = []
+            if open_orders_response and 'result' in open_orders_response and 'list' in open_orders_response['result']:
+                for order in open_orders_response['result']['list']:
+                    # Identify conditional orders: typically 'Stop' or 'Trigger' types, often Untriggered.
+                    # Bybit uses orderType 'Market' or 'Limit' with a stopOrderType like 'Stop', 'TakeProfit', 'StopLoss'.
+                    # Or, it might directly be a trigger order.
+                    # We are interested in orders that are conditional (SL/TP) and not yet triggered.
+                    order_status = order.get('orderStatus', '').lower()
+                    # stop_order_type = order.get('stopOrderType', '').lower() # V5 naming
+                    # tpsl_mode = order.get('tpslMode', '').lower() # V5 naming for TP/SL on position vs order
+
+                    is_conditional = order.get('stopOrderType') is not None or \
+                                     order.get('triggerPrice') is not None or \
+                                     order.get('orderType', '').lower() in ['stop', 'trigger', 'stopmarket', 'stoplimit'] # Common older terms
+                    
+                    # More robust check for Bybit V5 conditional orders:
+                    # They are identified by having triggerPrice, stopLoss, takeProfit, or tpslMode set.
+                    # For simple SL/TP orders not attached to a position but placed as separate conditional orders:
+                    is_v5_stop_order = order.get('stopOrderType') in ['Stop', 'TakeProfit', 'StopLoss', 'PartialTakeProfit', 'PartialStopLoss', 'TrailingStop'] and \
+                                       order_status in ['untriggered', 'new'] # Untriggered or active but not yet processed.
+
+                    if is_v5_stop_order:
+                        orders_to_cancel.append(order)
+                        self.logger.debug(f"Identified conditional order to cancel: ID {order.get('orderId')}, Type: {order.get('stopOrderType')}, Status: {order_status}")
+
+            if not orders_to_cancel:
+                self.logger.info(f"No existing conditional orders found to cancel for {symbol}.")
+                return
+
+            self.logger.info(f"Found {len(orders_to_cancel)} conditional orders to cancel for {symbol}.")
+            for order_to_cancel in orders_to_cancel:
+                order_id_to_cancel = order_to_cancel.get('orderId')
+                order_link_id_to_cancel = order_to_cancel.get('orderLinkId')
+                self.logger.info(f"Cancelling conditional order ID: {order_id_to_cancel} (LinkID: {order_link_id_to_cancel}) for {symbol}")
+                try:
+                    cancel_params = {'symbol': symbol, 'category': category}
+                    if order_id_to_cancel:
+                        cancel_params['orderId'] = order_id_to_cancel
+                    elif order_link_id_to_cancel: # Fallback to orderLinkId if orderId not present (should be rare for active orders)
+                        cancel_params['orderLinkId'] = order_link_id_to_cancel
+                    else:
+                        self.logger.warning(f"Conditional order for {symbol} has neither orderId nor orderLinkId, cannot cancel: {order_to_cancel}")
+                        continue
+
+                    cancel_response = self._retry_with_backoff(
+                        self.exchange.cancel_order,
+                        **cancel_params
+                    )
+                    # Check retCode for successful cancellation
+                    if cancel_response.get('retCode') == 0:
+                        self.logger.info(f"Successfully cancelled conditional order ID: {order_id_to_cancel or order_link_id_to_cancel} for {symbol}.")
+                    else:
+                        # Log specific error from Bybit if cancellation failed
+                        self.logger.error(f"Failed to cancel conditional order ID: {order_id_to_cancel or order_link_id_to_cancel} for {symbol}. Response: {cancel_response}")
+                except Exception as e:
+                    self.logger.error(f"Exception while cancelling conditional order ID: {order_id_to_cancel or order_link_id_to_cancel} for {symbol}: {e}", exc_info=True)
+        except Exception as e:
+            self.logger.error(f"Error in _cancel_existing_conditional_orders for {symbol}: {e}", exc_info=True)
+
     def _cancel_unfilled_main_and_return(self, symbol, order_id, order_responses):
         """
         Helper to cancel an unfilled main order and return early with appropriate logging and response structure.
@@ -89,6 +167,14 @@ class OrderManager:
         main_order_id = None
         actual_fill_price = None
         category = 'linear'
+
+        # Before placing any new orders, cancel existing conditional (SL/TP) orders for this symbol
+        try:
+            self._cancel_existing_conditional_orders(symbol, category=category)
+        except Exception as e_cancel_existing:
+            # Log the error but proceed with placing the new order.
+            # Depending on risk tolerance, one might choose to halt if cancellation fails.
+            self.logger.error(f"Critical error during _cancel_existing_conditional_orders for {symbol}: {e_cancel_existing}. Proceeding with order placement.", exc_info=True)
 
         try:
             order_link_id = params.get('orderLinkId') if params else None
