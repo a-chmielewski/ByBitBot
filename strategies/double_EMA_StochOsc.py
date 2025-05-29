@@ -345,65 +345,19 @@ class StrategyDoubleEMAStochOsc(StrategyTemplate):
 
     def check_exit(self, symbol: str = None, **kwargs) -> bool:
         """
-        Check exit conditions for an open position for a specific symbol.
-        Args:
-            symbol: The trading symbol (e.g., 'BTCUSDT')
-        Returns:
-            bool: True if exit signal, else False.
+        Determines if there's an active exit signal based on strategy rules.
+        For this strategy, exits are handled by SL/TP mechanisms externally.
+        This method will return False, as SL/TP are managed by the OrderManager
+        or trading platform based on parameters from get_risk_parameters.
         """
-        if symbol is None:
-            raise ValueError(f"{self.__class__.__name__}.check_exit() requires a 'symbol' argument.")
-
-        position_data = self.position.get(symbol)
-        if not position_data:
-            self.log_state_change(symbol, 'no_position_for_exit_check', f"{type(self).__name__}: No position to check for exit.")
+        current_values = self._get_current_values()
+        if not current_values:
+            self.logger.debug(f"Cannot check exit for {symbol if symbol else 'unknown symbol'} due to missing current values.")
             return False
 
-        position_side = position_data.get('side', '').lower()
-        if not position_side:
-            self.logger.error(f"{self.__class__.__name__}: Cannot determine position side from position_data. Details: {position_data}. Expected 'side' key.")
-            return False
-
-        vals = self._get_current_values()
-        if not vals:
-            self.logger.debug("check_exit: Not enough data or NaN values from _get_current_values.")
-            return False
-
-        current_price = vals["current_price"]
-        ema_fast = vals["ema_fast"]
-
-        if pd.isna(current_price) or pd.isna(ema_fast):
-            self.logger.debug("check_exit: Current price or EMA fast is NaN.")
-            return False
-
-        exit_signal = False
-        reason = None
-
-        # 1. Time-based stop
-        if self.entry_bar_index is not None:
-            current_df_index = len(self.data) - 1 
-            num_bars_held = current_df_index - self.entry_bar_index
-            if num_bars_held >= self.time_stop_bars:
-                exit_signal = True
-                reason = "time_stop"
-                self.logger.info(f"Exit (time_stop): Position held for {num_bars_held} bars (limit: {self.time_stop_bars}). Current price: {current_price:.2f}")
-        else:
-            self.logger.debug("Time-based stop skipped as entry_bar_index is None.")
-
-        # 2. Price crosses EMA against the trade direction (if not already triggered by time stop)
-        if not exit_signal:
-            if position_side == 'buy' and current_price < ema_fast:
-                exit_signal = True
-                reason = "price_cross_ema_long_exit"
-                self.logger.info(f"Exit (price_cross_ema_long_exit): Price {current_price:.2f} < EMAFast {ema_fast:.2f}")
-            elif position_side == 'sell' and current_price > ema_fast:
-                exit_signal = True
-                reason = "price_cross_ema_short_exit"
-                self.logger.info(f"Exit (price_cross_ema_short_exit): Price {current_price:.2f} > EMAFast {ema_fast:.2f}")
-        
-        if exit_signal:
-            self.log_state_change(symbol, 'exit_signal', f"{type(self).__name__}: Exit conditions met ({reason}), closing position.")
-            return True
+        # Exit conditions are now solely based on SL/TP, which are handled externally.
+        # This method, if called, should reflect that no strategy-specific exit signal is generated here.
+        self.logger.debug(f"Check_exit called for {self.__class__.__name__}. Exits are managed by SL/TP. No strategy-specific exit signal generated.")
         return False
 
     def get_risk_parameters(self) -> Dict[str, Any]:

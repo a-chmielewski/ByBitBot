@@ -2,6 +2,8 @@ import logging
 import time
 from typing import Any, Dict, Optional
 from pybit.unified_trading import HTTP
+from requests.exceptions import ReadTimeout, RequestException, ConnectionError
+from urllib3.exceptions import ReadTimeoutError as URLLib3ReadTimeoutError
 
 class ExchangeError(Exception):
     pass
@@ -34,7 +36,8 @@ class ExchangeConnector:
                 testnet=self.testnet,
                 api_key=self.api_key,
                 api_secret=self.api_secret,
-                recv_window=30000  # Increased to 30 seconds
+                recv_window=30000,  # Increased to 30 seconds
+                timeout=30  # Increased client-side timeout to 30 seconds
             )
             self.logger.info(f"Initialized ByBit client ({'testnet' if self.testnet else 'mainnet'})")
         except Exception as e:
@@ -139,34 +142,87 @@ class ExchangeConnector:
                 response = func(*args, **kwargs)
                 
                 # Check for HTTP error codes in response if available
-                if hasattr(response, 'status_code') and response.status_code in (429, 500):
-                    raise ExchangeError(f"HTTP error {response.status_code}")
+                if hasattr(response, 'status_code') and response.status_code in (429, 500, 502, 503, 504):
+                    self.logger.warning(f"'{func.__name__}' returned HTTP error {response.status_code}. Raising ExchangeError to trigger retry.")
+                    raise ExchangeError(f"HTTP error {response.status_code} from response object")
                     
                 return response
                 
-            except Exception as e:
-                err_msg = str(e)
+            except (ReadTimeout, URLLib3ReadTimeoutError) as e:
+                if retries < self.max_retries:
+                    wait = self.backoff_base * (2 ** retries)
+                    self.logger.warning(
+                        f"Read timeout for '{func.__name__}'. Attempt {retries + 1}/{self.max_retries}. "
+                        f"Retrying in {wait:.2f}s. Error: {str(e)}"
+                    )
+                    time.sleep(wait)
+                    retries += 1
+                    continue
+                self.logger.error(f"API call '{func.__name__}' failed after {self.max_retries} retries due to ReadTimeout: {str(e)}")
+                raise ExchangeError(f"API call '{func.__name__}' failed after {self.max_retries} retries (ReadTimeout.)") from e
+
+            except RequestException as e: # Catches ConnectionError, HTTPError (if pybit raises them), etc.
+                err_msg_lower = str(e).lower()
+                # Determine if this specific RequestException is retryable
+                is_retryable_http_error = (
+                    "429" in err_msg_lower or "rate limit" in err_msg_lower or "too many visits" in err_msg_lower or
+                    "500" in err_msg_lower or "502" in err_msg_lower or "503" in err_msg_lower or "504" in err_msg_lower or
+                    "server error" in err_msg_lower
+                )
+                is_connection_error = isinstance(e, ConnectionError)
+
+                if (is_retryable_http_error or is_connection_error) and retries < self.max_retries:
+                    wait = self.backoff_base * (2 ** retries)
+                    log_event_type = "Retryable HTTP/Server Error" if is_retryable_http_error else "Connection Error"
+                    self.logger.warning(
+                        f"{log_event_type} for '{func.__name__}'. Attempt {retries + 1}/{self.max_retries}. "
+                        f"Retrying in {wait:.2f}s. Error: {str(e)}"
+                    )
+                    time.sleep(wait)
+                    retries += 1
+                    continue
+                
+                self.logger.error(f"API call '{func.__name__}' failed due to non-retried RequestException: {str(e)}")
+                raise ExchangeError(f"API call '{func.__name__}' failed (RequestException.)") from e
+
+            except Exception as e: # General fallback, including handling self-raised ExchangeError from status_code check
+                err_msg_lower = str(e).lower()
                 
                 # Handle timestamp errors
-                if "timestamp" in err_msg.lower() and retries < self.max_retries:
-                    self.logger.warning(f"Timestamp error detected. Resyncing time with server...")
+                if "timestamp" in err_msg_lower and retries < self.max_retries:
+                    self.logger.warning(f"Timestamp error detected for '{func.__name__}'. Resyncing time with server...")
                     self._sync_time()  # Resync time
                     wait = self.backoff_base * (2 ** retries)
-                    self.logger.warning(f"Retrying in {wait:.2f}s (attempt {retries+1}/{self.max_retries})...")
+                    self.logger.warning(
+                        f"Retrying '{func.__name__}' after timestamp resync. Attempt {retries + 1}/{self.max_retries}. "
+                        f"Retrying in {wait:.2f}s..."
+                    )
                     time.sleep(wait)
                     retries += 1
                     continue
                     
-                # Handle rate limits and server errors
-                elif ("429" in err_msg or "rate limit" in err_msg or "500" in err_msg) and retries < self.max_retries:
+                # Handle rate limits/server errors if they came as a generic Exception or our self-raised ExchangeError
+                is_retryable_keyword_error = (
+                    "429" in err_msg_lower or "rate limit" in err_msg_lower or "too many visits" in err_msg_lower or
+                    "500" in err_msg_lower or "502" in err_msg_lower or "503" in err_msg_lower or "504" in err_msg_lower or
+                    "server error" in err_msg_lower or "http error" in err_msg_lower # Catches our self-raised one
+                )
+
+                if is_retryable_keyword_error and retries < self.max_retries:
                     wait = self.backoff_base * (2 ** retries)
-                    self.logger.warning(f"Rate limit/server error encountered. Retrying in {wait:.2f}s (attempt {retries+1}/{self.max_retries})...")
+                    self.logger.warning(
+                        f"Generic error with retryable keywords for '{func.__name__}'. Attempt {retries + 1}/{self.max_retries}. "
+                        f"Retrying in {wait:.2f}s. Error: {str(e)}"
+                    )
                     time.sleep(wait)
                     retries += 1
                     continue
                     
-                self.logger.error(f"API call failed after {retries} retries: {e}")
-                raise
+                self.logger.error(f"API call '{func.__name__}' failed after {retries} retries with unhandled exception: {str(e)}")
+                if isinstance(e, ExchangeError):
+                    raise # Re-raise if it's already an ExchangeError we classified
+                else:
+                    raise ExchangeError(f"API call '{func.__name__}' failed after {retries} retries (General Unhandled Exception.)") from e
 
     def place_order(self, **kwargs) -> Dict[str, Any]:
         '''

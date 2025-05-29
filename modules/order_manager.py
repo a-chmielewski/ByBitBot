@@ -47,11 +47,9 @@ class OrderManager:
             # We want to cancel both StopLoss and TakeProfit, which are conditional.
             # The get_open_orders can filter by status 'Untriggered' for conditional orders.
             open_orders_response = self._retry_with_backoff(
-                self.exchange.get_open_orders,
+                self.exchange.fetch_open_orders,
                 symbol=symbol,
-                category=category,
-                # status='Untriggered' # This might be too specific if some conditional orders have other statuses but are still active.
-                                        # Best to fetch all active conditional and filter by type if needed, or rely on Bybit's stop order types
+                params={'category': category} # Pass category in params
             )
             self._raise_on_retcode(open_orders_response, f"Fetching open orders for {symbol} to cancel existing conditional orders")
             
@@ -63,9 +61,7 @@ class OrderManager:
                     # Or, it might directly be a trigger order.
                     # We are interested in orders that are conditional (SL/TP) and not yet triggered.
                     order_status = order.get('orderStatus', '').lower()
-                    # stop_order_type = order.get('stopOrderType', '').lower() # V5 naming
-                    # tpsl_mode = order.get('tpslMode', '').lower() # V5 naming for TP/SL on position vs order
-
+                    
                     is_conditional = order.get('stopOrderType') is not None or \
                                      order.get('triggerPrice') is not None or \
                                      order.get('orderType', '').lower() in ['stop', 'trigger', 'stopmarket', 'stoplimit'] # Common older terms
@@ -92,16 +88,24 @@ class OrderManager:
                 try:
                     cancel_params = {'symbol': symbol, 'category': category}
                     if order_id_to_cancel:
-                        cancel_params['orderId'] = order_id_to_cancel
-                    elif order_link_id_to_cancel: # Fallback to orderLinkId if orderId not present (should be rare for active orders)
-                        cancel_params['orderLinkId'] = order_link_id_to_cancel
+                        # Corrected parameter name from 'id' to 'orderId' for cancel_order based on pybit unified_trading
+                        # The exchange.cancel_order wrapper expects 'order_id' as its direct named argument.
+                        # Additional parameters like 'category' go into its 'params' dict.
+                        final_cancel_call_params = {'symbol': symbol, 'order_id': order_id_to_cancel}
+                        if category: # Pass category if specified, via the params argument of cancel_order
+                            final_cancel_call_params['params'] = {'category': category}
+
+                    elif order_link_id_to_cancel:
+                        final_cancel_call_params = {'symbol': symbol, 'order_link_id': order_link_id_to_cancel}
+                        if category:
+                            final_cancel_call_params['params'] = {'category': category}
                     else:
                         self.logger.warning(f"Conditional order for {symbol} has neither orderId nor orderLinkId, cannot cancel: {order_to_cancel}")
                         continue
 
                     cancel_response = self._retry_with_backoff(
                         self.exchange.cancel_order,
-                        **cancel_params
+                        **final_cancel_call_params
                     )
                     # Check retCode for successful cancellation
                     if cancel_response.get('retCode') == 0:
@@ -546,48 +550,53 @@ class OrderManager:
         raise OrderExecutionError(f"All retries failed for {getattr(func, '__name__', str(func))}: {last_exception}") from last_exception
 
     def log_order_status(self, order_response: Dict[str, Any], order_type_context: str):
-        """
-        Log the status of an order.
-        Args:
-            order_response: The response dict from the exchange.
-            order_type_context: The context of the order (e.g., "Main order", "Stop-loss order").
-        """
-        if not isinstance(order_response, dict):
-            self.logger.error(f"Order response is not a dict: {order_response} for {order_type_context}")
-            return
-
-        result_data = order_response.get('result', {})
-        # V5 API uses camelCase for fields in result
-        order_id = result_data.get('orderId') or order_response.get('orderId') # Fallback to root for some cases
-        status = result_data.get('orderStatus') or order_response.get('orderStatus')
-        side = result_data.get('side') or order_response.get('side')
-        actual_order_type = result_data.get('orderType') or order_response.get('orderType') # Actual type from response
-        qty = result_data.get('qty') or order_response.get('qty')
-        price = result_data.get('price') or order_response.get('price')
-        avg_price = result_data.get('avgPrice')
-        
-        ret_code_raw = order_response.get('retCode', order_response.get('ret_code', 0))
-        try:
-            ret_code = int(ret_code_raw)
-        except (TypeError, ValueError):
-            ret_code = -1  # default to failure if non-numeric
+        order_id = order_response.get('orderId')
+        status = order_response.get('orderStatus')
+        side = order_response.get('side')
+        actual_order_type = order_response.get('orderType')
+        qty = order_response.get('qty')
+        price = order_response.get('price') 
+        avg_price = order_response.get('avgPrice')
+        ret_code = order_response.get('retCode', -1) # Default to -1 if not present
         error_msg = order_response.get('retMsg')
+
+        # Provide defaults for logging if values are None
+        log_order_id = order_id if order_id is not None else "N/A"
+        log_status = status if status is not None else "Unknown"
+        log_side = side if side is not None else "Unknown"
+        log_actual_order_type = actual_order_type if actual_order_type is not None else "Unknown"
+        log_qty = qty if qty is not None else "N/A"
+        
+        # Handle price and avg_price for logging
+        price_for_log = price if price is not None else 0.0 # Default to 0.0 or some indicator for logging
+        avg_price_for_log = avg_price if avg_price is not None else 0.0
+
+        # Determine the price to log: prefer avg_price if valid, else price, else "N/A"
+        display_price = "N/A"
+        if avg_price_for_log and float(avg_price_for_log) > 0:
+            display_price = str(avg_price_for_log)
+        elif price_for_log and float(price_for_log) > 0:
+            display_price = str(price_for_log)
+        elif price is None and avg_price is None: # Explicitly "N/A" if both were None
+            display_price = "N/A"
+        elif float(price_for_log) == 0 and float(avg_price_for_log) == 0 : # If both were 0.0 (original None or actual 0)
+             display_price = "0.0"
 
         if error_msg:
             # Convert to string, remove non-ASCII chars, and replace control chars with spaces
             error_msg = str(error_msg).encode('ascii', errors='ignore').decode('ascii')
             # Replace common control characters (newlines, tabs, etc.) with spaces
             error_msg = ' '.join(error_msg.replace('\\n', ' ').replace('\\r', ' ').replace('\\t', ' ').split())
-
-        log_price = avg_price if avg_price and float(avg_price) > 0 else price
+        else:
+            error_msg = "No error message." # Provide a default if None
 
         if ret_code == 0:
             self.logger.info(
-                f"{order_type_context} details: id={order_id}, status={status}, side={side}, type={actual_order_type}, qty={qty}, price={log_price}"
+                f"{order_type_context} details: id={log_order_id}, status={log_status}, side={log_side}, type={log_actual_order_type}, qty={log_qty}, price={display_price}"
             )
         else:
             self.logger.error(
-                f"{order_type_context} failed: id={order_id}, status={status}, side={side}, type={actual_order_type}, qty={qty}, price={log_price}, msg='{error_msg}' (retCode={ret_code})"
+                f"{order_type_context} failed: id={log_order_id}, status={log_status}, side={log_side}, type={log_actual_order_type}, qty={log_qty}, price={display_price}, msg='{error_msg}' (retCode={ret_code})"
             )
             self.logger.debug(f"Full raw order_response for failed order: {order_response}")
 
@@ -727,8 +736,8 @@ class OrderManager:
         if counterpart_order_id_to_cancel:
             self.logger.info(f"Attempting to cancel counterpart {order_type_to_cancel} order {counterpart_order_id_to_cancel} (for main order {main_order_id}) on {symbol}.")
             try:
-                cancel_args = {'symbol': symbol, 'id': counterpart_order_id_to_cancel}
-                if hasattr(self.exchange, 'unified_cancel_order_requires_category') and self.exchange.unified_cancel_order_requires_category:
+                cancel_args = {'symbol': symbol, 'order_id': counterpart_order_id_to_cancel}
+                if category:
                     cancel_args['params'] = {'category': category}
 
                 self._retry_with_backoff(
@@ -776,8 +785,8 @@ class OrderManager:
             order_type = order_info.get('type', 'unknown')
             self.logger.info(f"Attempting to cancel {order_type} order {order_id_to_cancel} (for main order {main_order_id}) on {symbol}.")
             try:
-                cancel_args = {'symbol': symbol, 'id': order_id_to_cancel}
-                if hasattr(self.exchange, 'unified_cancel_order_requires_category') and self.exchange.unified_cancel_order_requires_category:
+                cancel_args = {'symbol': symbol, 'order_id': order_id_to_cancel}
+                if category:
                     cancel_args['params'] = {'category': category}
                 
                 self._retry_with_backoff(
@@ -1029,17 +1038,17 @@ class OrderManager:
         orders_to_cancel: List[Tuple[Dict[str, Any], str]] = [] 
 
         if position_size == 0:
-            self.logger.info(f"No active position for {symbol}. All conditional orders are orphans.")
+            self.logger.debug(f"No active position for {symbol}. All conditional orders are orphans.")
             for sl_order in open_sl_orders:
                 orders_to_cancel.append((sl_order, "No active position"))
             for tp_order in open_tp_orders:
                 orders_to_cancel.append((tp_order, "No active position"))
         else: 
             if len(open_sl_orders) == 1 and len(open_tp_orders) == 0:
-                self.logger.warning(f"Found 1 SL order and 0 TP orders for active position on {symbol}. Cancelling SL.")
+                self.logger.debug(f"Found 1 SL order and 0 TP orders for active position on {symbol}. Cancelling SL.")
                 orders_to_cancel.append((open_sl_orders[0], "Lone SL with active position"))
             elif len(open_tp_orders) == 1 and len(open_sl_orders) == 0:
-                self.logger.warning(f"Found 1 TP order and 0 SL orders for active position on {symbol}. Cancelling TP.")
+                self.logger.debug(f"Found 1 TP order and 0 SL orders for active position on {symbol}. Cancelling TP.")
                 orders_to_cancel.append((open_tp_orders[0], "Lone TP with active position"))
             elif len(open_sl_orders) == 0 and len(open_tp_orders) == 0:
                 self.logger.debug(f"Position exists for {symbol}, but no SL/TP orders found. This is normal.")
@@ -1081,7 +1090,8 @@ class OrderManager:
                 # Assuming `self.exchange.cancel_order` takes `id` and `symbol`.
                 # And for Bybit V5, it might need `category` in params.
                 
-                cancel_args = {'id': actual_id_to_use_for_cancel, 'symbol': symbol}
+                # Corrected parameter name to 'order_id'
+                cancel_args = {'order_id': actual_id_to_use_for_cancel, 'symbol': symbol}
                 # If exchange module expects category for Bybit V5:
                 if hasattr(self.exchange, 'unified_cancel_order_requires_category') and self.exchange.unified_cancel_order_requires_category:
                     cancel_args['params'] = {'category': category}
