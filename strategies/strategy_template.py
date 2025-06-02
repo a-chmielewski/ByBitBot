@@ -48,6 +48,15 @@ class StrategyTemplate(ABC):
         """
         pass
 
+    def update_indicators_for_new_row(self) -> None:
+        """
+        Optional: Update indicators efficiently for the latest row only.
+        This method can be overridden by strategies to provide incremental updates
+        instead of recalculating all indicators from scratch.
+        Default implementation falls back to full init_indicators().
+        """
+        self.init_indicators()
+
     def _base_check_entry(self, symbol: str) -> bool:
         """
         Base check to see if a new entry can be considered for a specific symbol.

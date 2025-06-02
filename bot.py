@@ -28,6 +28,36 @@ def list_strategies():
     files = [f for f in os.listdir(STRATEGY_DIR) if f.endswith('.py') and not f.startswith('__') and 'template' not in f]
     return [os.path.splitext(f)[0] for f in files]
 
+def get_strategy_parameters(strategy_class_name: str) -> dict:
+    """
+    Map strategy class names to their trading parameters.
+    Returns a dict with symbol, timeframe, leverage, and category.
+    """
+    strategy_params = {
+        'StrategyDoubleEMAStochOsc': {
+            'symbol': 'LINKUSDT',
+            'coin_pair': 'LINK/USDT', 
+            'timeframe': '1m',
+            'leverage': 10,
+            'category': 'linear'
+        },
+        'StrategyBreakoutAndRetest': {
+            'symbol': 'NXPCUSDT',
+            'coin_pair': 'NXPC/USDT',
+            'timeframe': '5m', 
+            'leverage': 50,
+            'category': 'linear'
+        }
+    }
+    
+    return strategy_params.get(strategy_class_name, {
+        'symbol': 'BTCUSDT',
+        'coin_pair': 'BTC/USDT',
+        'timeframe': '1m',
+        'leverage': 10,
+        'category': 'linear'
+    })
+
 def select_strategies(available: list[str], logger_instance: logging.Logger): # Added logger
     logger_instance.info('Available strategies for selection:')
     for i, name in enumerate(available):
@@ -78,63 +108,85 @@ def main():
     # Exchange
     ex_cfg = config['bybit']
     exchange = ExchangeConnector(api_key=ex_cfg['api_key'], api_secret=ex_cfg['api_secret'], testnet=False, logger=bot_logger)
-    # Data fetcher
-    default_cfg = config['default']
-    symbol = default_cfg['coin_pair'].replace('/', '').upper()
-    timeframe = default_cfg['timeframe']
-    category = default_cfg.get('category', 'linear') # Get category from config, default to linear
+    
+    # Strategy selection FIRST - before setting up data fetcher
+    available_strategy_files = list_strategies()
+    bot_logger.info(f"Found strategy files: {available_strategy_files}")
+    
+    selected_strategy_names = select_strategies(available_strategy_files, bot_logger)
+    bot_logger.info(f"Strategies selected by user: {selected_strategy_names}")
+
+    if not selected_strategy_names:
+        bot_logger.error("No strategies were selected by the user, or selection failed. Bot will exit.")
+        return
+
+    # Load strategy classes to determine parameters
+    strategy_classes = []
+    for strat_name in selected_strategy_names:
+        bot_logger.info(f"Attempting to load strategy: {strat_name}")
+        try:
+            StratClass = dynamic_import_strategy(strat_name, StrategyTemplate, bot_logger)
+            strategy_classes.append(StratClass)
+            bot_logger.info(f"Successfully loaded strategy class: {StratClass.__name__}")
+        except ImportError as e:
+            bot_logger.error(f"ImportError loading strategy module {strat_name}: {e}", exc_info=True)
+        except Exception as e:
+            bot_logger.error(f"Failed to load strategy class {strat_name}: {e}", exc_info=True)
+
+    if not strategy_classes:
+        bot_logger.error("No strategies were successfully loaded. The bot will now exit.")
+        return
+
+    # Use parameters from the first strategy for now (single strategy support)
+    # In the future, this could be enhanced for multi-strategy support with parameter negotiation
+    primary_strategy_class = strategy_classes[0]
+    strategy_params = get_strategy_parameters(primary_strategy_class.__name__)
+    
+    symbol = strategy_params['symbol']
+    timeframe = strategy_params['timeframe']
+    leverage = strategy_params['leverage']
+    category = strategy_params['category']
+    coin_pair = strategy_params['coin_pair']
+    
+    bot_logger.info(f"Using trading parameters from {primary_strategy_class.__name__}: {coin_pair} ({symbol}), {timeframe}, {leverage}x leverage")
+    
+    # Data fetcher with strategy-determined parameters
     data_fetcher = LiveDataFetcher(exchange, symbol, timeframe, logger=bot_logger)
     data = data_fetcher.fetch_initial_data()
     # Start WebSocket for live data
     data_fetcher.start_websocket()
     bot_logger.info(f"Fetched initial OHLCV data: {len(data)} rows for {symbol} {timeframe}")
+    
     # Order manager
     order_manager = OrderManager(exchange, logger=bot_logger)
     # Performance tracker
     perf_tracker = PerformanceTracker(logger=bot_logger)
-    
-    # Strategy selection
-    available_strategy_files = list_strategies()
-    bot_logger.info(f"Found strategy files: {available_strategy_files}")
-    
-    selected_strategy_names = select_strategies(available_strategy_files, bot_logger) # Pass bot_logger
-    bot_logger.info(f"Strategies selected by user: {selected_strategy_names}")
 
+    # Initialize strategy instances with the fetched data
     strategies = []
-    if not selected_strategy_names:
-        bot_logger.warning("No strategies were selected by the user, or selection failed.")
-    else:
-        for strat_name in selected_strategy_names:
-            bot_logger.info(f"Attempting to load strategy: {strat_name}")
-            try:
-                # Pass bot_logger to dynamic_import_strategy
-                StratClass = dynamic_import_strategy(strat_name, StrategyTemplate, bot_logger)
-                # Each strategy instance gets its own logger
-                strategy_specific_logger = get_logger(strat_name) 
-                strategy_instance = StratClass(data.copy(), config, logger=strategy_specific_logger)
-                strategies.append(strategy_instance)
-                bot_logger.info(f"Successfully loaded and initialized strategy: {type(strategy_instance).__name__}")
-            except ImportError as e:
-                bot_logger.error(f"ImportError loading strategy module {strat_name}: {e}", exc_info=True)
-            except Exception as e:
-                bot_logger.error(f"Failed to load or initialize strategy class {strat_name}: {e}", exc_info=True)
+    for i, StratClass in enumerate(strategy_classes):
+        try:
+            # Each strategy instance gets its own logger
+            strategy_specific_logger = get_logger(selected_strategy_names[i]) 
+            strategy_instance = StratClass(data.copy(), config, logger=strategy_specific_logger)
+            strategies.append(strategy_instance)
+            bot_logger.info(f"Successfully initialized strategy: {type(strategy_instance).__name__}")
+        except Exception as e:
+            bot_logger.error(f"Failed to initialize strategy class {StratClass.__name__}: {e}", exc_info=True)
     
     # Log the final list of loaded strategies
     loaded_strategy_class_names = [type(s).__name__ for s in strategies]
     bot_logger.info(f"Loaded strategies: {loaded_strategy_class_names if loaded_strategy_class_names else '[]'}")
 
     if not strategies:
-        bot_logger.error("No strategies were successfully loaded. The bot will now exit.")
+        bot_logger.error("No strategies were successfully initialized. The bot will now exit.")
         if 'data_fetcher' in locals() and data_fetcher is not None:
             data_fetcher.stop_websocket()
-        # Perf tracker might not be used if no trades happened.
-        bot_logger.info('Bot session closed due to no strategies loaded.')
-        return # Exit main() if no strategies are loaded
+        bot_logger.info('Bot session closed due to no strategies initialized.')
+        return
 
     # Initial state logging for each strategy
     for strat_instance in strategies:
-        # Assuming strategies primarily operate on the main `symbol` defined in config for now.
-        # If strategies can handle multiple symbols, this logging might need adjustment or be symbol-specific within the strategy.
         strat_instance.log_state_change(symbol, "awaiting_entry", f"Strategy {type(strat_instance).__name__} for {symbol}: Initialized. Looking for new entry conditions...")
 
     # Main trading loop
@@ -173,7 +225,12 @@ def main():
             for strat in strategies:
                 bot_logger.debug(f"Processing strategy {type(strat).__name__}")
                 strat.data = data.copy()  # Ensure strategy uses a mutable copy of the latest data
-                strat.init_indicators() # Initialize/recalculate all indicators on the (potentially new) data
+                
+                # Use efficient indicator update if available, otherwise fall back to full init
+                if hasattr(strat, 'update_indicators_for_new_row') and len(data) > 1:
+                    strat.update_indicators_for_new_row()
+                else:
+                    strat.init_indicators()
 
                 # Debug: log the latest row's indicator values
                 # latest_row = strat.data.iloc[-1].to_dict()
