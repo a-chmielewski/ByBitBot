@@ -9,6 +9,9 @@ class StrategyExample(StrategyTemplate):
     Demonstrates position tracking, config usage, and all hooks.
     It now uses the base class for order pending/active state management.
     """
+    
+    # Hide this strategy from selection menu - it's for development/reference only
+    SHOW_IN_SELECTION: bool = False
 
     def on_init(self) -> None:
         """

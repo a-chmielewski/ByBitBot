@@ -16,6 +16,9 @@ class StrategyBreakoutAndRetest(StrategyTemplate):
     3. Reversal confirmation at the retest level
     4. Entry on bounce from retest with tight stop loss
     """
+    
+    # Market type tags indicating this strategy works best in transitional markets
+    MARKET_TYPE_TAGS: List[str] = ['TRANSITIONAL']
 
     def __init__(self,
                  data: pd.DataFrame,
@@ -106,26 +109,77 @@ class StrategyBreakoutAndRetest(StrategyTemplate):
             return
             
         try:
-            self.logger.debug(f"Initializing indicators with data length: {len(self.data)}")
+            self.logger.debug(f"Starting indicator initialization with data shape: {self.data.shape}")
+            self.logger.debug(f"Data columns before initialization: {list(self.data.columns)}")
+            self.logger.debug(f"Data index: {self.data.index.tolist()[:5]}... (showing first 5)")
             
             # Volume SMA for breakout confirmation
             self.data['volume_sma'] = self.data['volume'].rolling(window=self.volume_avg_period, min_periods=1).mean()
+            self.logger.debug(f"Volume SMA created successfully with {self.data['volume_sma'].notna().sum()} valid values")
+            self.logger.debug(f"Data columns after volume_sma: {list(self.data.columns)}")
             
             # EMA for trend bias (if enabled)
             if self.use_trend_filter:
-                self.data['ema_trend'] = self.data.ta.ema(close=self.data['close'], length=self.ema_trend_period)
+                try:
+                    self.logger.debug(f"Attempting EMA calculation with period {self.ema_trend_period}")
+                    self.data['ema_trend'] = self.data.ta.ema(close=self.data['close'], length=self.ema_trend_period)
+                    if 'ema_trend' not in self.data.columns or self.data['ema_trend'].isna().all():
+                        self.logger.warning(f"EMA calculation failed, creating manual EMA for trend bias")
+                        # Fallback to manual EMA calculation
+                        self.data['ema_trend'] = self.data['close'].ewm(span=self.ema_trend_period, adjust=False).mean()
+                    self.logger.debug(f"EMA trend created successfully with {self.data['ema_trend'].notna().sum()} valid values")
+                except Exception as ema_error:
+                    self.logger.error(f"Error calculating EMA trend: {ema_error}")
+                    # Fallback to manual EMA calculation
+                    self.data['ema_trend'] = self.data['close'].ewm(span=self.ema_trend_period, adjust=False).mean()
+                    self.logger.info(f"Using fallback EMA calculation")
             
             # RSI for momentum filter
-            self.data['rsi'] = self.data.ta.rsi(close=self.data['close'], length=self.rsi_period)
+            try:
+                self.logger.debug(f"Attempting RSI calculation with period {self.rsi_period}")
+                self.data['rsi'] = self.data.ta.rsi(close=self.data['close'], length=self.rsi_period)
+                if 'rsi' not in self.data.columns or self.data['rsi'].isna().all():
+                    self.logger.warning(f"RSI calculation failed, using default values")
+                    self.data['rsi'] = 50.0  # Neutral default
+                self.logger.debug(f"RSI created successfully with {self.data['rsi'].notna().sum()} valid values")
+            except Exception as rsi_error:
+                self.logger.error(f"Error calculating RSI: {rsi_error}")
+                self.data['rsi'] = 50.0  # Neutral default
             
             # Initialize support/resistance tracking columns
+            self.logger.debug("Creating support/resistance tracking columns")
             self.data['current_support'] = pd.Series(dtype='float64', index=self.data.index)
             self.data['current_resistance'] = pd.Series(dtype='float64', index=self.data.index)
+            self.logger.debug(f"Support/resistance columns created")
             
             # Update initial support/resistance levels
+            self.logger.debug("Updating initial support/resistance levels")
             self._update_support_resistance_levels()
 
-            self.logger.debug(f"{self.__class__.__name__} indicators initialized successfully.")
+            # Verify all required columns exist
+            expected_cols = ['volume_sma', 'rsi', 'current_support', 'current_resistance']
+            if self.use_trend_filter:
+                expected_cols.append('ema_trend')
+            
+            self.logger.debug(f"Data columns after full initialization: {list(self.data.columns)}")
+            self.logger.debug(f"Expected columns: {expected_cols}")
+            
+            missing_after_init = [col for col in expected_cols if col not in self.data.columns]
+            if missing_after_init:
+                self.logger.error(f"Indicator initialization incomplete, missing columns: {missing_after_init}")
+                # Let's also check if columns exist but are all NaN
+                for col in expected_cols:
+                    if col in self.data.columns:
+                        nan_count = self.data[col].isna().sum()
+                        total_count = len(self.data[col])
+                        self.logger.debug(f"Column '{col}': {nan_count}/{total_count} are NaN")
+            else:
+                self.logger.debug(f"{self.__class__.__name__} indicators initialized successfully.")
+                # Log sample values from the last row
+                if len(self.data) > 0:
+                    last_row = self.data.iloc[-1]
+                    sample_values = {col: last_row.get(col, 'N/A') for col in expected_cols}
+                    self.logger.debug(f"Sample indicator values from last row: {sample_values}")
             
         except Exception as e:
             self.logger.error(f"Error initializing indicators: {e}", exc_info=True)
@@ -137,6 +191,24 @@ class StrategyBreakoutAndRetest(StrategyTemplate):
             return
 
         try:
+            # Check if required columns exist, if not, fall back to full initialization
+            required_indicator_cols = ['volume_sma', 'rsi', 'current_support', 'current_resistance']
+            if self.use_trend_filter:
+                required_indicator_cols.append('ema_trend')
+            
+            self.logger.debug(f"'{self.__class__.__name__}': Checking for required columns: {required_indicator_cols}")
+            self.logger.debug(f"'{self.__class__.__name__}': Current data columns: {list(self.data.columns)}")
+            
+            missing_cols = [col for col in required_indicator_cols if col not in self.data.columns]
+            if missing_cols:
+                self.logger.warning(f"'{self.__class__.__name__}': Missing indicator columns {missing_cols}, falling back to full initialization.")
+                self.logger.debug(f"'{self.__class__.__name__}': Data shape before init fallback: {self.data.shape}")
+                self.init_indicators()
+                self.logger.debug(f"'{self.__class__.__name__}': Data shape after init fallback: {self.data.shape}")
+                self.logger.debug(f"'{self.__class__.__name__}': Data columns after init fallback: {list(self.data.columns)}")
+                return
+            
+            self.logger.debug(f"'{self.__class__.__name__}': All required columns present, proceeding with incremental update")
             latest_idx = self.data.index[-1]
             
             # Update volume SMA incrementally
@@ -165,7 +237,7 @@ class StrategyBreakoutAndRetest(StrategyTemplate):
             # Update RSI (recalculate on tail for accuracy)
             min_rsi_data = self.rsi_period + 5
             if len(self.data) >= min_rsi_data:
-                rsi_tail = self.data['close'].tail(min_rsi_data).ta.rsi(length=self.rsi_period)
+                rsi_tail = self.data.tail(min_rsi_data).ta.rsi(close='close', length=self.rsi_period)
                 if rsi_tail is not None and not rsi_tail.empty:
                     self.data.loc[latest_idx, 'rsi'] = rsi_tail.iloc[-1]
                 else:

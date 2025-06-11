@@ -1,6 +1,6 @@
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 import pandas as pd
 from datetime import datetime, timezone
 
@@ -11,6 +11,13 @@ class StrategyTemplate(ABC):
 
     NOTE: This template only supports single-symbol operation. The fields order_pending and active_order_id are not symbol-aware and will cause conflicts if used for multiple symbols simultaneously. For multi-symbol support, refactor these fields to be keyed by symbol.
     """
+    
+    # Market type tags - strategies should override this to indicate market conditions they work best in
+    MARKET_TYPE_TAGS: List[str] = []  # e.g., ['TRENDING', 'HIGH_VOLATILITY'], ['RANGING'], ['TRANSITIONAL'], etc.
+    
+    # Strategy visibility - strategies can set this to False to hide from selection menu (e.g., dev/example strategies)
+    SHOW_IN_SELECTION: bool = True
+    
     def __init__(self, data: Any, config: Dict[str, Any], logger: Optional[logging.Logger] = None):
         """
         Args:

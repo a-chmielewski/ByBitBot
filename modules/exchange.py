@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from pybit.unified_trading import HTTP
 from requests.exceptions import ReadTimeout, RequestException, ConnectionError
 from urllib3.exceptions import ReadTimeoutError as URLLib3ReadTimeoutError
@@ -93,7 +93,22 @@ class ExchangeConnector:
 
     def _get_adjusted_timestamp(self) -> int:
         """Get timestamp adjusted for server time offset."""
-        return int((time.time() + self._time_offset) * 1000)
+        current_time = time.time()
+        adjusted_time = current_time + self._time_offset
+        timestamp_ms = int(adjusted_time * 1000)
+        
+        # Safeguard: ensure timestamp is reasonable (not in far future or past)
+        current_ms = int(current_time * 1000)
+        max_offset_ms = 300000  # 5 minutes in milliseconds
+        
+        if abs(timestamp_ms - current_ms) > max_offset_ms:
+            self.logger.warning(f"Adjusted timestamp {timestamp_ms} seems unreasonable. Using current time instead.")
+            self.logger.debug(f"  current_ms={current_ms}, offset={self._time_offset}, adjusted={timestamp_ms}")
+            # Reset offset and use current time
+            self._time_offset = 0
+            timestamp_ms = current_ms
+            
+        return timestamp_ms
 
     def _check_response(self, response: dict, context: str = "API call") -> dict:
         """
@@ -526,4 +541,83 @@ class ExchangeConnector:
             # Remove non-ASCII characters from error message for Windows console compatibility
             safe_error = str(error).encode('ascii', errors='ignore').decode('ascii')
             self.logger.error(f"Error fetching minimum order amount for {symbol}: {safe_error}")
-            raise ExchangeError(f"Error fetching minimum order amount for {symbol}: {safe_error}") 
+            raise ExchangeError(f"Error fetching minimum order amount for {symbol}: {safe_error}")
+
+    def fetch_all_tickers(self, category: str = 'linear') -> Dict[str, Any]:
+        """
+        Fetch all ticker information including 24h volume for the specified category.
+        
+        Args:
+            category: The category of instruments ('linear' for USDT perpetuals)
+            
+        Returns:
+            Dict containing ticker information for all symbols
+        """
+        try:
+            self.logger.debug(f"Fetching all tickers for category: {category}")
+            response = self._api_call_with_backoff(
+                self.client.get_tickers,
+                category=category
+            )
+            
+            checked_response = self._check_response(response, f"fetch_all_tickers({category})")
+            self.logger.debug(f"Successfully fetched tickers. Response keys: {list(checked_response.keys())}")
+            
+            return checked_response
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching all tickers for category {category}: {e}")
+            raise ExchangeError(f"Failed to fetch tickers: {str(e)}") from e
+
+    def get_top_volume_symbols(self, category: str = 'linear', count: int = 10, min_volume_usdt: float = 1000000) -> List[str]:
+        """
+        Get the top N symbols by 24h volume in USDT.
+        
+        Args:
+            category: The category of instruments ('linear' for USDT perpetuals)
+            count: Number of top symbols to return
+            min_volume_usdt: Minimum 24h volume in USDT to consider
+            
+        Returns:
+            List of symbol names sorted by volume (highest first)
+        """
+        try:
+            ticker_data = self.fetch_all_tickers(category)
+            
+            if 'result' not in ticker_data or 'list' not in ticker_data['result']:
+                self.logger.error(f"Unexpected ticker data structure: {ticker_data}")
+                return []
+                
+            tickers = ticker_data['result']['list']
+            
+            # Filter and sort by volume
+            volume_data = []
+            for ticker in tickers:
+                symbol = ticker.get('symbol', '')
+                volume24h = ticker.get('volume24h', '0')
+                turnover24h = ticker.get('turnover24h', '0')  # This is volume in USDT
+                
+                try:
+                    # Use turnover24h as it's the volume in USDT
+                    volume_usdt = float(turnover24h)
+                    
+                    # Filter out symbols that don't meet minimum volume requirements
+                    if volume_usdt >= min_volume_usdt and symbol.endswith('USDT'):
+                        volume_data.append((symbol, volume_usdt))
+                        
+                except (ValueError, TypeError):
+                    continue
+            
+            # Sort by volume (highest first) and take top N
+            volume_data.sort(key=lambda x: x[1], reverse=True)
+            top_symbols = [symbol for symbol, volume in volume_data[:count]]
+            
+            self.logger.info(f"Top {count} symbols by 24h volume: {top_symbols}")
+            if volume_data:
+                self.logger.debug(f"Volume data sample: {volume_data[:5]}")  # Log first 5 for debugging
+                
+            return top_symbols
+            
+        except Exception as e:
+            self.logger.error(f"Error getting top volume symbols: {e}")
+            return [] 

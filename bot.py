@@ -7,9 +7,13 @@ from modules.exchange import ExchangeConnector
 from modules.data_fetcher import LiveDataFetcher
 from modules.order_manager import OrderManager, OrderExecutionError
 from modules.performance_tracker import PerformanceTracker
+from modules.market_analyzer import MarketAnalyzer, MarketAnalysisError
 from datetime import datetime, timezone
 import time
 import warnings
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
 
 # Import StrategyTemplate for type checking in dynamic_import_strategy
 from strategies.strategy_template import StrategyTemplate
@@ -25,45 +29,73 @@ def load_config():
         return json.load(f)
 
 def list_strategies():
+    """
+    List available strategies, filtering out template files and strategies marked as hidden.
+    Returns a list of tuples: (strategy_module_name, strategy_class, market_type_tags)
+    """
     files = [f for f in os.listdir(STRATEGY_DIR) if f.endswith('.py') and not f.startswith('__') and 'template' not in f]
-    return [os.path.splitext(f)[0] for f in files]
+    strategy_info = []
+    
+    for filename in files:
+        module_name = os.path.splitext(filename)[0]
+        try:
+            # Dynamically import to check visibility and get market type tags
+            strategy_class = dynamic_import_strategy(module_name, StrategyTemplate, get_logger('strategy_discovery'))
+            
+            # Check if strategy should be shown in selection
+            if getattr(strategy_class, 'SHOW_IN_SELECTION', True):
+                market_tags = getattr(strategy_class, 'MARKET_TYPE_TAGS', [])
+                strategy_info.append((module_name, strategy_class, market_tags))
+                
+        except Exception as e:
+            # If strategy fails to import, log but don't include it
+            get_logger('strategy_discovery').warning(f"Failed to import strategy {module_name}: {e}")
+            continue
+    
+    return strategy_info
 
 def get_strategy_parameters(strategy_class_name: str) -> dict:
     """
-    Map strategy class names to their trading parameters.
-    Returns a dict with symbol, timeframe, leverage, and category.
+    Map strategy class names to their trading parameters (leverage and category only).
+    Symbol and timeframe are now selected dynamically by the user.
     """
     strategy_params = {
         'StrategyDoubleEMAStochOsc': {
-            'symbol': 'LINKUSDT',
-            'coin_pair': 'LINK/USDT', 
-            'timeframe': '1m',
             'leverage': 10,
             'category': 'linear'
         },
         'StrategyBreakoutAndRetest': {
-            'symbol': 'NXPCUSDT',
-            'coin_pair': 'NXPC/USDT',
-            'timeframe': '5m', 
             'leverage': 50,
             'category': 'linear'
         }
     }
     
     return strategy_params.get(strategy_class_name, {
-        'symbol': 'BTCUSDT',
-        'coin_pair': 'BTC/USDT',
-        'timeframe': '1m',
         'leverage': 10,
         'category': 'linear'
     })
 
-def select_strategies(available: list[str], logger_instance: logging.Logger): # Added logger
+def select_strategies(available: list[tuple], logger_instance: logging.Logger): # Updated to handle list of tuples
+    """
+    Display available strategies with market type tags and prompt user to select.
+    Args:
+        available: List of tuples (strategy_module_name, strategy_class, market_type_tags)
+        logger_instance: Logger instance
+    Returns:
+        List of selected strategy module names
+    """
     logger_instance.info('Available strategies for selection:')
-    for i, name in enumerate(available):
-        print(f"  {i+1}. {name}")
-        logger_instance.info(f"  {i+1}. {name}")
+    print("\nAvailable strategies:")
+    print("=" * 60)
     
+    for i, (module_name, strategy_class, market_tags) in enumerate(available):
+        strategy_name = strategy_class.__name__
+        tags_display = f"[{', '.join(market_tags)}]" if market_tags else "[NO TAGS]"
+        display_line = f"  {i+1}. {strategy_name} {tags_display}"
+        print(display_line)
+        logger_instance.info(display_line)
+    
+    print("=" * 60)
     selected_input = input('Select strategies (comma-separated indices, e.g. 1,2): ')
     logger_instance.info(f"User input for strategy selection: '{selected_input}'")
     
@@ -75,9 +107,100 @@ def select_strategies(available: list[str], logger_instance: logging.Logger): # 
             logger_instance.error("Invalid input for strategy selection (non-integer value). No strategies selected.")
             return [] # Return empty if there's a non-integer value that's not filtered by isdigit
             
-    selected_names = [available[i] for i in indices]
+    selected_names = [available[i][0] for i in indices]  # Extract module names from tuples
     logger_instance.info(f"Parsed selected indices: {indices}, Corresponding names: {selected_names}")
     return selected_names
+
+def select_symbol(analysis_results: dict, logger_instance: logging.Logger) -> str:
+    """
+    Let user select a symbol from the analyzed symbols.
+    
+    Args:
+        analysis_results: Market analysis results dictionary
+        logger_instance: Logger instance
+        
+    Returns:
+        Selected symbol string
+    """
+    symbols = list(analysis_results.keys())
+    
+    logger_instance.info('Available symbols from market analysis:')
+    print("\nAvailable symbols:")
+    print("=" * 70)
+    
+    for i, symbol in enumerate(symbols):
+        # Get market types for this symbol
+        symbol_data = analysis_results[symbol]
+        market_types = []
+        for timeframe, data in symbol_data.items():
+            market_type = data.get('market_type', 'UNKNOWN')
+            market_types.append(f"{timeframe}:{market_type}")
+        
+        market_summary = " | ".join(market_types)
+        display_line = f"  {i+1}. {symbol:<15} [{market_summary}]"
+        print(display_line)
+        logger_instance.info(display_line)
+    
+    print("=" * 70)
+    
+    while True:
+        selected_input = input('Select symbol (enter number): ').strip()
+        logger_instance.info(f"User input for symbol selection: '{selected_input}'")
+        
+        try:
+            index = int(selected_input) - 1
+            if 0 <= index < len(symbols):
+                selected_symbol = symbols[index]
+                logger_instance.info(f"Selected symbol: {selected_symbol}")
+                return selected_symbol
+            else:
+                print(f"Invalid selection. Please enter a number between 1 and {len(symbols)}")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+
+def select_timeframe(analysis_results: dict, selected_symbol: str, logger_instance: logging.Logger) -> str:
+    """
+    Let user select a timeframe for the chosen symbol.
+    
+    Args:
+        analysis_results: Market analysis results dictionary
+        selected_symbol: Previously selected symbol
+        logger_instance: Logger instance
+        
+    Returns:
+        Selected timeframe string
+    """
+    symbol_data = analysis_results[selected_symbol]
+    timeframes = list(symbol_data.keys())
+    
+    logger_instance.info(f'Available timeframes for {selected_symbol}:')
+    print(f"\nAvailable timeframes for {selected_symbol}:")
+    print("=" * 50)
+    
+    for i, timeframe in enumerate(timeframes):
+        data = symbol_data[timeframe]
+        market_type = data.get('market_type', 'UNKNOWN')
+        current_price = data.get('price_range', {}).get('current', 'N/A')
+        display_line = f"  {i+1}. {timeframe:<5} [Market: {market_type}, Price: ${current_price}]"
+        print(display_line)
+        logger_instance.info(display_line)
+    
+    print("=" * 50)
+    
+    while True:
+        selected_input = input('Select timeframe (enter number): ').strip()
+        logger_instance.info(f"User input for timeframe selection: '{selected_input}'")
+        
+        try:
+            index = int(selected_input) - 1
+            if 0 <= index < len(timeframes):
+                selected_timeframe = timeframes[index]
+                logger_instance.info(f"Selected timeframe: {selected_timeframe}")
+                return selected_timeframe
+            else:
+                print(f"Invalid selection. Please enter a number between 1 and {len(timeframes)}")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
 
 def dynamic_import_strategy(name: str, base_class_to_check: type, logger_instance: logging.Logger) -> type:
     module_name = f"strategies.{name}"
@@ -99,6 +222,168 @@ def dynamic_import_strategy(name: str, base_class_to_check: type, logger_instanc
     logger_instance.error(f"No valid strategy class (subclass of {base_class_to_check.__name__}) found in {module_name}.")
     raise ImportError(f"No valid strategy class (subclass of {base_class_to_check.__name__}) found in {module_name}")
 
+def run_market_analysis(exchange, config, logger):
+    """
+    Run market analysis for all configured symbols and timeframes.
+    
+    Args:
+        exchange: ExchangeConnector instance
+        config: Configuration dictionary
+        logger: Logger instance
+        
+    Returns:
+        Analysis results dictionary or None if analysis fails
+    """
+    try:
+        logger.info("Starting market analysis...")
+        
+        # Initialize market analyzer
+        market_analyzer = MarketAnalyzer(exchange, config, logger)
+        
+        # Run analysis for all symbols and timeframes
+        analysis_results = market_analyzer.analyze_all_markets()
+        
+        # Get summary statistics
+        summary = market_analyzer.get_market_summary(analysis_results)
+        logger.info(f"Market analysis completed. Summary: {summary}")
+        
+        return analysis_results
+        
+    except MarketAnalysisError as e:
+        logger.error(f"Market analysis failed: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error during market analysis: {e}", exc_info=True)
+        return None
+
+def run_silent_market_analysis(exchange, config, symbol, timeframe, logger):
+    """
+    Run market analysis silently for a specific symbol and timeframe.
+    Used for periodic checks without verbose output.
+    
+    Args:
+        exchange: ExchangeConnector instance
+        config: Configuration dictionary
+        symbol: Symbol to analyze
+        timeframe: Timeframe to analyze
+        logger: Logger instance
+        
+    Returns:
+        Market type string or None if analysis fails
+    """
+    try:
+        logger.debug(f"Running silent market analysis for {symbol} {timeframe}")
+        
+        # Initialize market analyzer (temporarily override logging to reduce output)
+        market_analyzer = MarketAnalyzer(exchange, config, logger)
+        
+        # Analyze just the specific symbol/timeframe
+        try:
+            result = market_analyzer._analyze_symbol_timeframe(symbol, timeframe)
+            market_type = result.get('market_type', 'UNKNOWN')
+            logger.debug(f"Silent analysis result for {symbol} {timeframe}: {market_type}")
+            return market_type
+        except Exception as e:
+            logger.warning(f"Silent market analysis failed for {symbol} {timeframe}: {e}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Unexpected error during silent market analysis: {e}")
+        return None
+
+def check_strategy_market_compatibility(strategy_tags, current_market_type, symbol, timeframe, logger):
+    """
+    Check if current market type is compatible with strategy tags.
+    
+    Args:
+        strategy_tags: List of market type tags from strategy
+        current_market_type: Current market type from analysis
+        symbol: Trading symbol
+        timeframe: Trading timeframe
+        logger: Logger instance
+        
+    Returns:
+        bool: True if compatible, False if mismatch
+    """
+    if not strategy_tags or not current_market_type:
+        # If no tags defined or analysis failed, assume compatible
+        return True
+    
+    # Special handling for TEST tag - always compatible
+    if 'TEST' in strategy_tags:
+        return True
+    
+    # Check if current market type matches any strategy tag
+    is_compatible = current_market_type in strategy_tags
+    
+    if is_compatible:
+        logger.debug(f"Market compatibility check: {symbol} {timeframe} {current_market_type} matches strategy tags {strategy_tags}")
+    else:
+        logger.warning(f"Market compatibility mismatch: {symbol} {timeframe} is {current_market_type} but strategy expects {strategy_tags}")
+    
+    return is_compatible
+
+def prompt_strategy_reselection(analysis_results, current_symbol, current_timeframe, current_market_type, available_strategies, logger):
+    """
+    Prompt user about market change and ask for strategy reselection.
+    
+    Args:
+        analysis_results: Full market analysis results
+        current_symbol: Currently trading symbol
+        current_timeframe: Currently trading timeframe
+        current_market_type: New market type detected
+        available_strategies: Available strategy list
+        logger: Logger instance
+        
+    Returns:
+        tuple: (new_strategy_name, should_restart) or (None, False) to continue
+    """
+    print("\n" + "="*80)
+    print("🚨 MARKET CONDITION CHANGE DETECTED 🚨")
+    print("="*80)
+    print(f"Trading pair: {current_symbol} {current_timeframe}")
+    print(f"New market type: {current_market_type}")
+    print(f"The market conditions have changed and may no longer match your current strategy.")
+    print("\nFull market analysis:")
+    
+    # Print the analysis summary (reuse existing code from market_analyzer)
+    try:
+        if analysis_results:
+            # Create temporary analyzer just to use the print function
+            from modules.market_analyzer import MarketAnalyzer
+            temp_analyzer = MarketAnalyzer.__new__(MarketAnalyzer)  # Create without calling __init__
+            temp_analyzer.logger = logger
+            temp_analyzer._print_analysis_summary(analysis_results)
+    except Exception as e:
+        logger.error(f"Error printing analysis summary: {e}")
+        print("(Could not display full analysis)")
+    
+    print("\n" + "="*80)
+    print("STRATEGY RESELECTION OPTIONS")
+    print("="*80)
+    print("1. Continue with current strategy (ignore market change)")
+    print("2. Select a new strategy based on current market conditions")
+    print("="*80)
+    
+    while True:
+        choice = input("Enter your choice (1 or 2): ").strip()
+        logger.info(f"User choice for market change response: '{choice}'")
+        
+        if choice == "1":
+            logger.info("User chose to continue with current strategy despite market change")
+            return None, False
+        elif choice == "2":
+            logger.info("User chose to reselect strategy due to market change")
+            # Let user select new strategy
+            selected_strategy_names = select_strategies(available_strategies, logger)
+            if selected_strategy_names:
+                return selected_strategy_names[0], True  # Return first selected strategy
+            else:
+                print("No strategy selected. Continuing with current strategy.")
+                return None, False
+        else:
+            print("Invalid choice. Please enter 1 or 2.")
+
 def main():
     config = load_config()
     # Initialize the main bot logger
@@ -109,11 +394,28 @@ def main():
     ex_cfg = config['bybit']
     exchange = ExchangeConnector(api_key=ex_cfg['api_key'], api_secret=ex_cfg['api_secret'], testnet=False, logger=bot_logger)
     
-    # Strategy selection FIRST - before setting up data fetcher
-    available_strategy_files = list_strategies()
-    bot_logger.info(f"Found strategy files: {available_strategy_files}")
+    # RUN MARKET ANALYSIS FIRST - before strategy selection
+    bot_logger.info("="*60)
+    bot_logger.info("RUNNING STARTUP MARKET ANALYSIS")
+    bot_logger.info("="*60)
     
-    selected_strategy_names = select_strategies(available_strategy_files, bot_logger)
+    analysis_results = run_market_analysis(exchange, config, bot_logger)
+    
+    if analysis_results:
+        bot_logger.info("Market analysis completed successfully")
+    else:
+        bot_logger.warning("Market analysis failed or returned no results")
+    
+    bot_logger.info("="*60)
+    bot_logger.info("CONTINUING WITH STRATEGY SETUP")
+    bot_logger.info("="*60)
+    
+    # Strategy selection AFTER market analysis
+    available_strategies = list_strategies()
+    strategy_names = [info[0] for info in available_strategies]  # Extract module names for logging
+    bot_logger.info(f"Found available strategies: {strategy_names}")
+    
+    selected_strategy_names = select_strategies(available_strategies, bot_logger)
     bot_logger.info(f"Strategies selected by user: {selected_strategy_names}")
 
     if not selected_strategy_names:
@@ -137,18 +439,34 @@ def main():
         bot_logger.error("No strategies were successfully loaded. The bot will now exit.")
         return
 
-    # Use parameters from the first strategy for now (single strategy support)
-    # In the future, this could be enhanced for multi-strategy support with parameter negotiation
+    # User selects symbol and timeframe from analyzed markets
+    if not analysis_results:
+        bot_logger.error("No market analysis results available for symbol selection. Bot will exit.")
+        return
+    
+    bot_logger.info("="*60)
+    bot_logger.info("SYMBOL AND TIMEFRAME SELECTION")
+    bot_logger.info("="*60)
+    
+    # Let user select symbol from analyzed markets
+    selected_symbol = select_symbol(analysis_results, bot_logger)
+    
+    # Let user select timeframe for the chosen symbol
+    selected_timeframe = select_timeframe(analysis_results, selected_symbol, bot_logger)
+    
+    # Get strategy-specific parameters (leverage, category)
     primary_strategy_class = strategy_classes[0]
     strategy_params = get_strategy_parameters(primary_strategy_class.__name__)
     
-    symbol = strategy_params['symbol']
-    timeframe = strategy_params['timeframe']
+    # Use user selections and strategy defaults
+    symbol = selected_symbol
+    timeframe = selected_timeframe
     leverage = strategy_params['leverage']
     category = strategy_params['category']
-    coin_pair = strategy_params['coin_pair']
+    coin_pair = symbol.replace('USDT', '/USDT')  # Convert format for display
     
-    bot_logger.info(f"Using trading parameters from {primary_strategy_class.__name__}: {coin_pair} ({symbol}), {timeframe}, {leverage}x leverage")
+    bot_logger.info(f"Final trading parameters: {coin_pair} ({symbol}), {timeframe}, {leverage}x leverage")
+    bot_logger.info("="*60)
     
     # Data fetcher with strategy-determined parameters
     data_fetcher = LiveDataFetcher(exchange, symbol, timeframe, logger=bot_logger)
@@ -192,6 +510,17 @@ def main():
     # Main trading loop
     try:
         bot_logger.info("Entering main trading loop.")
+        
+        # Initialize timing for periodic market analysis
+        last_market_check = datetime.now()
+        market_check_interval = timedelta(minutes=60)  # Check every 60 minutes
+        # For testing purposes, you can temporarily change this to seconds:
+        # market_check_interval = timedelta(seconds=30)  # Uncomment for testing
+        primary_strategy_tags = getattr(primary_strategy_class, 'MARKET_TYPE_TAGS', [])
+        
+        bot_logger.info(f"Periodic market analysis will run every {market_check_interval.total_seconds()/60:.0f} minutes")
+        bot_logger.info(f"Current strategy tags: {primary_strategy_tags}")
+        
         while True:
             bot_logger.debug("Main loop iteration started.")
             
@@ -224,10 +553,35 @@ def main():
 
             for strat in strategies:
                 bot_logger.debug(f"Processing strategy {type(strat).__name__}")
-                strat.data = data.copy()  # Ensure strategy uses a mutable copy of the latest data
+                
+                # Update strategy data efficiently - preserve indicators while adding new OHLCV rows
+                if strat.data is not None and not strat.data.empty:
+                    # Strategy already has data - check if there are new rows to add
+                    if len(data) > len(strat.data):
+                        # Get new rows that need to be added
+                        new_rows = data.iloc[len(strat.data):]
+                        
+                        # Append new OHLCV rows to existing strategy data (preserving indicators)
+                        if not new_rows.empty:
+                            # Create empty indicator columns for new rows to match existing structure
+                            new_rows_with_indicators = new_rows.copy()
+                            indicator_cols = [col for col in strat.data.columns if col not in ['open', 'high', 'low', 'close', 'volume', 'timestamp']]
+                            for col in indicator_cols:
+                                new_rows_with_indicators[col] = np.nan
+                            
+                            # Append the new rows
+                            strat.data = pd.concat([strat.data, new_rows_with_indicators], ignore_index=False)
+                            bot_logger.debug(f"Added {len(new_rows)} new rows to {type(strat).__name__} data, now has {len(strat.data)} rows")
+                    else:
+                        # No new data - keep existing strategy data with indicators intact
+                        bot_logger.debug(f"{type(strat).__name__} data unchanged, {len(strat.data)} rows with indicators preserved")
+                else:
+                    # First time initialization - use fresh copy
+                    strat.data = data.copy()
+                    bot_logger.debug(f"Initialized {type(strat).__name__} data with {len(strat.data)} rows")
                 
                 # Use efficient indicator update if available, otherwise fall back to full init
-                if hasattr(strat, 'update_indicators_for_new_row') and len(data) > 1:
+                if hasattr(strat, 'update_indicators_for_new_row') and len(strat.data) > 1:
                     strat.update_indicators_for_new_row()
                 else:
                     strat.init_indicators()
@@ -384,6 +738,61 @@ def main():
                                 strat.on_order_update(error_response_exit, symbol=symbol)
                             except Exception as callback_error:
                                 bot_logger.error(f"Failed to notify strategy of unexpected exit order error: {callback_error}", exc_info=True)
+            
+            # Periodic market analysis check (every 60 minutes)
+            current_time = datetime.now()
+            if current_time - last_market_check >= market_check_interval:
+                bot_logger.info("="*60)
+                bot_logger.info("RUNNING PERIODIC MARKET ANALYSIS CHECK")
+                bot_logger.info("="*60)
+                
+                # Run silent market analysis for current symbol/timeframe
+                current_market_type = run_silent_market_analysis(exchange, config, symbol, timeframe, bot_logger)
+                
+                if current_market_type:
+                    bot_logger.info(f"Current market type for {symbol} {timeframe}: {current_market_type}")
+                    
+                    # Check if market type still matches strategy
+                    is_compatible = check_strategy_market_compatibility(
+                        primary_strategy_tags, current_market_type, symbol, timeframe, bot_logger
+                    )
+                    
+                    if not is_compatible:
+                        bot_logger.warning(f"Market type mismatch detected! Strategy expects {primary_strategy_tags}, but market is {current_market_type}")
+                        
+                        # Run full market analysis for user display
+                        full_analysis = run_market_analysis(exchange, config, bot_logger)
+                        
+                        # Prompt user for strategy reselection
+                        new_strategy_name, should_restart = prompt_strategy_reselection(
+                            full_analysis, symbol, timeframe, current_market_type, available_strategies, bot_logger
+                        )
+                        
+                        if should_restart and new_strategy_name:
+                            bot_logger.info(f"User selected new strategy: {new_strategy_name}. Restarting bot...")
+                            # Clean up current resources
+                            if 'data_fetcher' in locals() and data_fetcher is not None:
+                                data_fetcher.stop_websocket()
+                            if 'perf_tracker' in locals() and perf_tracker is not None:
+                                perf_tracker.close_session()
+                            
+                            # Note: This will exit the current bot session
+                            # In a production environment, you might want to implement
+                            # a more sophisticated restart mechanism
+                            bot_logger.info("Bot shutting down for strategy change. Please restart manually.")
+                            return
+                        else:
+                            bot_logger.info("Continuing with current strategy despite market change")
+                    else:
+                        bot_logger.info(f"Market type compatibility confirmed: {current_market_type} matches strategy tags {primary_strategy_tags}")
+                else:
+                    bot_logger.warning("Silent market analysis failed, skipping compatibility check")
+                
+                # Update last check time
+                last_market_check = current_time
+                bot_logger.info("="*60)
+                bot_logger.info("PERIODIC MARKET ANALYSIS CHECK COMPLETED")
+                bot_logger.info("="*60)
             
             # Brief pause to prevent excessive CPU usage and API rate limit issues
             bot_logger.debug("Main loop iteration ended. Pausing...")

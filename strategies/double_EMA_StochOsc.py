@@ -1,6 +1,6 @@
 import pandas as pd
 import pandas_ta as ta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 import logging
 
 from .strategy_template import StrategyTemplate
@@ -9,6 +9,9 @@ class StrategyDoubleEMAStochOsc(StrategyTemplate):
     """
     Strategy using Double EMA crossover and Stochastic Oscillator for entry/exit signals.
     """
+    
+    # Market type tags indicating this is a test strategy
+    MARKET_TYPE_TAGS: List[str] = ['TEST']
 
     def __init__(self,
                  data: pd.DataFrame,
