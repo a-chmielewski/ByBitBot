@@ -198,8 +198,13 @@ class OrderManager:
                 except Exception as e:
                     self.logger.warning(f"Failed to fetch latest price for notional pre-check: {e}, proceeding with caution.")
 
-            if size is None: size = min_order_qty
-            else: size = max(size, min_order_qty)
+            if size is None: 
+                size = min_order_qty
+                self.logger.info(f"🔍 TESTING MODE: Using minimum order size {size} {symbol.replace('USDT', '')} for {symbol}")
+            else: 
+                size = max(size, min_order_qty)
+                if size == min_order_qty:
+                    self.logger.info(f"🔍 TESTING MODE: Enforced minimum order size {size} {symbol.replace('USDT', '')} for {symbol}")
 
             if effective_price_for_notional_check: # Only if we have a price for check
                 current_notional = size * effective_price_for_notional_check

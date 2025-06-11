@@ -620,4 +620,39 @@ class ExchangeConnector:
             
         except Exception as e:
             self.logger.error(f"Error getting top volume symbols: {e}")
-            return [] 
+            return []
+
+    def set_leverage(self, symbol: str, leverage: int, category: str = 'linear') -> Dict[str, Any]:
+        """
+        Set leverage for a trading symbol.
+        
+        Args:
+            symbol: Trading pair symbol (e.g., 'BTCUSDT')
+            leverage: Leverage value (1-50 for most ByBit instruments)
+            category: The category of instruments ('linear' for USDT perpetuals)
+            
+        Returns:
+            Dict containing the response from ByBit API
+            
+        Raises:
+            ExchangeError: If leverage setting fails
+        """
+        try:
+            self.logger.info(f"Setting leverage to {leverage}x for {symbol} ({category})")
+            
+            response = self._api_call_with_backoff(
+                self.client.set_leverage,
+                category=category,
+                symbol=symbol,
+                buyLeverage=str(leverage),
+                sellLeverage=str(leverage)
+            )
+            
+            checked_response = self._check_response(response, f"set_leverage({symbol}, {leverage}x)")
+            self.logger.info(f"Successfully set leverage to {leverage}x for {symbol}")
+            
+            return checked_response
+            
+        except Exception as e:
+            self.logger.error(f"Error setting leverage to {leverage}x for {symbol}: {e}")
+            raise ExchangeError(f"Failed to set leverage for {symbol}: {str(e)}") from e 

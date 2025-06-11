@@ -57,6 +57,28 @@ Main building process is done. Any new changes to any module should be listed he
 - **Automated Mismatch Detection**: Identifies when market conditions change (e.g., TRANSITIONAL → TRENDING) and no longer match strategy
 - **User Notification System**: Alerts user with full market analysis when mismatch is detected
 - **Strategy Reselection Flow**: Prompts user to either continue with current strategy or select new one based on updated market conditions
-- **Graceful Bot Management**: Handles strategy changes by cleanly shutting down and prompting for manual restart
+- **Graceful Bot Management**: Handles strategy changes by cleanly shutdown and prompting for manual restart
 - **Adaptive Trading Logic**: Ensures strategy remains aligned with market conditions throughout trading session
 - **Testing Flexibility**: Includes commented option to reduce check interval to 30 seconds for testing purposes
+
+### EMA-ADX Trending Strategy Implementation - Done
+- **Strategy Creation**: Created StrategyEMAAdx following established template patterns and best practices
+- **Market Type Targeting**: Tagged with [TRENDING] to align with strong directional market conditions
+- **Technical Indicators**: Implemented Fast/Slow EMA (20/50), ADX (14), RSI (14), ATR (14), and Volume SMA (20)
+- **Trend Detection Logic**: EMA crossover confirmation with ADX threshold filtering (>25) for trend strength validation
+- **Pullback Entry System**: Waits for pullbacks against trend direction for optimal entry prices with volume confirmation
+- **ATR-Based Risk Management**: Dynamic stop loss and take profit calculation based on ATR multiples (2x SL, 2x TP)
+- **State Tracking**: Comprehensive trend state management including direction, confirmation, pullback detection, and timing
+- **Multi-Condition Entry**: Combines EMA position, ADX strength, RSI momentum, and volume spike confirmation
+- **Advanced Exit Logic**: Time-based stops, trend weakness detection, and EMA trend reversal exits
+- **Incremental Indicator Updates**: Efficient real-time indicator calculation for optimal performance
+
+### User-Selectable Leverage Implementation - Done
+- **Leverage Selection Function**: Created select_leverage() function prompting users to choose leverage 1-50 with risk level guidance
+- **Exchange Integration**: Added set_leverage() method to ExchangeConnector for ByBit position leverage configuration
+- **Dynamic Configuration**: Removed hardcoded leverage from strategy parameters, now fully user-controlled
+- **User Flow Enhancement**: Added leverage selection step after timeframe selection but before trading execution
+- **Risk Awareness Display**: Provides clear guidance on conservative (1-5x), moderate (10-25x), and aggressive (30-50x) leverage levels
+- **Exchange API Call**: Properly sets both buy and sell leverage on ByBit exchange before starting trading loop
+- **Error Handling**: Graceful handling of leverage setting failures with appropriate logging and continuation
+- **Parameter Cleanup**: Updated get_strategy_parameters() to only handle category, removed deprecated leverage mapping

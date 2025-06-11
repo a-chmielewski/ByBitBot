@@ -3,4 +3,8 @@
 /logs
 /venv
 /performance
-/strategies/*
+/strategies/High-Volatility Market Strategies - BACKTEST
+/strategies/Low-Volatility Market Strategies - BACKTEST/
+/strategies/Ranging Market Strategies - BACKTEST/
+/strategies/Transitional Market Strategies - BACKTEST
+/strategies/Trending Market Strategies - BACKTEST/

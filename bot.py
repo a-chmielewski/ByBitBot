@@ -56,22 +56,22 @@ def list_strategies():
 
 def get_strategy_parameters(strategy_class_name: str) -> dict:
     """
-    Map strategy class names to their trading parameters (leverage and category only).
-    Symbol and timeframe are now selected dynamically by the user.
+    Map strategy class names to their trading parameters (category only).
+    Symbol, timeframe, and leverage are now selected dynamically by the user.
     """
     strategy_params = {
         'StrategyDoubleEMAStochOsc': {
-            'leverage': 10,
             'category': 'linear'
         },
         'StrategyBreakoutAndRetest': {
-            'leverage': 50,
+            'category': 'linear'
+        },
+        'StrategyEMAAdx': {
             'category': 'linear'
         }
     }
     
     return strategy_params.get(strategy_class_name, {
-        'leverage': 10,
         'category': 'linear'
     })
 
@@ -201,6 +201,42 @@ def select_timeframe(analysis_results: dict, selected_symbol: str, logger_instan
                 print(f"Invalid selection. Please enter a number between 1 and {len(timeframes)}")
         except ValueError:
             print("Invalid input. Please enter a number.")
+
+def select_leverage(logger_instance: logging.Logger) -> int:
+    """
+    Let user select leverage for trading.
+    
+    Args:
+        logger_instance: Logger instance
+        
+    Returns:
+        Selected leverage as integer (1-50)
+    """
+    logger_instance.info('Leverage selection:')
+    print("\n" + "="*60)
+    print("LEVERAGE SELECTION")
+    print("="*60)
+    print("Choose your leverage multiplier (1-50):")
+    print("  • Lower leverage (1-5): Conservative trading, lower risk")
+    print("  • Medium leverage (10-25): Moderate risk/reward")
+    print("  • Higher leverage (30-50): Aggressive trading, higher risk")
+    print("  • Note: Higher leverage increases both potential gains and losses")
+    print("="*60)
+    
+    while True:
+        selected_input = input('Enter leverage (1-50): ').strip()
+        logger_instance.info(f"User input for leverage selection: '{selected_input}'")
+        
+        try:
+            leverage = int(selected_input)
+            if 1 <= leverage <= 50:
+                logger_instance.info(f"Selected leverage: {leverage}x")
+                print(f"✅ Leverage set to {leverage}x")
+                return leverage
+            else:
+                print("Invalid selection. Please enter a number between 1 and 50")
+        except ValueError:
+            print("Invalid input. Please enter a whole number.")
 
 def dynamic_import_strategy(name: str, base_class_to_check: type, logger_instance: logging.Logger) -> type:
     module_name = f"strategies.{name}"
@@ -454,18 +490,31 @@ def main():
     # Let user select timeframe for the chosen symbol
     selected_timeframe = select_timeframe(analysis_results, selected_symbol, bot_logger)
     
-    # Get strategy-specific parameters (leverage, category)
+    # Let user select leverage
+    selected_leverage = select_leverage(bot_logger)
+    
+    # Get strategy-specific parameters (category only, leverage now user-selected)
     primary_strategy_class = strategy_classes[0]
     strategy_params = get_strategy_parameters(primary_strategy_class.__name__)
     
     # Use user selections and strategy defaults
     symbol = selected_symbol
     timeframe = selected_timeframe
-    leverage = strategy_params['leverage']
+    leverage = selected_leverage  # Use user-selected leverage
     category = strategy_params['category']
     coin_pair = symbol.replace('USDT', '/USDT')  # Convert format for display
     
     bot_logger.info(f"Final trading parameters: {coin_pair} ({symbol}), {timeframe}, {leverage}x leverage")
+    
+    # Set leverage on the exchange for the selected symbol
+    try:
+        bot_logger.info(f"Setting leverage to {leverage}x for {symbol}")
+        exchange.set_leverage(symbol, leverage, category)
+        bot_logger.info(f"✅ Successfully set leverage to {leverage}x for {symbol}")
+    except Exception as e:
+        bot_logger.error(f"Failed to set leverage to {leverage}x for {symbol}: {e}")
+        bot_logger.error("Bot will continue, but orders may fail if current leverage is insufficient")
+    
     bot_logger.info("="*60)
     
     # Data fetcher with strategy-determined parameters
