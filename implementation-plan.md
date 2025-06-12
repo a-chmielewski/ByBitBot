@@ -82,3 +82,12 @@ Main building process is done. Any new changes to any module should be listed he
 - **Exchange API Call**: Properly sets both buy and sell leverage on ByBit exchange before starting trading loop
 - **Error Handling**: Graceful handling of leverage setting failures with appropriate logging and continuation
 - **Parameter Cleanup**: Updated get_strategy_parameters() to only handle category, removed deprecated leverage mapping
+
+### Seamless Strategy Reselection Flow - Done
+- **Fixed Strategy Change Flow**: Resolved issue where bot shut down after strategy reselection instead of continuing seamlessly
+- **Restart Configuration Function**: Created restart_configuration_with_new_strategy() to handle complete reconfiguration with new strategy
+- **Modular Trading Loop**: Extracted run_trading_loop() function to enable reuse during strategy changes
+- **Complete User Flow**: Strategy change now triggers: Strategy Selection → Symbol Selection → Timeframe Selection → Leverage Selection → Resume Trading
+- **Resource Management**: Proper cleanup of old resources (data fetcher, performance tracker) before reconfiguration
+- **Seamless Transition**: Users can now change strategies during periodic market checks without manual bot restart
+- **Enhanced User Experience**: No more manual restarts required - bot handles strategy changes automatically and continues trading

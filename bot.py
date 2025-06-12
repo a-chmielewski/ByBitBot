@@ -420,6 +420,396 @@ def prompt_strategy_reselection(analysis_results, current_symbol, current_timefr
         else:
             print("Invalid choice. Please enter 1 or 2.")
 
+def restart_configuration_with_new_strategy(new_strategy_name, available_strategies, analysis_results, exchange, config, bot_logger):
+    """
+    Restart the bot configuration process with a new strategy.
+    This function handles the complete reconfiguration flow after strategy reselection.
+    """
+    bot_logger.info("="*60)
+    bot_logger.info("RESTARTING CONFIGURATION WITH NEW STRATEGY")
+    bot_logger.info("="*60)
+    
+    try:
+        # Load the new strategy class
+        bot_logger.info(f"Loading new strategy: {new_strategy_name}")
+        try:
+            StratClass = dynamic_import_strategy(new_strategy_name, StrategyTemplate, bot_logger)
+            bot_logger.info(f"Successfully loaded strategy class: {StratClass.__name__}")
+        except Exception as e:
+            bot_logger.error(f"Failed to load new strategy {new_strategy_name}: {e}", exc_info=True)
+            bot_logger.error("Aborting strategy change - bot will shut down")
+            return
+        
+        # Let user select symbol and timeframe from analyzed markets
+        bot_logger.info("="*60)
+        bot_logger.info("SYMBOL AND TIMEFRAME SELECTION")
+        bot_logger.info("="*60)
+        
+        selected_symbol = select_symbol(analysis_results, bot_logger)
+        selected_timeframe = select_timeframe(analysis_results, selected_symbol, bot_logger)
+        selected_leverage = select_leverage(bot_logger)
+        
+        # Get strategy parameters
+        strategy_params = get_strategy_parameters(StratClass.__name__)
+        
+        # Set up trading parameters
+        symbol = selected_symbol
+        timeframe = selected_timeframe
+        leverage = selected_leverage
+        category = strategy_params['category']
+        coin_pair = symbol.replace('USDT', '/USDT')
+        
+        bot_logger.info(f"New configuration: {coin_pair} ({symbol}), {timeframe}, {leverage}x leverage")
+        
+        # Set leverage on exchange
+        try:
+            bot_logger.info(f"Setting leverage to {leverage}x for {symbol}")
+            exchange.set_leverage(symbol, leverage, category)
+            bot_logger.info(f"✅ Successfully set leverage to {leverage}x for {symbol}")
+        except Exception as e:
+            bot_logger.error(f"Failed to set leverage to {leverage}x for {symbol}: {e}")
+            bot_logger.error("Bot will continue, but orders may fail if current leverage is insufficient")
+        
+        # Initialize new data fetcher
+        data_fetcher = LiveDataFetcher(exchange, symbol, timeframe, logger=bot_logger)
+        data = data_fetcher.fetch_initial_data()
+        data_fetcher.start_websocket()
+        bot_logger.info(f"Fetched initial OHLCV data: {len(data)} rows for {symbol} {timeframe}")
+        
+        # Initialize new order manager and performance tracker
+        order_manager = OrderManager(exchange, logger=bot_logger)
+        perf_tracker = PerformanceTracker(logger=bot_logger)
+        
+        # Initialize the new strategy instance
+        try:
+            strategy_specific_logger = get_logger(new_strategy_name)
+            strategy_instance = StratClass(data.copy(), config, logger=strategy_specific_logger)
+            bot_logger.info(f"Successfully initialized new strategy: {type(strategy_instance).__name__}")
+        except Exception as e:
+            bot_logger.error(f"Failed to initialize new strategy {StratClass.__name__}: {e}", exc_info=True)
+            if 'data_fetcher' in locals() and data_fetcher is not None:
+                data_fetcher.stop_websocket()
+            return
+        
+        # Log initial state
+        strategy_instance.log_state_change(symbol, "awaiting_entry", f"Strategy {type(strategy_instance).__name__} for {symbol}: Initialized after strategy change. Looking for new entry conditions...")
+        
+        bot_logger.info("="*60)
+        bot_logger.info("RESUMING TRADING WITH NEW CONFIGURATION")
+        bot_logger.info("="*60)
+        
+        # Start new trading loop with the reconfigured parameters
+        run_trading_loop(
+            strategy_instance, symbol, timeframe, leverage, category,
+            data_fetcher, order_manager, perf_tracker, exchange, config, bot_logger
+        )
+        
+    except Exception as e:
+        bot_logger.error(f"Error during strategy reconfiguration: {e}", exc_info=True)
+        bot_logger.error("Strategy change failed - bot will shut down")
+
+def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, data_fetcher, order_manager, perf_tracker, exchange, config, bot_logger):
+    """
+    Main trading loop that can be reused for strategy changes.
+    """
+    bot_logger.info("Entering main trading loop.")
+    
+    # Get available strategies for potential reselection
+    available_strategies = list_strategies()
+    
+    # Get strategy tags for compatibility checking
+    primary_strategy_tags = getattr(type(strategy_instance), 'MARKET_TYPE_TAGS', [])
+    
+    # Initialize timing for periodic market analysis
+    last_market_check = datetime.now()
+    market_check_interval = timedelta(minutes=60)  # Check every 60 minutes
+    
+    bot_logger.info(f"Periodic market analysis will run every {market_check_interval.total_seconds()/60:.0f} minutes")
+    bot_logger.info(f"Current strategy tags: {primary_strategy_tags}")
+    
+    # Wrap strategy in list for compatibility with existing loop logic
+    strategies = [strategy_instance]
+    
+    while True:
+        bot_logger.debug("Main loop iteration started.")
+        
+        bot_logger.debug("Calling data_fetcher.update_data()")
+        data = data_fetcher.update_data()
+        bot_logger.debug("data_fetcher.update_data() returned.")
+        
+        # Sync active orders with exchange and process adopted orders
+        bot_logger.debug(f"Calling order_manager.sync_active_orders_with_exchange for {symbol}")
+        adopted_orders = order_manager.sync_active_orders_with_exchange(symbol, category=category)
+        bot_logger.debug("order_manager.sync_active_orders_with_exchange() returned.")
+
+        # Check for and cancel orphaned conditional orders
+        bot_logger.debug(f"Calling order_manager.check_and_cancel_orphaned_conditional_orders for {symbol} ({category})")
+        try:
+            order_manager.check_and_cancel_orphaned_conditional_orders(symbol, category=category)
+        except Exception as e_orphan_check:
+            bot_logger.error(f"Error during check_and_cancel_orphaned_conditional_orders: {e_orphan_check}", exc_info=True)
+        bot_logger.debug("order_manager.check_and_cancel_orphaned_conditional_orders() returned.")
+
+        if adopted_orders:
+            for strat in strategies: # Notify all strategies (can be refined if strategies manage specific symbols)
+                for adopted_order in adopted_orders:
+                    if adopted_order.get('symbol') == symbol: # Basic check
+                        try:
+                            bot_logger.info(f"Notifying strategy {type(strat).__name__} of adopted order {adopted_order.get('orderId')}")
+                            strat.on_externally_synced_order(adopted_order, symbol)
+                        except Exception as e_strat_notify:
+                            bot_logger.error(f"Error notifying strategy {type(strat).__name__} of adopted order: {e_strat_notify}", exc_info=True)
+
+        for strat in strategies:
+            strat_instance = strat  # For consistency with existing variable names
+            bot_logger.debug(f"Processing strategy {type(strat).__name__}")
+            
+            # Update strategy data efficiently - preserve indicators while adding new OHLCV rows
+            if strat.data is not None and not strat.data.empty:
+                # Strategy already has data - check if there are new rows to add
+                if len(data) > len(strat.data):
+                    # Get new rows that need to be added
+                    new_rows = data.iloc[len(strat.data):]
+                    
+                    # Append new OHLCV rows to existing strategy data (preserving indicators)
+                    if not new_rows.empty:
+                        # Create empty indicator columns for new rows to match existing structure
+                        new_rows_with_indicators = new_rows.copy()
+                        indicator_cols = [col for col in strat.data.columns if col not in ['open', 'high', 'low', 'close', 'volume', 'timestamp']]
+                        for col in indicator_cols:
+                            new_rows_with_indicators[col] = np.nan
+                        
+                        # Append the new rows
+                        strat.data = pd.concat([strat.data, new_rows_with_indicators], ignore_index=False)
+                        bot_logger.debug(f"Added {len(new_rows)} new rows to {type(strat).__name__} data, now has {len(strat.data)} rows")
+                else:
+                    # No new data - keep existing strategy data with indicators intact
+                    bot_logger.debug(f"{type(strat).__name__} data unchanged, {len(strat.data)} rows with indicators preserved")
+            else:
+                # First time initialization - use fresh copy
+                strat.data = data.copy()
+                bot_logger.debug(f"Initialized {type(strat).__name__} data with {len(strat.data)} rows")
+            
+            # Use efficient indicator update if available, otherwise fall back to full init
+            if hasattr(strat, 'update_indicators_for_new_row') and len(strat.data) > 1:
+                strat.update_indicators_for_new_row()
+            else:
+                strat.init_indicators()
+
+            # Debug: log the latest row's indicator values
+            # latest_row = strat.data.iloc[-1].to_dict()
+            entry_signal = strat.check_entry(symbol=symbol)
+            if entry_signal:
+                # Validate required fields are present in entry_signal
+                required_fields = ['side', 'size', 'sl_pct', 'tp_pct']
+                missing_fields = [field for field in required_fields if field not in entry_signal]
+                
+                if missing_fields:
+                    bot_logger.error(f"Strategy {type(strat).__name__} produced invalid entry_signal missing required fields {missing_fields}: {entry_signal}")
+                    continue  # Skip this signal and move to next strategy
+
+                # Validate price field based on order type
+                order_type = entry_signal.get('order_type', 'market')  # Default to market if not specified
+                if order_type != 'market' and 'price' not in entry_signal:
+                    bot_logger.error(f"Strategy {type(strat).__name__} produced non-market order signal without 'price': {entry_signal}")
+                    continue  # Skip this signal and move to next strategy
+
+                order_details = entry_signal.copy()
+
+                # The strategy should now always provide sl_pct and tp_pct.
+                # The OrderManager will calculate absolute SL/TP prices based on actual fill price.
+                # The old block for recalculating SL/TP if not in order_details is removed.
+
+                bot_logger.info(f"Order signal: {order_details}") # Log details before sending to OrderManager
+
+                try:
+                    order_responses = order_manager.place_order_with_risk(
+                     symbol=symbol,
+                     side=order_details['side'],
+                     order_type=order_details.get('order_type', 'market'),
+                     size=order_details['size'],
+                     signal_price=order_details.get('price'), # Price at the time of signal generation
+                     sl_pct=order_details['sl_pct'],
+                     tp_pct=order_details['tp_pct'],
+                     params=order_details.get('params'), # Pass any extra params from strategy
+                     reduce_only=order_details.get('reduce_only', False),
+                     time_in_force=order_details.get('time_in_force', 'GoodTillCancel')
+                    )
+                except OrderExecutionError as oe:
+                    bot_logger.error(f"Order placement failed for {type(strat).__name__}: {oe}")
+                    # Notify strategy of order failure with error response
+                    error_response = {
+                        'main_order': {
+                            'result': {
+                                'orderId': None,
+                                'orderStatus': 'rejected',
+                                'error': str(oe)
+                            }
+                        }
+                    }
+                    try:
+                        strat.on_order_update(error_response, symbol=symbol)
+                    except Exception as callback_error:
+                        bot_logger.error(f"Failed to notify strategy of error: {callback_error}", exc_info=True)
+                        continue  # move on to next strategy without crashing the bot
+                except Exception as e:
+                    bot_logger.error(f"Unexpected error during order placement for {type(strat).__name__}: {e}", exc_info=True)
+                    error_response = {
+                        'main_order': {
+                            'result': {
+                                'orderId': None,
+                                'orderStatus': 'rejected',
+                                'error': f"Unexpected error: {str(e)}",
+                                'category': 'linear',
+                                'symbol': symbol,
+                                'side': order_details.get('side', 'N/A'),
+                            }
+                        }
+                    }
+                    try:
+                        strat.on_order_update(error_response, symbol=symbol)
+                    except Exception as callback_error:
+                        bot_logger.error(f"Failed to notify strategy of error: {callback_error}", exc_info=True)
+                        continue
+                # Now call on_order_update with the actual responses from OrderManager.
+                try:
+                    strat.on_order_update(order_responses, symbol=symbol)
+                except Exception as callback_error:
+                    bot_logger.error(f"Strategy callback error in {type(strat).__name__}.on_order_update: {callback_error}", exc_info=True)
+                    continue  # move on to next strategy without crashing the bot
+
+            # Check for open position and exit
+            # Ensure strat_instance.position is a dict, as expected
+            if not isinstance(strat_instance.position, dict):
+                strat_instance.position = {} # Initialize if not a dict to prevent errors
+
+            current_position_details = strat_instance.position.get(symbol)
+            if current_position_details and float(current_position_details.get('size', 0)) != 0:
+                exit_signal = strat.check_exit(symbol=symbol)
+                if exit_signal:
+                    bot_logger.info(f"Exit signal received from {type(strat).__name__} for {symbol}: {exit_signal}")
+                    try:
+                        # Pass category to execute_strategy_exit
+                        exit_order_response = order_manager.execute_strategy_exit(symbol, current_position_details, category=category)
+                        bot_logger.info(f"Exit order response for {type(strat).__name__}: {exit_order_response}")
+                        # Notify strategy of exit order update
+                        try:
+                            strat.on_order_update(exit_order_response, symbol=symbol)
+                        except Exception as callback_error:
+                            bot_logger.error(f"Strategy callback error in {type(strat).__name__}.on_order_update (exit): {callback_error}", exc_info=True)
+                        
+                        # Update performance tracker after successful exit
+                        if exit_order_response and exit_order_response.get('exit_order', {}).get('result', {}).get('orderStatus', '').lower() == 'filled':
+                            trade_summary = {
+                                'strategy': type(strat).__name__,
+                                'symbol': symbol,
+                                'entry_price': float(current_position_details.get('entry_price', 0)),
+                                'exit_price': float(exit_order_response['exit_order']['result'].get('avgPrice', 0)),
+                                'size': float(current_position_details.get('size', 0)),
+                                'side': current_position_details.get('side'),
+                                'pnl': float(exit_order_response.get('pnl', 0)), # Assuming OrderManager calculates this
+                                'timestamp': datetime.now(timezone.utc).isoformat()
+                            }
+                            perf_tracker.record_trade(trade_summary)
+                            bot_logger.info(f"Trade recorded for {type(strat).__name__}: {trade_summary}")
+                        
+                        # Clear position from strategy after successful exit and recording
+                        strat_instance.clear_position(symbol)
+                        bot_logger.info(f"Position for {symbol} cleared from strategy {type(strat).__name__}.")
+
+                    except OrderExecutionError as oe:
+                        bot_logger.error(f"Exit order placement failed for {type(strat).__name__}: {oe}")
+                        # Notify strategy of order failure with error response
+                        error_response_exit = {
+                            'exit_order': {
+                                'result': {
+                                    'orderId': None,
+                                    'orderStatus': 'rejected',
+                                    'error': str(oe)
+                                }
+                            }
+                        }
+                        try:
+                            strat.on_order_update(error_response_exit, symbol=symbol)
+                        except Exception as callback_error:
+                            bot_logger.error(f"Failed to notify strategy of exit order error: {callback_error}", exc_info=True)
+                    except Exception as e_exit:
+                        bot_logger.error(f"Unexpected error during strategy exit for {type(strat).__name__}: {e_exit}", exc_info=True)
+                        error_response_exit = {
+                            'exit_order': {
+                                'result': {
+                                    'orderId': None,
+                                    'orderStatus': 'rejected',
+                                    'error': f"Unexpected error: {str(e_exit)}"
+                                }
+                            }
+                        }
+                        try:
+                            strat.on_order_update(error_response_exit, symbol=symbol)
+                        except Exception as callback_error:
+                            bot_logger.error(f"Failed to notify strategy of unexpected exit order error: {callback_error}", exc_info=True)
+        
+        # Periodic market analysis check (every 60 minutes)
+        current_time = datetime.now()
+        if current_time - last_market_check >= market_check_interval:
+            bot_logger.info("="*60)
+            bot_logger.info("RUNNING PERIODIC MARKET ANALYSIS CHECK")
+            bot_logger.info("="*60)
+            
+            # Run silent market analysis for current symbol/timeframe
+            current_market_type = run_silent_market_analysis(exchange, config, symbol, timeframe, bot_logger)
+            
+            if current_market_type:
+                bot_logger.info(f"Current market type for {symbol} {timeframe}: {current_market_type}")
+                
+                # Check if market type still matches strategy
+                is_compatible = check_strategy_market_compatibility(
+                    primary_strategy_tags, current_market_type, symbol, timeframe, bot_logger
+                )
+                
+                if not is_compatible:
+                    bot_logger.warning(f"Market type mismatch detected! Strategy expects {primary_strategy_tags}, but market is {current_market_type}")
+                    
+                    # Run full market analysis for user display
+                    full_analysis = run_market_analysis(exchange, config, bot_logger)
+                    
+                    # Prompt user for strategy reselection
+                    new_strategy_name, should_restart = prompt_strategy_reselection(
+                        full_analysis, symbol, timeframe, current_market_type, available_strategies, bot_logger
+                    )
+                    
+                    if should_restart and new_strategy_name:
+                        bot_logger.info(f"User selected new strategy: {new_strategy_name}. Restarting configuration...")
+                        # Clean up current resources
+                        if 'data_fetcher' in locals() and data_fetcher is not None:
+                            data_fetcher.stop_websocket()
+                        if 'perf_tracker' in locals() and perf_tracker is not None:
+                            perf_tracker.close_session()
+                        
+                        # Instead of shutting down, restart the configuration process
+                        # This will trigger a new configuration flow with the selected strategy
+                        restart_configuration_with_new_strategy(
+                            new_strategy_name, available_strategies, full_analysis, 
+                            exchange, config, bot_logger
+                        )
+                        return  # Exit current main loop, new one will start
+                    else:
+                        bot_logger.info("Continuing with current strategy despite market change")
+                else:
+                    bot_logger.info(f"Market type compatibility confirmed: {current_market_type} matches strategy tags {primary_strategy_tags}")
+            else:
+                bot_logger.warning("Silent market analysis failed, skipping compatibility check")
+            
+            # Update last check time
+            last_market_check = current_time
+            bot_logger.info("="*60)
+            bot_logger.info("PERIODIC MARKET ANALYSIS CHECK COMPLETED")
+            bot_logger.info("="*60)
+        
+        # Brief pause to prevent excessive CPU usage and API rate limit issues
+        bot_logger.debug("Main loop iteration ended. Pausing...")
+        time.sleep(0.1)
+
 def main():
     config = load_config()
     # Initialize the main bot logger
@@ -558,294 +948,11 @@ def main():
 
     # Main trading loop
     try:
-        bot_logger.info("Entering main trading loop.")
-        
-        # Initialize timing for periodic market analysis
-        last_market_check = datetime.now()
-        market_check_interval = timedelta(minutes=60)  # Check every 60 minutes
-        # For testing purposes, you can temporarily change this to seconds:
-        # market_check_interval = timedelta(seconds=30)  # Uncomment for testing
-        primary_strategy_tags = getattr(primary_strategy_class, 'MARKET_TYPE_TAGS', [])
-        
-        bot_logger.info(f"Periodic market analysis will run every {market_check_interval.total_seconds()/60:.0f} minutes")
-        bot_logger.info(f"Current strategy tags: {primary_strategy_tags}")
-        
-        while True:
-            bot_logger.debug("Main loop iteration started.")
-            
-            bot_logger.debug("Calling data_fetcher.update_data()")
-            data = data_fetcher.update_data()
-            bot_logger.debug("data_fetcher.update_data() returned.")
-            
-            # Sync active orders with exchange and process adopted orders
-            bot_logger.debug(f"Calling order_manager.sync_active_orders_with_exchange for {symbol}")
-            adopted_orders = order_manager.sync_active_orders_with_exchange(symbol, category=category)
-            bot_logger.debug("order_manager.sync_active_orders_with_exchange() returned.")
-
-            # Check for and cancel orphaned conditional orders
-            bot_logger.debug(f"Calling order_manager.check_and_cancel_orphaned_conditional_orders for {symbol} ({category})")
-            try:
-                order_manager.check_and_cancel_orphaned_conditional_orders(symbol, category=category)
-            except Exception as e_orphan_check:
-                bot_logger.error(f"Error during check_and_cancel_orphaned_conditional_orders: {e_orphan_check}", exc_info=True)
-            bot_logger.debug("order_manager.check_and_cancel_orphaned_conditional_orders() returned.")
-
-            if adopted_orders:
-                for strat in strategies: # Notify all strategies (can be refined if strategies manage specific symbols)
-                    for adopted_order in adopted_orders:
-                        if adopted_order.get('symbol') == symbol: # Basic check
-                            try:
-                                bot_logger.info(f"Notifying strategy {type(strat).__name__} of adopted order {adopted_order.get('orderId')}")
-                                strat.on_externally_synced_order(adopted_order, symbol)
-                            except Exception as e_strat_notify:
-                                bot_logger.error(f"Error notifying strategy {type(strat).__name__} of adopted order: {e_strat_notify}", exc_info=True)
-
-            for strat in strategies:
-                bot_logger.debug(f"Processing strategy {type(strat).__name__}")
-                
-                # Update strategy data efficiently - preserve indicators while adding new OHLCV rows
-                if strat.data is not None and not strat.data.empty:
-                    # Strategy already has data - check if there are new rows to add
-                    if len(data) > len(strat.data):
-                        # Get new rows that need to be added
-                        new_rows = data.iloc[len(strat.data):]
-                        
-                        # Append new OHLCV rows to existing strategy data (preserving indicators)
-                        if not new_rows.empty:
-                            # Create empty indicator columns for new rows to match existing structure
-                            new_rows_with_indicators = new_rows.copy()
-                            indicator_cols = [col for col in strat.data.columns if col not in ['open', 'high', 'low', 'close', 'volume', 'timestamp']]
-                            for col in indicator_cols:
-                                new_rows_with_indicators[col] = np.nan
-                            
-                            # Append the new rows
-                            strat.data = pd.concat([strat.data, new_rows_with_indicators], ignore_index=False)
-                            bot_logger.debug(f"Added {len(new_rows)} new rows to {type(strat).__name__} data, now has {len(strat.data)} rows")
-                    else:
-                        # No new data - keep existing strategy data with indicators intact
-                        bot_logger.debug(f"{type(strat).__name__} data unchanged, {len(strat.data)} rows with indicators preserved")
-                else:
-                    # First time initialization - use fresh copy
-                    strat.data = data.copy()
-                    bot_logger.debug(f"Initialized {type(strat).__name__} data with {len(strat.data)} rows")
-                
-                # Use efficient indicator update if available, otherwise fall back to full init
-                if hasattr(strat, 'update_indicators_for_new_row') and len(strat.data) > 1:
-                    strat.update_indicators_for_new_row()
-                else:
-                    strat.init_indicators()
-
-                # Debug: log the latest row's indicator values
-                # latest_row = strat.data.iloc[-1].to_dict()
-                entry_signal = strat.check_entry(symbol=symbol)
-                if entry_signal:
-                    # Validate required fields are present in entry_signal
-                    required_fields = ['side', 'size', 'sl_pct', 'tp_pct']
-                    missing_fields = [field for field in required_fields if field not in entry_signal]
-                    
-                    if missing_fields:
-                        bot_logger.error(f"Strategy {type(strat).__name__} produced invalid entry_signal missing required fields {missing_fields}: {entry_signal}")
-                        continue  # Skip this signal and move to next strategy
-
-                    # Validate price field based on order type
-                    order_type = entry_signal.get('order_type', 'market')  # Default to market if not specified
-                    if order_type != 'market' and 'price' not in entry_signal:
-                        bot_logger.error(f"Strategy {type(strat).__name__} produced non-market order signal without 'price': {entry_signal}")
-                        continue  # Skip this signal and move to next strategy
-
-                    order_details = entry_signal.copy()
-
-                    # The strategy should now always provide sl_pct and tp_pct.
-                    # The OrderManager will calculate absolute SL/TP prices based on actual fill price.
-                    # The old block for recalculating SL/TP if not in order_details is removed.
-
-                    bot_logger.info(f"Order signal: {order_details}") # Log details before sending to OrderManager
-
-                    try:
-                        order_responses = order_manager.place_order_with_risk(
-                         symbol=symbol,
-                         side=order_details['side'],
-                         order_type=order_details.get('order_type', 'market'),
-                         size=order_details['size'],
-                         signal_price=order_details.get('price'), # Price at the time of signal generation
-                         sl_pct=order_details['sl_pct'],
-                         tp_pct=order_details['tp_pct'],
-                         params=order_details.get('params'), # Pass any extra params from strategy
-                         reduce_only=order_details.get('reduce_only', False),
-                         time_in_force=order_details.get('time_in_force', 'GoodTillCancel')
-                        )
-                    except OrderExecutionError as oe:
-                        bot_logger.error(f"Order placement failed for {type(strat).__name__}: {oe}")
-                        # Notify strategy of order failure with error response
-                        error_response = {
-                            'main_order': {
-                                'result': {
-                                    'orderId': None,
-                                    'orderStatus': 'rejected',
-                                    'error': str(oe)
-                                }
-                            }
-                        }
-                        try:
-                            strat.on_order_update(error_response, symbol=symbol)
-                        except Exception as callback_error:
-                            bot_logger.error(f"Failed to notify strategy of error: {callback_error}", exc_info=True)
-                            continue  # move on to next strategy without crashing the bot
-                    except Exception as e:
-                        bot_logger.error(f"Unexpected error during order placement for {type(strat).__name__}: {e}", exc_info=True)
-                        error_response = {
-                            'main_order': {
-                                'result': {
-                                    'orderId': None,
-                                    'orderStatus': 'rejected',
-                                    'error': f"Unexpected error: {str(e)}",
-                                    'category': 'linear',
-                                    'symbol': symbol,
-                                    'side': order_details.get('side', 'N/A'),
-                                }
-                            }
-                        }
-                        try:
-                            strat.on_order_update(error_response, symbol=symbol)
-                        except Exception as callback_error:
-                            bot_logger.error(f"Failed to notify strategy of error: {callback_error}", exc_info=True)
-                            continue
-                    # Now call on_order_update with the actual responses from OrderManager.
-                    try:
-                        strat.on_order_update(order_responses, symbol=symbol)
-                    except Exception as callback_error:
-                        bot_logger.error(f"Strategy callback error in {type(strat).__name__}.on_order_update: {callback_error}", exc_info=True)
-                        continue  # move on to next strategy without crashing the bot
-
-                # Check for open position and exit
-                # Ensure strat_instance.position is a dict, as expected
-                if not isinstance(strat_instance.position, dict):
-                    strat_instance.position = {} # Initialize if not a dict to prevent errors
-
-                current_position_details = strat_instance.position.get(symbol)
-                if current_position_details and float(current_position_details.get('size', 0)) != 0:
-                    exit_signal = strat.check_exit(symbol=symbol)
-                    if exit_signal:
-                        bot_logger.info(f"Exit signal received from {type(strat).__name__} for {symbol}: {exit_signal}")
-                        try:
-                            # Pass category to execute_strategy_exit
-                            exit_order_response = order_manager.execute_strategy_exit(symbol, current_position_details, category=category)
-                            bot_logger.info(f"Exit order response for {type(strat).__name__}: {exit_order_response}")
-                            # Notify strategy of exit order update
-                            try:
-                                strat.on_order_update(exit_order_response, symbol=symbol)
-                            except Exception as callback_error:
-                                bot_logger.error(f"Strategy callback error in {type(strat).__name__}.on_order_update (exit): {callback_error}", exc_info=True)
-                            
-                            # Update performance tracker after successful exit
-                            if exit_order_response and exit_order_response.get('exit_order', {}).get('result', {}).get('orderStatus', '').lower() == 'filled':
-                                trade_summary = {
-                                    'strategy': type(strat).__name__,
-                                    'symbol': symbol,
-                                    'entry_price': float(current_position_details.get('entry_price', 0)),
-                                    'exit_price': float(exit_order_response['exit_order']['result'].get('avgPrice', 0)),
-                                    'size': float(current_position_details.get('size', 0)),
-                                    'side': current_position_details.get('side'),
-                                    'pnl': float(exit_order_response.get('pnl', 0)), # Assuming OrderManager calculates this
-                                    'timestamp': datetime.now(timezone.utc).isoformat()
-                                }
-                                perf_tracker.record_trade(trade_summary)
-                                bot_logger.info(f"Trade recorded for {type(strat).__name__}: {trade_summary}")
-                            
-                            # Clear position from strategy after successful exit and recording
-                            strat_instance.clear_position(symbol)
-                            bot_logger.info(f"Position for {symbol} cleared from strategy {type(strat).__name__}.")
-
-                        except OrderExecutionError as oe:
-                            bot_logger.error(f"Exit order placement failed for {type(strat).__name__}: {oe}")
-                            # Notify strategy of order failure with error response
-                            error_response_exit = {
-                                'exit_order': {
-                                    'result': {
-                                        'orderId': None,
-                                        'orderStatus': 'rejected',
-                                        'error': str(oe)
-                                    }
-                                }
-                            }
-                            try:
-                                strat.on_order_update(error_response_exit, symbol=symbol)
-                            except Exception as callback_error:
-                                bot_logger.error(f"Failed to notify strategy of exit order error: {callback_error}", exc_info=True)
-                        except Exception as e_exit:
-                            bot_logger.error(f"Unexpected error during strategy exit for {type(strat).__name__}: {e_exit}", exc_info=True)
-                            error_response_exit = {
-                                'exit_order': {
-                                    'result': {
-                                        'orderId': None,
-                                        'orderStatus': 'rejected',
-                                        'error': f"Unexpected error: {str(e_exit)}"
-                                    }
-                                }
-                            }
-                            try:
-                                strat.on_order_update(error_response_exit, symbol=symbol)
-                            except Exception as callback_error:
-                                bot_logger.error(f"Failed to notify strategy of unexpected exit order error: {callback_error}", exc_info=True)
-            
-            # Periodic market analysis check (every 60 minutes)
-            current_time = datetime.now()
-            if current_time - last_market_check >= market_check_interval:
-                bot_logger.info("="*60)
-                bot_logger.info("RUNNING PERIODIC MARKET ANALYSIS CHECK")
-                bot_logger.info("="*60)
-                
-                # Run silent market analysis for current symbol/timeframe
-                current_market_type = run_silent_market_analysis(exchange, config, symbol, timeframe, bot_logger)
-                
-                if current_market_type:
-                    bot_logger.info(f"Current market type for {symbol} {timeframe}: {current_market_type}")
-                    
-                    # Check if market type still matches strategy
-                    is_compatible = check_strategy_market_compatibility(
-                        primary_strategy_tags, current_market_type, symbol, timeframe, bot_logger
-                    )
-                    
-                    if not is_compatible:
-                        bot_logger.warning(f"Market type mismatch detected! Strategy expects {primary_strategy_tags}, but market is {current_market_type}")
-                        
-                        # Run full market analysis for user display
-                        full_analysis = run_market_analysis(exchange, config, bot_logger)
-                        
-                        # Prompt user for strategy reselection
-                        new_strategy_name, should_restart = prompt_strategy_reselection(
-                            full_analysis, symbol, timeframe, current_market_type, available_strategies, bot_logger
-                        )
-                        
-                        if should_restart and new_strategy_name:
-                            bot_logger.info(f"User selected new strategy: {new_strategy_name}. Restarting bot...")
-                            # Clean up current resources
-                            if 'data_fetcher' in locals() and data_fetcher is not None:
-                                data_fetcher.stop_websocket()
-                            if 'perf_tracker' in locals() and perf_tracker is not None:
-                                perf_tracker.close_session()
-                            
-                            # Note: This will exit the current bot session
-                            # In a production environment, you might want to implement
-                            # a more sophisticated restart mechanism
-                            bot_logger.info("Bot shutting down for strategy change. Please restart manually.")
-                            return
-                        else:
-                            bot_logger.info("Continuing with current strategy despite market change")
-                    else:
-                        bot_logger.info(f"Market type compatibility confirmed: {current_market_type} matches strategy tags {primary_strategy_tags}")
-                else:
-                    bot_logger.warning("Silent market analysis failed, skipping compatibility check")
-                
-                # Update last check time
-                last_market_check = current_time
-                bot_logger.info("="*60)
-                bot_logger.info("PERIODIC MARKET ANALYSIS CHECK COMPLETED")
-                bot_logger.info("="*60)
-            
-            # Brief pause to prevent excessive CPU usage and API rate limit issues
-            bot_logger.debug("Main loop iteration ended. Pausing...")
-            time.sleep(0.1)
+        # Start trading loop with single strategy (modified to handle single strategy)
+        run_trading_loop(
+            strategies[0], symbol, timeframe, leverage, category,
+            data_fetcher, order_manager, perf_tracker, exchange, config, bot_logger
+        )
     except KeyboardInterrupt:
         bot_logger.info('Bot shutting down (KeyboardInterrupt).')
     except Exception as exc:
