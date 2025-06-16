@@ -7,18 +7,90 @@ import logging
 from .strategy_template import StrategyTemplate
 
 class StrategyBreakoutAndRetest(StrategyTemplate):
-    """
-    Breakout and Retest Strategy - Captures transitional trend changes.
-    
+    """Breakout and Retest Strategy - Captures transitional trend changes.
+
+    **STRATEGY MATRIX ROLE**: Active strategy for trending markets with mixed 1-minute conditions
+    **MATRIX USAGE**: 
+    - TRENDING(5m) + RANGING(1m) → 1-minute execution
+    - TRENDING(5m) + TRANSITIONAL(1m) → 1-minute execution
+    **EXECUTION TIMEFRAME**: 1-minute for precision entry timing
+
     Strategy waits for:
     1. Clear breakout of support/resistance with volume confirmation
     2. Retest of the broken level
     3. Reversal confirmation at the retest level
     4. Entry on bounce from retest with tight stop loss
+
+    Market Type:
+        Transitional trend change – e.g. a market that has been trending on 5-minute timeframe
+        but showing ranging or transitional behavior on 1-minute timeframe. This strategy captures
+        the continuation of the 5-minute trend by entering on precise 1-minute retest levels.
+        Perfect for trending markets that need precision timing due to short-term consolidation.
+
+    Indicators & Parameters:
+        - Support/Resistance levels (drawn from recent highs/lows)
+        - Volume to confirm breakout strength on the initial break
+        - Trend indicator (50-period EMA or Supertrend on 5-min) for bigger trend bias
+        - Momentum oscillator (e.g. RSI) for entry timing
+
+    Entry Conditions:
+        1. Initial breakout:
+           - Clear breakout of a key level (e.g. price breaks above $250)
+           - Large candle with high volume
+           - Wait for retest rather than chasing immediately
+
+        2. Retest entry:
+           - Price retraces to breakout level (old resistance → new support)
+           - Look for bullish reversal signs (double bottom, dojis, engulfing candle)
+           - Enter on bounce with decent uptick
+           - For bearish breakout/retest, invert the logic
+
+        3. Indicator filter:
+           - RSI should stay above 40 in uptrend pullback
+           - Monitor ADX for momentum strength
+
+        4. Volume:
+           - Declining volume on pullback
+           - Volume pickup on bounce
+           - High volume on deep pullback suggests breakout failure
+
+    Exit Conditions:
+        1. Trend continuation:
+           - Ride until clear reversal pattern
+           - Target next major resistance
+           - Use measured move concept (prior range height)
+
+        2. Partial exits:
+           - Take partial at +0.5% or structural level
+           - Trail stop on remainder
+           - Consider breakeven stop after initial profit
+
+    Stop Loss / Take Profit:
+        Stop Loss:
+            - Place just below retested level (e.g. $248-249 for $250 level)
+            - Tight enough to avoid noise but catch failures
+            - Invert for short positions
+
+        Take Profit:
+            - Target next resistance level
+            - Scale out at 1R (e.g. $254 for $251 entry with $248 stop)
+            - Trail remainder with breakeven stop
+
+    Notes:
+        - High success rate due to confirmation wait
+        - Good reward-to-risk ratio
+        - Not all breakouts retest
+        - Suitable for high leverage due to tight stops
+        - Avoid trading during major news
+        - Wait for clear entry signals
+        - Focus on clear levels and patient confirmation
     """
     
-    # Market type tags indicating this strategy works best in transitional markets
-    MARKET_TYPE_TAGS: List[str] = ['TRANSITIONAL']
+    # Market type tags indicating this strategy works for trending markets with mixed 1-min conditions
+    MARKET_TYPE_TAGS: List[str] = ['TRENDING', 'RANGING', 'TRANSITIONAL']
+    
+    # Strategy Matrix integration
+    SHOW_IN_SELECTION: bool = True  # Available for manual selection and automatic matrix selection
 
     def __init__(self,
                  data: pd.DataFrame,

@@ -1,23 +1,38 @@
+"""
+Double EMA Stochastic Oscillator Strategy
+
+DEPRECATED: This strategy is obsolete and no longer used in the new automatic strategy selection system.
+It has been replaced by the Strategy Matrix system that automatically selects optimal strategies based on market conditions.
+
+Legacy strategy kept for reference only.
+"""
+
 import pandas as pd
 import pandas_ta as ta
 from typing import Any, Dict, Optional, List
 import logging
+import numpy as np
 
 from .strategy_template import StrategyTemplate
 
 class StrategyDoubleEMAStochOsc(StrategyTemplate):
     """
-    Strategy using Double EMA crossover and Stochastic Oscillator for entry/exit signals.
+    DEPRECATED: Double EMA with Stochastic Oscillator Strategy
+    
+    This strategy is obsolete and has been replaced by the automatic Strategy Matrix system.
+    It will not be available for selection in the new trading system.
     """
     
-    # Market type tags indicating this is a test strategy
-    MARKET_TYPE_TAGS: List[str] = ['TEST']
+    MARKET_TYPE_TAGS: List[str] = ['DEPRECATED']
+    SHOW_IN_SELECTION: bool = False  # Hidden from selection - obsolete strategy
 
     def __init__(self,
                  data: pd.DataFrame,
                  config: Dict[str, Any],
                  logger: logging.Logger):
         super().__init__(data=data, config=config, logger=logger)
+        self.logger.warning(f"{self.__class__.__name__}: This strategy is DEPRECATED and obsolete!")
+        self.logger.warning("Please use the new automatic strategy selection system instead.")
 
     def on_init(self) -> None:
         super().on_init() # Call base on_init

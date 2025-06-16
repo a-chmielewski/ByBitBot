@@ -91,3 +91,22 @@ Main building process is done. Any new changes to any module should be listed he
 - **Resource Management**: Proper cleanup of old resources (data fetcher, performance tracker) before reconfiguration
 - **Seamless Transition**: Users can now change strategies during periodic market checks without manual bot restart
 - **Enhanced User Experience**: No more manual restarts required - bot handles strategy changes automatically and continues trading
+
+### Automatic Strategy Selection System Based on Market Conditions - Done
+- **User Flow Simplification**: Removed manual strategy selection - users now only choose coin pair and leverage
+- **Strategy Matrix Implementation**: Created comprehensive 5x5 matrix mapping market conditions (1m vs 5m timeframes) to optimal strategies
+- **Automatic Strategy Selection**: Bot automatically selects optimal strategy based on current market analysis and Strategy Matrix
+- **15-Minute Market Re-evaluation**: Implemented periodic market condition checks every 15 minutes with automatic strategy switching
+- **Safe Strategy Transitions**: Strategy changes only occur when no active orders exist to prevent trading disruptions
+- **Strategy File Management**: Created template files for all 14 strategies in the matrix, marked incomplete ones for future implementation
+- **Documentation Updates**: Updated application flow documents to reflect new automatic strategy selection system
+- **Double EMA StochOsc Deprecation**: Marked double_EMA_StochOsc.py as obsolete strategy no longer used in new system
+- **Strategy Matrix Module**: Implemented StrategyMatrix class with complete 5x5 matrix logic and strategy descriptions
+- **Modified Bot Flow**: Updated main() function to use automatic strategy selection instead of manual user selection
+- **New Trading Loop**: Created run_trading_loop_with_auto_strategy() function handling periodic strategy evaluation and switching
+- **Fallback Logic**: Implemented robust fallback to working strategies when selected strategy cannot be loaded
+- **Strategy Module Name Conversion**: Added automatic conversion from strategy class names to module file names
+- **Automatic Timeframe Selection**: Extended Strategy Matrix to include execution timeframe selection (5m for TRENDING+TRENDING, 1m for all others)
+- **Timeframe Change Handling**: Added logic to restart DataFetcher when timeframe changes during strategy switching
+- **Comprehensive Matrix Coverage**: Matrix now covers all 25 combinations with both strategy and timeframe assignments
+- **User Interface Updates**: Removed manual timeframe selection from user flow, now fully automated

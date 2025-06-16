@@ -6,21 +6,89 @@ import logging
 
 from .strategy_template import StrategyTemplate
 
-class StrategyEMAAdx(StrategyTemplate):
+class StrategyEMATrendRider(StrategyTemplate):
     """
     EMA Trend Rider with ADX Filter Strategy
     
-    Market Type: Strong trending conditions with clear directional bias.
+    **STRATEGY MATRIX ROLE**: Primary strategy for stable trending conditions
+    **MATRIX USAGE**: TRENDING(5m) + TRENDING(1m) → 5-minute execution (only 5m execution in matrix)
+    **EXECUTION TIMEFRAME**: 5-minute for stable trend-following
     
-    Strategy Logic:
+    Market Type: Strong trending conditions with clear directional bias on both timeframes.
+    
+    Quick Strategy Logic:
     1. Wait for EMA crossover (20/50) with ADX > threshold for trend confirmation
     2. Wait for pullback against the trend for better entry price
     3. Enter on trend resumption with volume confirmation
     4. Use ATR-based stops and targets with trailing functionality
+
+    Market Type:
+    - Strong trending conditions (price making higher highs/higher lows in uptrend or 
+      lower highs/lower lows in downtrend)
+
+    Indicators & Parameters:
+    - Fast and slow Exponential Moving Averages (20-period EMA and 50-period EMA)
+    - Average Directional Index (ADX) 14-period as trend-strength filter
+    - Optional: RSI (14) for momentum confirmation (above 50 for uptrend, below 50 for downtrend)
+
+    Entry Conditions:
+    Only trade in direction of the dominant trend:
+
+    1. Trend Detection:
+       - Wait for fast EMA to cross above slow EMA for bullish trend (or below for bearish)
+       - Confirm ADX > 25-30 indicating strong trend (filters out weak/sideways moves)
+       - Example: ADX rising above 30 with EMA bull-cross implies robust uptrend
+
+    2. Pullback Entry:
+       - Wait for brief pullback against trend for better price
+       - Uptrend: If price above EMAs, wait for dip toward 20 EMA or red candles
+       - Enter long on upward resumption (bullish engulfing off 20 EMA or 50 EMA bounce)
+       - Downtrend: Wait for bounce toward EMAs, enter short on bearish reversal
+
+    3. Volume Confirmation:
+       - Prefer entries with increasing volume in trend direction
+       - Example: Uptrend pullback - volume tapers on dip, spikes on rally
+
+    Exit Conditions:
+    Two-pronged approach to minimize drawdown:
+
+    1. Take Profit:
+       - Exit at nearest significant price swing level or pivot
+       - Uptrend: Exit approaching last swing high or round-number resistance
+       - Alternative: Fixed risk-reward (1.5:1 or 2:1) if backtests show high win rate
+
+    2. Trailing Stop:
+       - Trail stop behind short-term EMA or recent swing lows/highs
+       - Stay in if trend continues, exit with locked-in profit if trend reverses
+       - Example: Move stop loss up below each higher low in uptrend
+
+    Stop Loss / Take Profit:
+    - Stop Loss: Place beyond pullback's extreme
+      * Long entry: Few ticks below recent swing low or 50 EMA
+      * Keeps risk tight (0.2-0.5% on liquid pairs)
+    - Take Profit: Split approach
+      * First target at prior swing high
+      * Runner position to trail for larger moves
+    - ATR-based stops effective:
+      * Stop at 2×ATR(14) from entry
+      * Initial target at 2×ATR in profit
+      * Adjust for desired risk/reward
+
+    Notes (Leverage & Timing):
+    - High win rates in strong trends due to momentum trading
+    - ADX filter crucial for high leverage (avoids choppy periods)
+    - Best during clear market direction (crypto: London/NY session overlap)
+    - Avoid new entries if:
+      * Volatility drops
+      * ADX falls below 20-25
+    - Always use stop losses (critical for leveraged positions)
     """
     
-    # Market type tags indicating this strategy works best in trending markets
+    # Market type tags - Active strategy for double trending conditions
     MARKET_TYPE_TAGS: List[str] = ['TRENDING']
+    
+    # Strategy Matrix integration
+    SHOW_IN_SELECTION: bool = True  # Available for manual selection and automatic matrix selection
 
     def __init__(self,
                  data: pd.DataFrame,
@@ -162,6 +230,15 @@ class StrategyEMAAdx(StrategyTemplate):
         """Update indicators for the latest row efficiently."""
         if self.data is None or self.data.empty or len(self.data) < 2:
             self.logger.debug(f"'{self.__class__.__name__}': Not enough data for incremental update.")
+            return
+
+        # Check if indicator columns exist, if not initialize them first
+        required_indicator_cols = ['ema_fast', 'ema_slow', 'adx', 'rsi', 'atr', 'ema_cross', 'volume_sma']
+        missing_cols = [col for col in required_indicator_cols if col not in self.data.columns]
+        
+        if missing_cols:
+            self.logger.info(f"'{self.__class__.__name__}': Missing indicator columns {missing_cols}. Initializing indicators first.")
+            self.init_indicators()
             return
 
         try:

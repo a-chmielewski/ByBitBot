@@ -8,12 +8,14 @@ from modules.data_fetcher import LiveDataFetcher
 from modules.order_manager import OrderManager, OrderExecutionError
 from modules.performance_tracker import PerformanceTracker
 from modules.market_analyzer import MarketAnalyzer, MarketAnalysisError
+from modules.strategy_matrix import StrategyMatrix
 from datetime import datetime, timezone
 import time
 import warnings
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
+import re
 
 # Import StrategyTemplate for type checking in dynamic_import_strategy
 from strategies.strategy_template import StrategyTemplate
@@ -22,6 +24,45 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 
 CONFIG_PATH = 'config.json'
 STRATEGY_DIR = 'strategies'
+
+
+def convert_strategy_class_to_module_name(strategy_class_name: str) -> str:
+    """
+    Convert a strategy class name to its corresponding module name.
+    
+    Args:
+        strategy_class_name: Class name like 'StrategyAdaptiveTransitionalMomentum'
+        
+    Returns:
+        Module name like 'adaptive_transitional_momentum_strategy'
+    """
+    # Special case mappings for strategies that don't follow the standard naming convention
+    special_mappings = {
+        'StrategyDoubleEMAStochOsc': 'double_EMA_StochOsc',  # Non-standard file name
+        'StrategyEMAAdx': 'ema_adx_strategy',  # Handle EMA + ADX case properly
+        'StrategyEMATrendRider': 'ema_adx_strategy',  # Class name doesn't match file name
+        'StrategyRSIRangeScalping': 'rsi_range_scalping_strategy',  # rsirange_scalping_strategy -> rsi_range_scalping_strategy
+        'StrategyATRMomentumBreakout': 'atr_momentum_breakout_strategy',  # atrmomentum_breakout_strategy -> atr_momentum_breakout_strategy
+    }
+    
+    # Check for special mappings first
+    if strategy_class_name in special_mappings:
+        return special_mappings[strategy_class_name]
+    
+    # Standard conversion logic
+    # Remove 'Strategy' prefix
+    name_without_prefix = strategy_class_name.replace('Strategy', '')
+    
+    # Add underscores before capitals (while capitals still exist)
+    snake_case_name = re.sub('([a-z0-9])([A-Z])', r'\1_\2', name_without_prefix)
+    
+    # Convert to lowercase
+    snake_case_name = snake_case_name.lower()
+    
+    # Add '_strategy' suffix  
+    module_name = snake_case_name + '_strategy'
+    
+    return module_name
 
 
 def load_config():
@@ -810,6 +851,294 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
         bot_logger.debug("Main loop iteration ended. Pausing...")
         time.sleep(0.1)
 
+def automatic_strategy_and_timeframe_selection(analysis_results: dict, selected_symbol: str, logger_instance: logging.Logger) -> tuple:
+    """
+    Automatically select the optimal strategy and execution timeframe based on market conditions using the Strategy Matrix.
+    
+    Args:
+        analysis_results: Market analysis results dictionary
+        selected_symbol: The selected trading symbol
+        logger_instance: Logger instance
+        
+    Returns:
+        tuple: (strategy_class_name, execution_timeframe, strategy_description, selection_reason)
+    """
+    logger_instance.info("="*60)
+    logger_instance.info("AUTOMATIC STRATEGY AND TIMEFRAME SELECTION")
+    logger_instance.info("="*60)
+    
+    # Initialize Strategy Matrix
+    strategy_matrix = StrategyMatrix(logger_instance)
+    
+    # Get market conditions for the selected symbol
+    symbol_analysis = analysis_results.get(selected_symbol, {})
+    
+    market_5min = symbol_analysis.get('5m', {}).get('market_type', 'UNKNOWN')
+    market_1min = symbol_analysis.get('1m', {}).get('market_type', 'UNKNOWN')
+    
+    logger_instance.info(f"Market conditions for {selected_symbol}:")
+    logger_instance.info(f"  5-minute timeframe: {market_5min}")
+    logger_instance.info(f"  1-minute timeframe: {market_1min}")
+    
+    # Validate market conditions
+    if not strategy_matrix.validate_market_conditions(market_5min, market_1min):
+        logger_instance.error("Invalid market conditions detected. Cannot select strategy automatically.")
+        return None, None, None, "Invalid market conditions"
+    
+    # Select strategy and timeframe using the matrix
+    selected_strategy_class, execution_timeframe, selection_reason = strategy_matrix.select_strategy_and_timeframe(market_5min, market_1min)
+    strategy_description = strategy_matrix.get_strategy_description(selected_strategy_class)
+    
+    logger_instance.info(f"Strategy Matrix Selection:")
+    logger_instance.info(f"  Selected Strategy: {selected_strategy_class}")
+    logger_instance.info(f"  Execution Timeframe: {execution_timeframe}")
+    logger_instance.info(f"  Description: {strategy_description}")
+    logger_instance.info(f"  Reason: {selection_reason}")
+    
+    # Display matrix summary for reference
+    matrix_summary = strategy_matrix.get_matrix_summary()
+    logger_instance.debug(f"Strategy Matrix:\n{matrix_summary}")
+    
+    logger_instance.info("="*60)
+    
+    return selected_strategy_class, execution_timeframe, strategy_description, selection_reason
+
+def check_strategy_needs_change(analysis_results: dict, selected_symbol: str, current_strategy_class: str, current_timeframe: str, logger_instance: logging.Logger) -> tuple:
+    """
+    Check if the current strategy and timeframe are still optimal for current market conditions.
+    
+    Args:
+        analysis_results: Current market analysis results
+        selected_symbol: The trading symbol
+        current_strategy_class: Current strategy class name
+        current_timeframe: Current execution timeframe
+        logger_instance: Logger instance
+        
+    Returns:
+        tuple: (needs_change: bool, new_strategy_class: str, new_timeframe: str, reason: str)
+    """
+    logger_instance.info("Checking if strategy/timeframe change is needed based on current market conditions...")
+    
+    # Initialize Strategy Matrix
+    strategy_matrix = StrategyMatrix(logger_instance)
+    
+    # Get current market conditions
+    symbol_analysis = analysis_results.get(selected_symbol, {})
+    market_5min = symbol_analysis.get('5m', {}).get('market_type', 'UNKNOWN')
+    market_1min = symbol_analysis.get('1m', {}).get('market_type', 'UNKNOWN')
+    
+    # Get optimal strategy and timeframe for current conditions
+    optimal_strategy_class, optimal_timeframe, selection_reason = strategy_matrix.select_strategy_and_timeframe(market_5min, market_1min)
+    
+    if optimal_strategy_class != current_strategy_class or optimal_timeframe != current_timeframe:
+        reason = f"Market conditions changed. Optimal setup is now {optimal_strategy_class} on {optimal_timeframe} instead of {current_strategy_class} on {current_timeframe}. {selection_reason}"
+        logger_instance.warning(reason)
+        return True, optimal_strategy_class, optimal_timeframe, reason
+    else:
+        reason = f"Current setup {current_strategy_class} on {current_timeframe} is still optimal for market conditions {market_5min}(5m) + {market_1min}(1m)"
+        logger_instance.info(reason)
+        return False, current_strategy_class, current_timeframe, reason
+
+def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_class, symbol, timeframe, leverage, category, data_fetcher, order_manager, perf_tracker, exchange, config, analysis_results, bot_logger):
+    """
+    Main trading loop with automatic strategy switching based on market conditions.
+    
+    Args:
+        strategy_instance: Current strategy instance
+        current_strategy_class: Current strategy class name
+        symbol: Trading symbol
+        timeframe: Trading timeframe
+        leverage: Trading leverage
+        category: Trading category
+        data_fetcher: Data fetcher instance
+        order_manager: Order manager instance
+        perf_tracker: Performance tracker instance
+        exchange: Exchange connector instance
+        config: Configuration dictionary
+        analysis_results: Initial market analysis results
+        bot_logger: Logger instance
+    """
+    bot_logger.info("="*60)
+    bot_logger.info("STARTING TRADING LOOP WITH AUTOMATIC STRATEGY MANAGEMENT")
+    bot_logger.info("="*60)
+    
+    # Initialize timing for strategy checks
+    last_strategy_check = time.time()
+    strategy_check_interval = 15 * 60  # 15 minutes in seconds
+    
+    current_strategy = strategy_instance
+    current_strategy_name = current_strategy_class
+    
+    bot_logger.info(f"Initial strategy: {current_strategy_name}")
+    bot_logger.info(f"Strategy check interval: {strategy_check_interval / 60:.0f} minutes")
+    
+    while True:
+        try:
+            current_time = time.time()
+            
+            # Update data using the LiveDataFetcher interface
+            try:
+                latest_data = data_fetcher.update_data()
+                
+                # Check if strategy data has indicators (avoid overwriting them)
+                if current_strategy.data is not None and not current_strategy.data.empty:
+                    # Get indicator columns that exist in strategy data but not in raw OHLCV
+                    base_ohlcv_cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+                    indicator_cols = [col for col in current_strategy.data.columns if col not in base_ohlcv_cols]
+                    
+                    if indicator_cols:
+                        # Strategy data has indicators - merge carefully to preserve them
+                        bot_logger.debug(f"Preserving {len(indicator_cols)} indicator columns during data update")
+                        
+                        # Update OHLCV columns with latest data, keeping indicators
+                        for col in base_ohlcv_cols:
+                            if col in latest_data.columns:
+                                current_strategy.data[col] = latest_data[col].copy()
+                        
+                        # Ensure data length matches (trim if necessary)
+                        if len(current_strategy.data) != len(latest_data):
+                            current_strategy.data = current_strategy.data.iloc[-len(latest_data):].reset_index(drop=True)
+                        
+                        bot_logger.debug(f"Updated strategy OHLCV data while preserving indicators. Rows: {len(current_strategy.data)}")
+                    else:
+                        # No indicators yet - safe to replace entirely
+                        current_strategy.data = latest_data.copy()
+                        bot_logger.debug(f"Updated strategy data (no indicators to preserve). Rows: {len(latest_data)}")
+                else:
+                    # No existing data - safe to replace entirely
+                    current_strategy.data = latest_data.copy()
+                    bot_logger.debug(f"Initialized strategy data. Rows: {len(latest_data)}")
+                
+                # Now update indicators for the new row
+                current_strategy.update_indicators_for_new_row()
+                
+            except Exception as e:
+                bot_logger.debug(f"Data update failed: {e}")
+                # Continue with existing data
+            
+            # Check for strategy change every 15 minutes (only when no active orders)
+            if current_time - last_strategy_check >= strategy_check_interval:
+                bot_logger.info("="*60)
+                bot_logger.info("PERIODIC STRATEGY EVALUATION CHECK")
+                bot_logger.info("="*60)
+                
+                # Check if there are any active orders
+                has_active_orders = False
+                if hasattr(current_strategy, 'position') and current_strategy.position.get(symbol):
+                    has_active_orders = True
+                    bot_logger.info(f"Active position exists for {symbol}. Skipping strategy evaluation until position closes.")
+                elif hasattr(current_strategy, 'order_pending') and current_strategy.order_pending.get(symbol, False):
+                    has_active_orders = True
+                    bot_logger.info(f"Order pending for {symbol}. Skipping strategy evaluation until order completes.")
+                
+                if not has_active_orders:
+                    bot_logger.info("No active orders detected. Proceeding with strategy evaluation...")
+                    
+                    # Run silent market analysis to get current conditions
+                    try:
+                        current_analysis = run_silent_market_analysis(exchange, config, symbol, timeframe, bot_logger)
+                        
+                        if current_analysis and symbol in current_analysis:
+                            # Check if strategy/timeframe needs to change
+                            needs_change, new_strategy_class, new_timeframe, reason = check_strategy_needs_change(
+                                current_analysis, symbol, current_strategy_name, timeframe, bot_logger
+                            )
+                            
+                            if needs_change:
+                                bot_logger.warning(f"Strategy/timeframe change needed: {reason}")
+                                
+                                try:
+                                    # Check if timeframe changed - if so, need to restart data fetcher
+                                    timeframe_changed = new_timeframe != timeframe
+                                    
+                                    if timeframe_changed:
+                                        bot_logger.info(f"Timeframe changing from {timeframe} to {new_timeframe}. Restarting data fetcher...")
+                                        # Stop current data fetcher
+                                        data_fetcher.stop_websocket()
+                                        # Create new data fetcher with new timeframe
+                                        data_fetcher = LiveDataFetcher(exchange, symbol, new_timeframe, logger=bot_logger)
+                                        latest_data = data_fetcher.fetch_initial_data()
+                                        data_fetcher.start_websocket()
+                                        bot_logger.info(f"Data fetcher restarted with {new_timeframe} timeframe")
+                                        # Update timeframe variable
+                                        timeframe = new_timeframe
+                                    else:
+                                        latest_data = data_fetcher.get_data()
+                                    
+                                    # Load new strategy
+                                    new_strategy_module = convert_strategy_class_to_module_name(new_strategy_class)
+                                    
+                                    bot_logger.info(f"Loading new strategy module: {new_strategy_module}")
+                                    NewStratClass = dynamic_import_strategy(new_strategy_module, StrategyTemplate, bot_logger)
+                                    
+                                    # Create new strategy instance
+                                    new_strategy_logger = get_logger(new_strategy_class.lower())
+                                    new_strategy_instance = NewStratClass(latest_data.copy(), config, logger=new_strategy_logger)
+                                    
+                                    bot_logger.info(f"Successfully switched from {current_strategy_name} to {new_strategy_class} on {new_timeframe}")
+                                    
+                                    # Update current strategy references
+                                    current_strategy = new_strategy_instance
+                                    current_strategy_name = new_strategy_class
+                                    
+                                    # Log strategy change
+                                    current_strategy.log_state_change(symbol, "awaiting_entry", 
+                                        f"Strategy {new_strategy_class} on {new_timeframe} for {symbol}: Switched due to market condition change. Looking for entry conditions...")
+                                    
+                                except Exception as e:
+                                    bot_logger.error(f"Failed to switch to new strategy {new_strategy_class} on {new_timeframe}: {e}")
+                                    bot_logger.info("Continuing with current strategy and timeframe")
+                            else:
+                                bot_logger.info("Current strategy and timeframe remain optimal for market conditions")
+                        else:
+                            bot_logger.warning("Failed to get current market analysis for strategy evaluation")
+                    except Exception as e:
+                        bot_logger.error(f"Error during strategy evaluation: {e}")
+                
+                # Update last check time regardless of whether we could evaluate
+                last_strategy_check = current_time
+                bot_logger.info("="*60)
+                bot_logger.info("STRATEGY EVALUATION CHECK COMPLETED")
+                bot_logger.info("="*60)
+            
+            # Regular trading logic - check for entry
+            if not hasattr(current_strategy, 'position') or not current_strategy.position.get(symbol):
+                entry_signal = current_strategy.check_entry(symbol)
+                if entry_signal:
+                    bot_logger.info(f"Entry signal detected by {current_strategy_name}: {entry_signal}")
+                    try:
+                        order_responses = order_manager.place_order_with_sl_tp(symbol, entry_signal)
+                        current_strategy.on_order_update(order_responses, symbol)
+                        bot_logger.info(f"Orders placed successfully for {symbol}")
+                    except OrderExecutionError as e:
+                        bot_logger.error(f"Order execution failed: {e}")
+                        current_strategy.order_pending[symbol] = False  # Reset pending state
+                        current_strategy.active_order_id[symbol] = None
+            
+            # Check for exit if position exists
+            if hasattr(current_strategy, 'position') and current_strategy.position.get(symbol):
+                exit_signal = current_strategy.check_exit(symbol)
+                if exit_signal:
+                    bot_logger.info(f"Exit signal detected by {current_strategy_name}: {exit_signal}")
+                    try:
+                        exit_order_responses = order_manager.place_exit_order(symbol, exit_signal)
+                        # Update strategy on successful exit
+                        if exit_order_responses:
+                            current_strategy.clear_position(symbol)
+                            bot_logger.info(f"Position closed for {symbol}")
+                    except OrderExecutionError as e:
+                        bot_logger.error(f"Exit order execution failed: {e}")
+            
+            # Brief pause to prevent excessive CPU usage
+            time.sleep(0.1)
+            
+        except KeyboardInterrupt:
+            bot_logger.info("Trading loop interrupted by user")
+            break
+        except Exception as e:
+            bot_logger.error(f"Error in trading loop: {e}", exc_info=True)
+            time.sleep(1)  # Pause before retrying
+
 def main():
     config = load_config()
     # Initialize the main bot logger
@@ -836,65 +1165,67 @@ def main():
     bot_logger.info("CONTINUING WITH STRATEGY SETUP")
     bot_logger.info("="*60)
     
-    # Strategy selection AFTER market analysis
-    available_strategies = list_strategies()
-    strategy_names = [info[0] for info in available_strategies]  # Extract module names for logging
-    bot_logger.info(f"Found available strategies: {strategy_names}")
-    
-    selected_strategy_names = select_strategies(available_strategies, bot_logger)
-    bot_logger.info(f"Strategies selected by user: {selected_strategy_names}")
-
-    if not selected_strategy_names:
-        bot_logger.error("No strategies were selected by the user, or selection failed. Bot will exit.")
-        return
-
-    # Load strategy classes to determine parameters
-    strategy_classes = []
-    for strat_name in selected_strategy_names:
-        bot_logger.info(f"Attempting to load strategy: {strat_name}")
-        try:
-            StratClass = dynamic_import_strategy(strat_name, StrategyTemplate, bot_logger)
-            strategy_classes.append(StratClass)
-            bot_logger.info(f"Successfully loaded strategy class: {StratClass.__name__}")
-        except ImportError as e:
-            bot_logger.error(f"ImportError loading strategy module {strat_name}: {e}", exc_info=True)
-        except Exception as e:
-            bot_logger.error(f"Failed to load strategy class {strat_name}: {e}", exc_info=True)
-
-    if not strategy_classes:
-        bot_logger.error("No strategies were successfully loaded. The bot will now exit.")
-        return
-
-    # User selects symbol and timeframe from analyzed markets
+    # User selects symbol and timeframe from analyzed markets (NO MANUAL STRATEGY SELECTION)
     if not analysis_results:
         bot_logger.error("No market analysis results available for symbol selection. Bot will exit.")
         return
     
     bot_logger.info("="*60)
-    bot_logger.info("SYMBOL AND TIMEFRAME SELECTION")
+    bot_logger.info("SYMBOL AND LEVERAGE SELECTION")
     bot_logger.info("="*60)
     
     # Let user select symbol from analyzed markets
     selected_symbol = select_symbol(analysis_results, bot_logger)
     
-    # Let user select timeframe for the chosen symbol
-    selected_timeframe = select_timeframe(analysis_results, selected_symbol, bot_logger)
-    
     # Let user select leverage
     selected_leverage = select_leverage(bot_logger)
     
-    # Get strategy-specific parameters (category only, leverage now user-selected)
-    primary_strategy_class = strategy_classes[0]
-    strategy_params = get_strategy_parameters(primary_strategy_class.__name__)
+    # AUTOMATIC STRATEGY AND TIMEFRAME SELECTION based on market conditions
+    selected_strategy_class, selected_timeframe, strategy_description, selection_reason = automatic_strategy_and_timeframe_selection(
+        analysis_results, selected_symbol, bot_logger
+    )
     
-    # Use user selections and strategy defaults
+    if not selected_strategy_class or not selected_timeframe:
+        bot_logger.error("Automatic strategy and timeframe selection failed. Bot will exit.")
+        return
+    
+    bot_logger.info(f"Automatically selected strategy: {selected_strategy_class}")
+    bot_logger.info(f"Automatically selected timeframe: {selected_timeframe}")
+    bot_logger.info(f"Strategy description: {strategy_description}")
+    
+    # Load the selected strategy class
+    try:
+        # Convert class name to module name using helper function
+        strategy_module_name = convert_strategy_class_to_module_name(selected_strategy_class)
+        
+        bot_logger.info(f"Attempting to load strategy module: {strategy_module_name}")
+        StratClass = dynamic_import_strategy(strategy_module_name, StrategyTemplate, bot_logger)
+        bot_logger.info(f"Successfully loaded strategy class: {StratClass.__name__}")
+    except Exception as e:
+        bot_logger.error(f"Failed to load automatically selected strategy {selected_strategy_class}: {e}")
+        bot_logger.error("Falling back to StrategyBreakoutAndRetest with 1m timeframe as a working strategy")
+        try:
+            StratClass = dynamic_import_strategy('breakout_and_retest_strategy', StrategyTemplate, bot_logger)
+            selected_strategy_class = 'StrategyBreakoutAndRetest'
+            selected_timeframe = '1m'  # Use 1m as fallback timeframe
+            bot_logger.info(f"Successfully loaded fallback strategy: {StratClass.__name__} on {selected_timeframe}")
+        except Exception as fallback_error:
+            bot_logger.error(f"Even fallback strategy failed to load: {fallback_error}")
+            return
+    
+    # Get strategy-specific parameters (category only, leverage now user-selected)
+    strategy_params = get_strategy_parameters(StratClass.__name__)
+    
+    # Use user selections and automatically selected strategy/timeframe
     symbol = selected_symbol
-    timeframe = selected_timeframe
+    timeframe = selected_timeframe  # Automatically selected timeframe
     leverage = selected_leverage  # Use user-selected leverage
     category = strategy_params['category']
     coin_pair = symbol.replace('USDT', '/USDT')  # Convert format for display
     
     bot_logger.info(f"Final trading parameters: {coin_pair} ({symbol}), {timeframe}, {leverage}x leverage")
+    bot_logger.info(f"Selected strategy: {selected_strategy_class}")
+    bot_logger.info(f"Selected timeframe: {timeframe}")
     
     # Set leverage on the exchange for the selected symbol
     try:
@@ -919,39 +1250,28 @@ def main():
     # Performance tracker
     perf_tracker = PerformanceTracker(logger=bot_logger)
 
-    # Initialize strategy instances with the fetched data
-    strategies = []
-    for i, StratClass in enumerate(strategy_classes):
-        try:
-            # Each strategy instance gets its own logger
-            strategy_specific_logger = get_logger(selected_strategy_names[i]) 
-            strategy_instance = StratClass(data.copy(), config, logger=strategy_specific_logger)
-            strategies.append(strategy_instance)
-            bot_logger.info(f"Successfully initialized strategy: {type(strategy_instance).__name__}")
-        except Exception as e:
-            bot_logger.error(f"Failed to initialize strategy class {StratClass.__name__}: {e}", exc_info=True)
-    
-    # Log the final list of loaded strategies
-    loaded_strategy_class_names = [type(s).__name__ for s in strategies]
-    bot_logger.info(f"Loaded strategies: {loaded_strategy_class_names if loaded_strategy_class_names else '[]'}")
-
-    if not strategies:
-        bot_logger.error("No strategies were successfully initialized. The bot will now exit.")
+    # Initialize the selected strategy instance
+    try:
+        # Create strategy-specific logger
+        strategy_logger = get_logger(selected_strategy_class.lower())
+        strategy_instance = StratClass(data.copy(), config, logger=strategy_logger)
+        bot_logger.info(f"Successfully initialized strategy: {type(strategy_instance).__name__}")
+    except Exception as e:
+        bot_logger.error(f"Failed to initialize strategy class {StratClass.__name__}: {e}", exc_info=True)
         if 'data_fetcher' in locals() and data_fetcher is not None:
             data_fetcher.stop_websocket()
-        bot_logger.info('Bot session closed due to no strategies initialized.')
+        bot_logger.info('Bot session closed due to strategy initialization failure.')
         return
 
-    # Initial state logging for each strategy
-    for strat_instance in strategies:
-        strat_instance.log_state_change(symbol, "awaiting_entry", f"Strategy {type(strat_instance).__name__} for {symbol}: Initialized. Looking for new entry conditions...")
+    # Initial state logging
+    strategy_instance.log_state_change(symbol, "awaiting_entry", f"Strategy {type(strategy_instance).__name__} for {symbol}: Initialized. Looking for new entry conditions...")
 
-    # Main trading loop
+    # Main trading loop with automatic strategy switching
     try:
-        # Start trading loop with single strategy (modified to handle single strategy)
-        run_trading_loop(
-            strategies[0], symbol, timeframe, leverage, category,
-            data_fetcher, order_manager, perf_tracker, exchange, config, bot_logger
+        # Start trading loop with automatic strategy management
+        run_trading_loop_with_auto_strategy(
+            strategy_instance, selected_strategy_class, symbol, timeframe, leverage, category,
+            data_fetcher, order_manager, perf_tracker, exchange, config, analysis_results, bot_logger
         )
     except KeyboardInterrupt:
         bot_logger.info('Bot shutting down (KeyboardInterrupt).')

@@ -640,19 +640,45 @@ class ExchangeConnector:
         try:
             self.logger.info(f"Setting leverage to {leverage}x for {symbol} ({category})")
             
-            response = self._api_call_with_backoff(
-                self.client.set_leverage,
+            # Call the API directly without backoff wrapper to handle 110043 ourselves
+            response = self.client.set_leverage(
                 category=category,
                 symbol=symbol,
                 buyLeverage=str(leverage),
-                sellLeverage=str(leverage)
+                sellLeverage=str(leverage),
+                timestamp=self._get_adjusted_timestamp()
             )
             
+            # Handle specific case where leverage is already set (error code 110043)
+            api_ret_code = response.get("retCode") or response.get("ret_code")
+            if api_ret_code == 110043:
+                self.logger.info(f"Leverage for {symbol} is already set to {leverage}x (no change needed)")
+                # Return a successful response structure
+                return {
+                    "retCode": 0,
+                    "retMsg": "Leverage already set to requested value",
+                    "result": {},
+                    "time": int(time.time() * 1000)
+                }
+            
+            # For all other responses, use normal error checking
             checked_response = self._check_response(response, f"set_leverage({symbol}, {leverage}x)")
             self.logger.info(f"Successfully set leverage to {leverage}x for {symbol}")
             
             return checked_response
             
         except Exception as e:
-            self.logger.error(f"Error setting leverage to {leverage}x for {symbol}: {e}")
-            raise ExchangeError(f"Failed to set leverage for {symbol}: {str(e)}") from e 
+            # Catch any other exceptions including pybit errors
+            error_msg = str(e).lower()
+            if "110043" in error_msg or "leverage not modified" in error_msg:
+                self.logger.info(f"Leverage for {symbol} is already set to {leverage}x (no change needed)")
+                # Return a successful response structure
+                return {
+                    "retCode": 0,
+                    "retMsg": "Leverage already set to requested value",
+                    "result": {},
+                    "time": int(time.time() * 1000)
+                }
+            else:
+                self.logger.error(f"Error setting leverage to {leverage}x for {symbol}: {e}")
+                raise ExchangeError(f"Failed to set leverage for {symbol}: {str(e)}") from e 
