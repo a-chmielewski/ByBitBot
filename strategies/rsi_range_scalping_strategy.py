@@ -161,7 +161,7 @@ class StrategyRSIRangeScalping(StrategyTemplate):
             # Volume analysis
             self.data['volume_sma'] = self.data['volume'].rolling(window=volume_period).mean()
             
-            self.logger.info("All indicators initialized successfully")
+            self.logger.debug("All indicators initialized successfully")
             
         except Exception as e:
             self.logger.error(f"Error initializing indicators: {str(e)}")
@@ -495,10 +495,10 @@ class StrategyRSIRangeScalping(StrategyTemplate):
                     self.logger.info(f"RSI range scalping long entry - RSI: {current_rsi:.1f}, Pattern: {pattern_type}")
                     
                     return {
-                        'action': 'long',
+                        'side': 'buy',
                         'price': current_price,
                         'confidence': 0.8,
-                        'reason': f'rsi_range_scalp_long_{pattern_type}'
+                        'reason': 'rsi_oversold_bounce'
                     }
             
             # Short entry conditions (near resistance)
@@ -517,10 +517,10 @@ class StrategyRSIRangeScalping(StrategyTemplate):
                     self.logger.info(f"RSI range scalping short entry - RSI: {current_rsi:.1f}, Pattern: {pattern_type}")
                     
                     return {
-                        'action': 'short',
+                        'side': 'sell',
                         'price': current_price,
                         'confidence': 0.8,
-                        'reason': f'rsi_range_scalp_short_{pattern_type}'
+                        'reason': 'rsi_overbought_rejection'
                     }
             
             return None

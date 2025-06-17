@@ -198,7 +198,7 @@ class StrategyVolatilitySqueezeBreakout(StrategyTemplate):
             # Volume analysis
             self.data['volume_sma'] = self.data['volume'].rolling(window=volume_avg_period).mean()
             
-            self.logger.info("All squeeze detection indicators initialized successfully")
+            self.logger.debug("All squeeze detection indicators initialized successfully")
             
         except Exception as e:
             self.logger.error(f"Error initializing indicators: {str(e)}")
@@ -683,7 +683,7 @@ class StrategyVolatilitySqueezeBreakout(StrategyTemplate):
                                     self.logger.info(f"Squeeze breakout long entry above {self.range_resistance:.4f}")
                                     
                                     return {
-                                        'action': 'long',
+                                        'side': 'buy',
                                         'price': current_price,
                                         'confidence': 0.8,
                                         'reason': f'squeeze_breakout_long_above_{self.range_resistance:.4f}'
@@ -700,7 +700,7 @@ class StrategyVolatilitySqueezeBreakout(StrategyTemplate):
                                     self.logger.info(f"Squeeze breakout short entry below {self.range_support:.4f}")
                                     
                                     return {
-                                        'action': 'short',
+                                        'side': 'sell',
                                         'price': current_price,
                                         'confidence': 0.8,
                                         'reason': f'squeeze_breakout_short_below_{self.range_support:.4f}'
@@ -744,7 +744,7 @@ class StrategyVolatilitySqueezeBreakout(StrategyTemplate):
                             self.logger.info(f"Simple range breakout long entry above {self.range_resistance:.4f}")
                             
                             return {
-                                'action': 'long',
+                                'side': 'buy',
                                 'price': current_price,
                                 'confidence': 0.75,
                                 'reason': f'simple_range_breakout_long_above_{self.range_resistance:.4f}'
@@ -762,7 +762,7 @@ class StrategyVolatilitySqueezeBreakout(StrategyTemplate):
                             self.logger.info(f"Simple range breakout short entry below {self.range_support:.4f}")
                             
                             return {
-                                'action': 'short',
+                                'side': 'sell',
                                 'price': current_price,
                                 'confidence': 0.75,
                                 'reason': f'simple_range_breakout_short_below_{self.range_support:.4f}'

@@ -223,7 +223,7 @@ class StrategyHighVolatilityTrendRider(StrategyTemplate):
             self.data['highest'] = self.data['high'].rolling(window=self.breakout_bars, min_periods=1).max()
             self.data['lowest'] = self.data['low'].rolling(window=self.breakout_bars, min_periods=1).min()
             
-            self.logger.info(f"'{self.__class__.__name__}': All indicators initialized successfully")
+            self.logger.debug(f"'{self.__class__.__name__}': All indicators initialized successfully")
             
         except Exception as e:
             self.logger.error(f"'{self.__class__.__name__}': Error initializing indicators: {str(e)}")

@@ -207,7 +207,7 @@ class StrategyAdaptiveTransitionalMomentum(StrategyTemplate):
             # Volume analysis
             self.data['volume_sma'] = self.data['volume'].rolling(window=volume_period).mean()
             
-            self.logger.info("All adaptive momentum indicators initialized successfully")
+            self.logger.debug("All adaptive momentum indicators initialized successfully")
             
         except Exception as e:
             self.logger.error(f"Error initializing indicators: {str(e)}")

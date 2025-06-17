@@ -193,7 +193,7 @@ class StrategyMicroRangeScalping(StrategyTemplate):
             # Volume analysis
             self.data['volume_sma'] = self.data['volume'].rolling(window=volume_period).mean()
             
-            self.logger.info("All micro-range indicators initialized successfully")
+            self.logger.debug("All micro-range indicators initialized successfully")
             
         except Exception as e:
             self.logger.error(f"Error initializing indicators: {str(e)}")
@@ -548,7 +548,7 @@ class StrategyMicroRangeScalping(StrategyTemplate):
                 self.logger.info(f"Micro range scalping long entry at support {self.range_support:.4f}")
                 
                 return {
-                    'action': 'long',
+                    'side': 'buy',
                     'price': current_price,
                     'confidence': 0.8,
                     'reason': 'micro_range_support_bounce'
@@ -566,7 +566,7 @@ class StrategyMicroRangeScalping(StrategyTemplate):
                 self.logger.info(f"Micro range scalping short entry at resistance {self.range_resistance:.4f}")
                 
                 return {
-                    'action': 'short',
+                    'side': 'sell',
                     'price': current_price,
                     'confidence': 0.8,
                     'reason': 'micro_range_resistance_rejection'

@@ -191,7 +191,7 @@ class StrategyVolatilityReversalScalping(StrategyTemplate):
             # Volume analysis
             self.data['volume_sma'] = self.data['volume'].rolling(window=volume_period).mean()
             
-            self.logger.info("All volatility indicators initialized successfully")
+            self.logger.debug("All volatility indicators initialized successfully")
             
         except Exception as e:
             self.logger.error(f"Error initializing indicators: {str(e)}")
@@ -685,7 +685,7 @@ class StrategyVolatilityReversalScalping(StrategyTemplate):
                     self.logger.info(f"Volatility reversal pattern entry - Pattern: {confirmation_type}")
                     
                     return {
-                        'action': self.entry_side,
+                        'side': 'buy' if self.entry_side == 'long' else 'sell',
                         'price': current_price,
                         'confidence': 0.8,
                         'reason': f'volatility_reversal_pattern_{confirmation_type}'
@@ -718,7 +718,7 @@ class StrategyVolatilityReversalScalping(StrategyTemplate):
                     self.logger.info(f"Volatility reversal moderate overbought entry - RSI: {rsi_value:.1f}")
                     
                     return {
-                        'action': 'short',
+                        'side': 'sell',
                         'price': current_price,
                         'confidence': 0.7,
                         'reason': 'volatility_reversal_moderate_overbought'
@@ -737,7 +737,7 @@ class StrategyVolatilityReversalScalping(StrategyTemplate):
                     self.logger.info(f"Volatility reversal moderate oversold entry - RSI: {rsi_value:.1f}")
                     
                     return {
-                        'action': 'long',
+                        'side': 'buy',
                         'price': current_price,
                         'confidence': 0.7,
                         'reason': 'volatility_reversal_moderate_oversold'

@@ -180,7 +180,7 @@ class StrategyRangeBreakoutMomentum(StrategyTemplate):
             # Bollinger Band width for squeeze detection
             self.data['bb_width'] = (self.data['bb_upper'] - self.data['bb_lower']) / self.data['bb_middle']
             
-            self.logger.info("All indicators initialized successfully")
+            self.logger.debug("All indicators initialized successfully")
             
         except Exception as e:
             self.logger.error(f"Error initializing indicators: {str(e)}")

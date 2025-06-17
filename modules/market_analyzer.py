@@ -177,11 +177,14 @@ class MarketAnalyzer:
         """
         try:
             # Create a temporary data fetcher for this symbol/timeframe
+            # Need enough data for longest period indicators (atr_240, bb_width_avg_200)
+            # Plus buffer for reliable calculation
+            window_size = 350 if timeframe == '5m' else 400  # More data for 1m due to higher noise
             data_fetcher = LiveDataFetcher(
                 exchange=self.exchange,
                 symbol=symbol,
                 timeframe=timeframe,
-                window_size=300,  # Get enough data for all indicators
+                window_size=window_size,
                 logger=self.logger
             )
             
@@ -241,7 +244,9 @@ class MarketAnalyzer:
             data['atr_48'] = data['tr'].rolling(window=48, min_periods=48).mean()
             data['atr_50'] = data['tr'].rolling(window=50, min_periods=50).mean()
             data['atr_60'] = data['tr'].rolling(window=60, min_periods=60).mean()
-            data['atr_240'] = data['tr'].rolling(window=240, min_periods=240).mean()
+            # Use adaptive min_periods for long-term ATR to handle insufficient data
+            atr_240_min_periods = min(240, len(data) // 2) if len(data) >= 120 else 60
+            data['atr_240'] = data['tr'].rolling(window=240, min_periods=atr_240_min_periods).mean()
             
             # ADX calculation
             data = self._calculate_adx(data, period=14)
@@ -340,9 +345,11 @@ class MarketAnalyzer:
             # Calculate Bollinger Band Width
             data['bb_width'] = (data['bb_upper'] - data['bb_lower']) / data['bb_middle']
             
-            # Calculate average BB width for comparison
-            data['bb_width_avg_100'] = data['bb_width'].rolling(window=100, min_periods=100).mean()
-            data['bb_width_avg_200'] = data['bb_width'].rolling(window=200, min_periods=200).mean()
+            # Calculate average BB width for comparison with adaptive min_periods
+            bb_100_min_periods = min(100, len(data) // 3) if len(data) >= 60 else 30
+            bb_200_min_periods = min(200, len(data) // 2) if len(data) >= 100 else 50
+            data['bb_width_avg_100'] = data['bb_width'].rolling(window=100, min_periods=bb_100_min_periods).mean()
+            data['bb_width_avg_200'] = data['bb_width'].rolling(window=200, min_periods=bb_200_min_periods).mean()
             
             return data
             

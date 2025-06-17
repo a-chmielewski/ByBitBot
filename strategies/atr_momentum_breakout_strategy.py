@@ -177,7 +177,7 @@ class StrategyATRMomentumBreakout(StrategyTemplate):
             # Volume analysis
             self.data['volume_sma'] = self.data['volume'].rolling(window=volume_avg_period).mean()
             
-            self.logger.info("All ATR momentum indicators initialized successfully")
+            self.logger.debug("All ATR momentum indicators initialized successfully")
             
         except Exception as e:
             self.logger.error(f"Error initializing indicators: {str(e)}")
@@ -499,10 +499,10 @@ class StrategyATRMomentumBreakout(StrategyTemplate):
                     self.logger.info(f"ATR momentum breakout long entry above {breakout_level:.4f}")
                     
                     return {
-                        'action': 'long',
+                        'side': 'buy',
                         'price': current_price,
-                        'confidence': 0.85,
-                        'reason': f'atr_momentum_breakout_above_{breakout_level:.4f}'
+                        'confidence': 0.8,
+                        'reason': 'atr_momentum_breakout_long'
                     }
                 
                 elif breakout_direction == 'short':
@@ -510,10 +510,10 @@ class StrategyATRMomentumBreakout(StrategyTemplate):
                     self.logger.info(f"ATR momentum breakout short entry below {breakout_level:.4f}")
                     
                     return {
-                        'action': 'short',
+                        'side': 'sell',
                         'price': current_price,
-                        'confidence': 0.85,
-                        'reason': f'atr_momentum_breakdown_below_{breakout_level:.4f}'
+                        'confidence': 0.8,
+                        'reason': 'atr_momentum_breakout_short'
                     }
             
             return None

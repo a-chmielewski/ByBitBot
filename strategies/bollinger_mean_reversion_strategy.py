@@ -180,7 +180,7 @@ class StrategyBollingerMeanReversion(StrategyTemplate):
             # Calculate BB width for regime detection
             self.data['bb_width'] = (self.data['bb_upper'] - self.data['bb_lower']) / self.data['bb_middle']
             
-            self.logger.info(f"'{self.__class__.__name__}': All indicators initialized successfully")
+            self.logger.debug(f"'{self.__class__.__name__}': All indicators initialized successfully")
             
         except Exception as e:
             self.logger.error(f"'{self.__class__.__name__}': Error initializing indicators: {str(e)}")

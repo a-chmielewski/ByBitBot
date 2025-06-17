@@ -346,22 +346,51 @@ def run_silent_market_analysis(exchange, config, symbol, timeframe, logger):
         logger: Logger instance
         
     Returns:
-        Market type string or None if analysis fails
+        Market analysis results dictionary with structure: {symbol: {timeframe: {analysis_data}}}
+        or None if analysis fails
     """
     try:
         logger.debug(f"Running silent market analysis for {symbol} {timeframe}")
         
-        # Initialize market analyzer (temporarily override logging to reduce output)
-        market_analyzer = MarketAnalyzer(exchange, config, logger)
+        # Create a MarketAnalyzer with minimal initialization to avoid expensive symbol fetching
+        # but still set up essential attributes needed for analysis
+        market_analyzer = MarketAnalyzer.__new__(MarketAnalyzer)
+        market_analyzer.exchange = exchange
+        market_analyzer.config = config
+        market_analyzer.logger = logger
         
-        # Analyze just the specific symbol/timeframe
+        # Set up essential attributes without expensive operations
+        market_config = config.get('market_analysis', {})
+        market_analyzer.timeframes = market_config.get('timeframes', ['1m', '5m'])
+        market_analyzer.use_dynamic_symbols = market_config.get('use_dynamic_symbols', False)
+        market_analyzer.top_volume_count = market_config.get('top_volume_count', 10)
+        market_analyzer.min_volume_usdt = market_config.get('min_volume_usdt', 1000000)
+        
+        # Skip the expensive symbol fetching/validation - we only need to analyze one symbol
+        market_analyzer.symbols = [symbol]  # Set just the symbol we need
+        
+        # Analyze just the specific symbol/timeframe directly
         try:
             result = market_analyzer._analyze_symbol_timeframe(symbol, timeframe)
             market_type = result.get('market_type', 'UNKNOWN')
-            logger.debug(f"Silent analysis result for {symbol} {timeframe}: {market_type}")
-            return market_type
+            
+            # Log more details if analysis fails or returns UNKNOWN
+            if market_type in ['UNKNOWN', 'INSUFFICIENT_DATA', 'ANALYSIS_FAILED']:
+                analysis_details = result.get('analysis_details', {})
+                data_points = result.get('data_points', 0)
+                logger.warning(f"Silent analysis for {symbol} {timeframe} returned {market_type}. "
+                             f"Data points: {data_points}, Details: {analysis_details}")
+            else:
+                logger.debug(f"Silent analysis result for {symbol} {timeframe}: {market_type}")
+            
+            # Return in the expected dictionary structure
+            return {
+                symbol: {
+                    timeframe: result
+                }
+            }
         except Exception as e:
-            logger.warning(f"Silent market analysis failed for {symbol} {timeframe}: {e}")
+            logger.warning(f"Silent market analysis failed for {symbol} {timeframe}: {e}", exc_info=True)
             return None
             
     except Exception as e:
@@ -1034,9 +1063,20 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                 if not has_active_orders:
                     bot_logger.info("No active orders detected. Proceeding with strategy evaluation...")
                     
-                    # Run silent market analysis to get current conditions
+                    # Run silent market analysis to get current conditions for both timeframes
                     try:
-                        current_analysis = run_silent_market_analysis(exchange, config, symbol, timeframe, bot_logger)
+                        # Strategy matrix needs both 1m and 5m analysis, so fetch both
+                        analysis_1m = run_silent_market_analysis(exchange, config, symbol, '1m', bot_logger)
+                        analysis_5m = run_silent_market_analysis(exchange, config, symbol, '5m', bot_logger)
+                        
+                        # Combine the results
+                        current_analysis = {}
+                        if analysis_1m and symbol in analysis_1m:
+                            current_analysis[symbol] = analysis_1m[symbol]
+                        if analysis_5m and symbol in analysis_5m:
+                            if symbol not in current_analysis:
+                                current_analysis[symbol] = {}
+                            current_analysis[symbol].update(analysis_5m[symbol])
                         
                         if current_analysis and symbol in current_analysis:
                             # Check if strategy/timeframe needs to change
