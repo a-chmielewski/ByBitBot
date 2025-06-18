@@ -556,7 +556,7 @@ class StrategyLowVolatilityTrendPullback(StrategyTemplate):
                 self.logger.info(f"Pullback entry signal detected - {entry_side} at {current_price}")
                 
                 return {
-                    'action': entry_side,
+                    'side': 'buy' if entry_side == 'long' else 'sell',
                     'price': current_price,
                     'confidence': 0.8,
                     'reason': f'pullback_scalp_{trend_direction}_trend'

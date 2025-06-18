@@ -1147,7 +1147,30 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                 if entry_signal:
                     bot_logger.info(f"Entry signal detected by {current_strategy_name}: {entry_signal}")
                     try:
-                        order_responses = order_manager.place_order_with_sl_tp(symbol, entry_signal)
+                        # Extract parameters from entry_signal for place_order_with_risk method
+                        side = entry_signal.get('side')
+                        order_type = entry_signal.get('type', 'market')  # Default to market if not specified
+                        size = entry_signal.get('size')
+                        signal_price = entry_signal.get('price')
+                        sl_pct = entry_signal.get('sl_pct')
+                        tp_pct = entry_signal.get('tp_pct')
+                        
+                        # Create params dict for additional parameters
+                        params = {}
+                        for key, value in entry_signal.items():
+                            if key not in ['side', 'type', 'size', 'price', 'sl_pct', 'tp_pct']:
+                                params[key] = value
+                        
+                        order_responses = order_manager.place_order_with_risk(
+                            symbol=symbol,
+                            side=side,
+                            order_type=order_type,
+                            size=size,
+                            signal_price=signal_price,
+                            sl_pct=sl_pct,
+                            tp_pct=tp_pct,
+                            params=params if params else None
+                        )
                         current_strategy.on_order_update(order_responses, symbol)
                         bot_logger.info(f"Orders placed successfully for {symbol}")
                     except OrderExecutionError as e:
@@ -1161,11 +1184,16 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                 if exit_signal:
                     bot_logger.info(f"Exit signal detected by {current_strategy_name}: {exit_signal}")
                     try:
-                        exit_order_responses = order_manager.place_exit_order(symbol, exit_signal)
-                        # Update strategy on successful exit
-                        if exit_order_responses:
-                            current_strategy.clear_position(symbol)
-                            bot_logger.info(f"Position closed for {symbol}")
+                        # Get the position details from the strategy
+                        position_to_close = current_strategy.position.get(symbol)
+                        if position_to_close:
+                            exit_order_responses = order_manager.execute_strategy_exit(symbol, position_to_close)
+                            # Update strategy on successful exit
+                            if exit_order_responses:
+                                current_strategy.clear_position(symbol)
+                                bot_logger.info(f"Position closed for {symbol}")
+                        else:
+                            bot_logger.error(f"Position data not found for {symbol} during exit")
                     except OrderExecutionError as e:
                         bot_logger.error(f"Exit order execution failed: {e}")
             

@@ -640,7 +640,7 @@ class StrategyVolatilityReversalScalping(StrategyTemplate):
                 self.logger.info(f"Volatility reversal immediate entry - Score: {score}, Direction: {spike_data['direction']}")
                 
                 return {
-                    'action': self.entry_side,
+                    'side': 'buy' if self.entry_side == 'long' else 'sell',
                     'price': current_price,
                     'confidence': 0.9,
                     'reason': f'volatility_reversal_immediate_{spike_data["direction"]}_spike'

@@ -650,7 +650,7 @@ class StrategyBreakoutAndRetest(StrategyTemplate):
                 
         else:
             # Step 2: Check for retest
-            if self._detect_retest(vals):
+            if not self.retest_confirmed and self._detect_retest(vals):
                 self.retest_confirmed = True
                 self.reversal_start_bar = current_bar
                 self.logger.info(f"{self.__class__.__name__}: Retest confirmed at level {self.retest_level}")

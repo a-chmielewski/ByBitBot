@@ -522,7 +522,7 @@ class StrategyRangeBreakoutMomentum(StrategyTemplate):
             self.logger.info(f"Range breakout entry confirmed - {direction} at {current_price}")
             
             return {
-                'action': direction,
+                'side': 'buy' if direction == 'long' else 'sell',
                 'price': current_price,
                 'confidence': 0.85,
                 'reason': f'range_breakout_{direction}_momentum'

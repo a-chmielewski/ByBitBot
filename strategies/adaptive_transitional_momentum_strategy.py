@@ -793,7 +793,7 @@ class StrategyAdaptiveTransitionalMomentum(StrategyTemplate):
                 self.logger.info(f"Adaptive transitional {direction} entry at {current_price:.4f}, momentum: {momentum:.3f}, regime: {self.current_volatility_regime}")
                 
                 return {
-                    'action': direction,
+                    'side': 'buy' if direction == 'long' else 'sell',
                     'price': current_price,
                     'confidence': 0.75,
                     'reason': f'adaptive_transitional_{direction}_momentum_{momentum:.2f}_regime_{self.current_volatility_regime}'
