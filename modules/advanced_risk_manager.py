@@ -212,6 +212,15 @@ class AdvancedRiskManager:
                 'risk_score': 0.0
             }
             
+            # Validate input parameters
+            if size is None or entry_price is None:
+                validation_result['approved'] = False
+                validation_result['violations'].append({
+                    'type': 'INVALID_PARAMETERS',
+                    'message': f'Invalid parameters: size={size}, entry_price={entry_price}'
+                })
+                return validation_result
+            
             # Check if emergency stop is active
             if self.emergency_stop_active:
                 validation_result['approved'] = False
@@ -232,7 +241,7 @@ class AdvancedRiskManager:
                 return validation_result
             
             account_balance = account_info.get('total_balance', 0)
-            position_value = size * entry_price
+            position_value = float(size) * float(entry_price)
             
             # 1. Position size validation
             position_size_pct = (position_value / account_balance) * 100

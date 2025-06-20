@@ -73,6 +73,7 @@ class RealTimeMetrics:
     trades_per_hour: float
     current_strategy: Optional[str] = None
     current_market_conditions: Optional[str] = None
+    current_symbol: Optional[str] = None
 
 class ConsoleFormatter:
     """Console formatting utilities with color support"""
@@ -128,8 +129,15 @@ class ConsoleFormatter:
     def move_cursor_up(lines: int):
         """Move cursor up N lines"""
         if os.name == 'nt':
-            # Windows
-            os.system(f'echo [A' * lines)
+            # Windows - use a different approach to avoid echo artifacts
+            try:
+                import subprocess
+                for _ in range(lines):
+                    subprocess.run(['powershell', '-Command', 'Write-Host "`e[1A" -NoNewline'], 
+                                 capture_output=True, check=False)
+            except:
+                # Fallback - just clear screen on Windows
+                ConsoleFormatter.clear_screen()
         else:
             # Unix/Linux/Mac
             sys.stdout.write(f'\033[{lines}A')
@@ -204,9 +212,11 @@ class RealTimeMonitor:
         # Dashboard configuration
         self.dashboard_enabled = True
         self.dashboard_update_interval = dashboard_update_interval
+        self.adaptive_update_interval = True  # Adjust update frequency based on activity
         self.last_dashboard_update = None
         self.dashboard_thread = None
         self.stop_dashboard = threading.Event()
+        self.last_trade_count = 0  # Track trade count changes
         
         # Performance tracking
         self.metrics_history: List[RealTimeMetrics] = []
@@ -502,31 +512,79 @@ class RealTimeMonitor:
             self.logger.error(f"Error saving alert to file: {e}")
     
     def _dashboard_loop(self):
-        """Main dashboard update loop"""
+        """Main dashboard update loop with adaptive timing"""
         while not self.stop_dashboard.is_set():
             try:
                 self.update_metrics()
-                if self.dashboard_enabled:
+                
+                # Determine update interval based on activity
+                current_interval = self._get_adaptive_update_interval()
+                
+                # Only update dashboard if there's meaningful activity or it's been a while
+                should_update = self._should_update_dashboard()
+                
+                if self.dashboard_enabled and should_update:
                     self._update_console_dashboard()
                 
                 # Wait for next update
-                self.stop_dashboard.wait(self.dashboard_update_interval)
+                self.stop_dashboard.wait(current_interval)
                 
             except Exception as e:
                 self.logger.error(f"Error in dashboard loop: {e}", exc_info=True)
                 self.stop_dashboard.wait(5.0)  # Wait 5 seconds on error
+
+    def _get_adaptive_update_interval(self) -> float:
+        """Get adaptive update interval based on trading activity"""
+        if not self.adaptive_update_interval:
+            return self.dashboard_update_interval
+        
+        # Base intervals
+        high_activity_interval = 1.0  # 1 second when trading
+        low_activity_interval = 10.0  # 10 seconds when idle
+        
+        # Check if there's recent trading activity
+        if self.current_metrics.total_trades > self.last_trade_count:
+            # New trades - high frequency updates
+            self.last_trade_count = self.current_metrics.total_trades
+            return high_activity_interval
+        elif self.current_metrics.total_trades == 0:
+            # No trades yet - very low frequency
+            return 30.0  # 30 seconds when no trades
+        else:
+            # No new trades - moderate frequency
+            return low_activity_interval
+
+    def _should_update_dashboard(self) -> bool:
+        """Determine if dashboard should be updated"""
+        # Always update if there are new trades
+        if self.current_metrics.total_trades > self.last_trade_count:
+            return True
+        
+        # Update if there are active alerts
+        if self.active_alerts:
+            return True
+        
+        # Update every 30 seconds even if no activity (to show time progression)
+        if not self.last_dashboard_update:
+            return True
+        
+        time_since_last_update = (datetime.now() - self.last_dashboard_update).total_seconds()
+        if time_since_last_update >= 30.0:
+            return True
+        
+        return False
     
     def _update_console_dashboard(self):
         """Update the live console dashboard"""
-        if not COLORS_AVAILABLE:
-            return  # Skip fancy dashboard if colors not available
-        
         try:
             # Build dashboard content
             dashboard_lines = self._build_dashboard_content()
             
-            # Clear previous dashboard if this isn't the first update
-            if self.last_dashboard_update:
+            # On Windows, just clear screen and redraw to avoid cursor issues
+            if os.name == 'nt' and self.last_dashboard_update:
+                ConsoleFormatter.clear_screen()
+            elif self.last_dashboard_update and COLORS_AVAILABLE:
+                # On Unix systems, try to move cursor up
                 ConsoleFormatter.move_cursor_up(len(dashboard_lines))
             
             # Print new dashboard
@@ -547,8 +605,10 @@ class RealTimeMonitor:
         lines.append(f"🚀 REAL-TIME TRADING PERFORMANCE MONITOR - {datetime.now().strftime('%H:%M:%S')}")
         lines.append("=" * 80)
         
-        # Session info
+        # Session info with symbol
         session_info = f"Session: {self.current_metrics.session_id[:16]}... | Duration: {self.current_metrics.session_duration_hours:.1f}h"
+        if self.current_metrics.current_symbol:
+            session_info += f" | Symbol: {self.current_metrics.current_symbol}"
         lines.append(session_info)
         lines.append("")
         
@@ -643,15 +703,19 @@ class RealTimeMonitor:
         """Update alert thresholds"""
         self.alert_thresholds.update(new_thresholds)
         self.logger.info(f"Alert thresholds updated: {new_thresholds}")
-    
+
     def set_current_strategy(self, strategy_name: str):
         """Set current strategy name for dashboard display"""
         self.current_metrics.current_strategy = strategy_name
-    
+
     def set_current_market_conditions(self, conditions: str):
         """Set current market conditions for dashboard display"""
         self.current_metrics.current_market_conditions = conditions
-    
+
+    def set_current_symbol(self, symbol: str):
+        """Set current trading symbol for dashboard display"""
+        self.current_metrics.current_symbol = symbol
+
     def disable_dashboard(self):
         """Disable the live dashboard"""
         self.dashboard_enabled = False

@@ -547,11 +547,19 @@ class StrategyMicroRangeScalping(StrategyTemplate):
                 
                 self.logger.info(f"Micro range scalping long entry at support {self.range_support:.4f}")
                 
+                # Get risk parameters for this entry
+                risk_params = self.get_risk_parameters()
+                
                 return {
                     'side': 'buy',
                     'price': current_price,
                     'confidence': 0.8,
-                    'reason': 'micro_range_support_bounce'
+                    'reason': 'micro_range_support_bounce',
+                    'sl_pct': risk_params.get('sl_pct', 0.0005),
+                    'tp_pct': risk_params.get('tp_pct', 0.0015),
+                    'max_position_pct': risk_params.get('max_position_pct', 1.4),
+                    'risk_reward_ratio': risk_params.get('risk_reward_ratio', 3.0),
+                    'size': None  # Will be calculated by bot's risk manager
                 }
             
             # Entry Condition 2: Short near micro-resistance
@@ -565,11 +573,19 @@ class StrategyMicroRangeScalping(StrategyTemplate):
                 
                 self.logger.info(f"Micro range scalping short entry at resistance {self.range_resistance:.4f}")
                 
+                # Get risk parameters for this entry
+                risk_params = self.get_risk_parameters()
+                
                 return {
                     'side': 'sell',
                     'price': current_price,
                     'confidence': 0.8,
-                    'reason': 'micro_range_resistance_rejection'
+                    'reason': 'micro_range_resistance_rejection',
+                    'sl_pct': risk_params.get('sl_pct', 0.0005),
+                    'tp_pct': risk_params.get('tp_pct', 0.0015),
+                    'max_position_pct': risk_params.get('max_position_pct', 1.4),
+                    'risk_reward_ratio': risk_params.get('risk_reward_ratio', 3.0),
+                    'size': None  # Will be calculated by bot's risk manager
                 }
             
             return None

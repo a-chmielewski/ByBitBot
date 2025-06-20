@@ -960,6 +960,22 @@ class SessionManager:
         """Get all active sessions"""
         return self.active_sessions.copy()
 
+    def end_active_sessions(self, reason: str = "Manual session end") -> List[SessionSummary]:
+        """End all active sessions and return their summaries"""
+        summaries = []
+        active_session_ids = list(self.active_sessions.keys())
+        
+        for session_id in active_session_ids:
+            try:
+                summary = self.end_session(session_id)
+                summary.metadata.notes = reason
+                summaries.append(summary)
+                self.logger.info(f"Ended session {session_id}: {reason}")
+            except Exception as e:
+                self.logger.error(f"Failed to end session {session_id}: {e}")
+                
+        return summaries
+
     def get_session_history(self) -> Dict[str, SessionSummary]:
         """Get complete session history"""
         return self.session_history.copy()

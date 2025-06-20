@@ -413,107 +413,163 @@ class OrderManager:
                 if sl_pct is not None and stop_loss_price_calculated is not None and stop_loss_price_calculated > 0:
                     stop_side = 'Sell' if side.lower() == 'buy' else 'Buy'
                     trigger_direction_sl = 2 if side.lower() == 'buy' else 1
-                    sl_params = {
-                        'category': category,
-                        'symbol': symbol,
-                        'side': stop_side,
-                        'orderType': 'Market',
-                        'qty': str(filled_qty),
-                        'reduceOnly': True,
-                        'triggerPrice': str(stop_loss_price_calculated),
-                        'triggerBy': 'LastPrice',
-                        'triggerDirection': trigger_direction_sl,
-                        'positionIdx': 0,
-                        'closeOnTrigger': True
-                    }
-                    if order_link_id: sl_params['orderLinkId'] = order_link_id + "-sl"
                     
-                    self.logger.info(f"Placing stop-loss order (trigger).")
-                    self.logger.debug(f"Placing stop-loss order (trigger): {sl_params}")
-                    
-                    # Retry SL order placement up to 3 times
-                    for attempt in range(3):
-                        try:
-                            stop_loss_response = self._retry_with_backoff(self.exchange.place_order, **sl_params)
-                            self._raise_on_retcode(stop_loss_response, "Stop-loss order placement")
-                            self.log_order_status(stop_loss_response, "Stop-loss order")
-                            order_responses['stop_loss_order'] = stop_loss_response
-                            sl_order_id = stop_loss_response.get('result', {}).get('orderId')
-                            if sl_order_id:
-                                self.active_orders[sl_order_id] = {
-                                    'type': 'sl',
-                                    'main_order_id': main_order_id,
-                                    'symbol': symbol,
-                                    'side': stop_side,
-                                    'size': filled_qty,
-                                    'trigger_price': stop_loss_price_calculated
-                                }
-                            break
-                        except Exception as e:
-                            if attempt == 2:  # Last attempt
-                                self.logger.error(f"Failed to place stop-loss order after 3 attempts: {e}")
-                                raise
-                            self.logger.warning(f"Attempt {attempt + 1} to place stop-loss order failed: {e}")
-                            time.sleep(1)  # Wait before retry
+                    # CRITICAL FIX: Validate stop-loss trigger direction before placing order
+                    current_price = self.exchange.get_current_price(symbol)
+                    if current_price:
+                        # Check if stop-loss configuration is valid
+                        sl_valid = True
+                        if side.lower() == 'buy':
+                            # Long position: stop-loss should be below current price, trigger when falling
+                            if stop_loss_price_calculated >= current_price:
+                                self.logger.warning(f"Invalid stop-loss for long position: SL price {stop_loss_price_calculated} >= current {current_price}")
+                                sl_valid = False
+                        else:  # sell/short position
+                            # Short position: stop-loss should be above current price, trigger when rising
+                            if stop_loss_price_calculated <= current_price:
+                                self.logger.warning(f"Invalid stop-loss for short position: SL price {stop_loss_price_calculated} <= current {current_price}")
+                                # Try to adjust stop-loss to a valid level
+                                adjusted_sl = current_price * (1 + 0.001)  # 0.1% above current price
+                                self.logger.warning(f"Adjusting stop-loss from {stop_loss_price_calculated} to {adjusted_sl}")
+                                stop_loss_price_calculated = round(adjusted_sl, price_precision)
+                                
+                                # Re-validate after adjustment
+                                if stop_loss_price_calculated <= current_price:
+                                    self.logger.error(f"Cannot place valid stop-loss for short position. Price moved too far.")
+                                    sl_valid = False
+                        
+                        if not sl_valid:
+                            self.logger.error(f"Skipping stop-loss order placement due to invalid configuration")
+                            # Don't place stop-loss but continue with take-profit
+                        else:
+                            sl_params = {
+                                'category': category,
+                                'symbol': symbol,
+                                'side': stop_side,
+                                'orderType': 'Market',
+                                'qty': str(filled_qty),
+                                'reduceOnly': True,
+                                'triggerPrice': str(stop_loss_price_calculated),
+                                'triggerBy': 'LastPrice',
+                                'triggerDirection': trigger_direction_sl,
+                                'positionIdx': 0,
+                                'closeOnTrigger': True
+                            }
+                            if order_link_id: sl_params['orderLinkId'] = order_link_id + "-sl"
+                            
+                            self.logger.info(f"Placing stop-loss order (trigger). Price: {stop_loss_price_calculated}, Current: {current_price}, Direction: {trigger_direction_sl}")
+                            self.logger.debug(f"Placing stop-loss order (trigger): {sl_params}")
+                            
+                            # Retry SL order placement up to 3 times
+                            for attempt in range(3):
+                                try:
+                                    stop_loss_response = self._retry_with_backoff(self.exchange.place_order, **sl_params)
+                                    self._raise_on_retcode(stop_loss_response, "Stop-loss order placement")
+                                    self.log_order_status(stop_loss_response, "Stop-loss order")
+                                    order_responses['stop_loss_order'] = stop_loss_response
+                                    sl_order_id = stop_loss_response.get('result', {}).get('orderId')
+                                    if sl_order_id:
+                                        self.active_orders[sl_order_id] = {
+                                            'type': 'sl',
+                                            'main_order_id': main_order_id,
+                                            'symbol': symbol,
+                                            'side': stop_side,
+                                            'size': filled_qty,
+                                            'trigger_price': stop_loss_price_calculated
+                                        }
+                                    break
+                                except Exception as e:
+                                    if attempt == 2:  # Last attempt
+                                        self.logger.error(f"Failed to place stop-loss order after 3 attempts: {e}")
+                                        # Don't raise here - continue without stop-loss rather than failing entire trade
+                                        self.logger.warning(f"Continuing without stop-loss order due to placement failure")
+                                        break
+                                    self.logger.warning(f"Attempt {attempt + 1} to place stop-loss order failed: {e}")
+                                    time.sleep(1)  # Wait before retry
+                    else:
+                        self.logger.warning(f"Could not get current price for stop-loss validation. Skipping stop-loss placement.")
 
                 # Place take-profit order with retries
                 if tp_pct is not None and take_profit_price_calculated is not None and take_profit_price_calculated > 0:
                     tp_side = 'Sell' if side.lower() == 'buy' else 'Buy'
                     trigger_direction_tp = 1 if side.lower() == 'buy' else 2
-                    tp_params = {
-                        'category': category,
-                        'symbol': symbol,
-                        'side': tp_side,
-                        'orderType': 'Market',
-                        'qty': str(filled_qty),
-                        'reduceOnly': True,
-                        'triggerPrice': str(take_profit_price_calculated),
-                        'triggerBy': 'LastPrice',
-                        'triggerDirection': trigger_direction_tp,
-                        'positionIdx': 0,
-                        'closeOnTrigger': True
-                    }
-                    if order_link_id: tp_params['orderLinkId'] = order_link_id + "-tp"
-
-                    self.logger.info(f"Placing take-profit order (trigger).")
-                    self.logger.debug(f"Placing take-profit order (trigger): {tp_params}")
                     
-                    # Retry TP order placement up to 3 times
-                    for attempt in range(3):
-                        try:
-                            take_profit_response = self._retry_with_backoff(self.exchange.place_order, **tp_params)
-                            self._raise_on_retcode(take_profit_response, "Take-profit order placement")
-                            self.log_order_status(take_profit_response, "Take-profit order")
-                            order_responses['take_profit_order'] = take_profit_response
-                            tp_order_id = take_profit_response.get('result', {}).get('orderId')
-                            if tp_order_id:
-                                self.active_orders[tp_order_id] = {
-                                    'type': 'tp',
-                                    'main_order_id': main_order_id,
-                                    'symbol': symbol,
-                                    'side': tp_side,
-                                    'size': filled_qty,
-                                    'trigger_price': take_profit_price_calculated
-                                }
-                            break
-                        except Exception as e:
-                            if attempt == 2:  # Last attempt
-                                self.logger.error(f"Failed to place take-profit order after 3 attempts: {e}")
-                                raise
-                            self.logger.warning(f"Attempt {attempt + 1} to place take-profit order failed: {e}")
-                            time.sleep(1)  # Wait before retry
+                    # VALIDATION: Validate take-profit trigger direction
+                    if current_price:  # Use current_price from stop-loss validation above
+                        tp_valid = True
+                        if side.lower() == 'buy':
+                            # Long position: take-profit should be above current price, trigger when rising
+                            if take_profit_price_calculated <= current_price:
+                                self.logger.warning(f"Invalid take-profit for long position: TP price {take_profit_price_calculated} <= current {current_price}")
+                                tp_valid = False
+                        else:  # sell/short position
+                            # Short position: take-profit should be below current price, trigger when falling
+                            if take_profit_price_calculated >= current_price:
+                                self.logger.warning(f"Invalid take-profit for short position: TP price {take_profit_price_calculated} >= current {current_price}")
+                                tp_valid = False
+                        
+                        if not tp_valid:
+                            self.logger.error(f"Skipping take-profit order placement due to invalid configuration")
+                        else:
+                            tp_params = {
+                                'category': category,
+                                'symbol': symbol,
+                                'side': tp_side,
+                                'orderType': 'Market',
+                                'qty': str(filled_qty),
+                                'reduceOnly': True,
+                                'triggerPrice': str(take_profit_price_calculated),
+                                'triggerBy': 'LastPrice',
+                                'triggerDirection': trigger_direction_tp,
+                                'positionIdx': 0,
+                                'closeOnTrigger': True
+                            }
+                            if order_link_id: tp_params['orderLinkId'] = order_link_id + "-tp"
+
+                            self.logger.info(f"Placing take-profit order (trigger). Price: {take_profit_price_calculated}, Current: {current_price}, Direction: {trigger_direction_tp}")
+                            self.logger.debug(f"Placing take-profit order (trigger): {tp_params}")
+                            
+                            # Retry TP order placement up to 3 times
+                            for attempt in range(3):
+                                try:
+                                    take_profit_response = self._retry_with_backoff(self.exchange.place_order, **tp_params)
+                                    self._raise_on_retcode(take_profit_response, "Take-profit order placement")
+                                    self.log_order_status(take_profit_response, "Take-profit order")
+                                    order_responses['take_profit_order'] = take_profit_response
+                                    tp_order_id = take_profit_response.get('result', {}).get('orderId')
+                                    if tp_order_id:
+                                        self.active_orders[tp_order_id] = {
+                                            'type': 'tp',
+                                            'main_order_id': main_order_id,
+                                            'symbol': symbol,
+                                            'side': tp_side,
+                                            'size': filled_qty,
+                                            'trigger_price': take_profit_price_calculated
+                                        }
+                                    break
+                                except Exception as e:
+                                    if attempt == 2:  # Last attempt
+                                        self.logger.error(f"Failed to place take-profit order after 3 attempts: {e}")
+                                        # Don't raise here - continue without take-profit rather than failing entire trade
+                                        self.logger.warning(f"Continuing without take-profit order due to placement failure")
+                                        break
+                                    self.logger.warning(f"Attempt {attempt + 1} to place take-profit order failed: {e}")
+                                    time.sleep(1)  # Wait before retry
+                    else:
+                        self.logger.warning(f"Could not get current price for take-profit validation. Skipping take-profit placement.")
 
                 # Verify SL/TP orders are properly placed
-                if (sl_pct is not None and 'stop_loss_order' not in order_responses) or \
-                   (tp_pct is not None and 'take_profit_order' not in order_responses):
-                    self.logger.error("Failed to place one or more protective orders. Cancelling main position.")
-                    try:
-                        # Cancel the main position if protective orders failed
-                        self.exchange.cancel_order(symbol=symbol, order_id=main_order_id)
-                        raise OrderExecutionError("Failed to place protective orders. Main position cancelled.")
-                    except Exception as e:
-                        self.logger.error(f"Failed to cancel main position after protective order failure: {e}")
-                        raise OrderExecutionError("Failed to place protective orders and cancel main position.")
+                # NOTE: We now allow trades to continue without SL/TP if market conditions prevent placement
+                missing_orders = []
+                if sl_pct is not None and 'stop_loss_order' not in order_responses:
+                    missing_orders.append("stop-loss")
+                if tp_pct is not None and 'take_profit_order' not in order_responses:
+                    missing_orders.append("take-profit")
+                
+                if missing_orders:
+                    self.logger.warning(f"Some protective orders could not be placed: {', '.join(missing_orders)}. Trade will continue without them.")
+                    # Note: We no longer cancel the main position here as this may be due to market conditions
+                    # The trade will continue but without the missing protective orders
 
             return order_responses
 

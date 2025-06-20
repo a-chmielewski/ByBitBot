@@ -203,6 +203,32 @@ class ExchangeConnector:
             except Exception as e: # General fallback, including handling self-raised ExchangeError from status_code check
                 err_msg_lower = str(e).lower()
                 
+                # Handle specific non-retryable errors for cancel_order
+                if func.__name__ == 'cancel_order':
+                    # Check for specific ByBit error codes that shouldn't be retried
+                    non_retryable_cancel_errors = [
+                        "110001",  # order not exists or too late to cancel
+                        "110003",  # order does not exist
+                        "110004",  # order status does not allow cancellation
+                        "110005",  # order has been cancelled
+                        "110006",  # order has been filled
+                        "110007",  # order has been partially filled
+                    ]
+                    
+                    # Check if this is a non-retryable cancel error
+                    if any(error_code in str(e) for error_code in non_retryable_cancel_errors):
+                        # Extract the specific error code for logging
+                        found_error_code = next((code for code in non_retryable_cancel_errors if code in str(e)), "unknown")
+                        self.logger.info(f"Cancel order completed - order was already processed (Error {found_error_code}): {str(e)}")
+                        # Return a success-like response for these expected failures
+                        return {
+                            "retCode": 0,
+                            "retMsg": f"Order already processed - Error {found_error_code}",
+                            "result": {"status": "already_processed", "error_code": found_error_code},
+                            "retExtInfo": {},
+                            "time": int(time.time() * 1000)
+                        }
+                
                 # Handle timestamp errors
                 if "timestamp" in err_msg_lower and retries < self.max_retries:
                     self.logger.warning(f"Timestamp error detected for '{func.__name__}'. Resyncing time with server...")
@@ -571,56 +597,81 @@ class ExchangeConnector:
 
     def get_top_volume_symbols(self, category: str = 'linear', count: int = 10, min_volume_usdt: float = 1000000) -> List[str]:
         """
-        Get the top N symbols by 24h volume in USDT.
+        Get top symbols by 24h volume from ByBit.
         
         Args:
             category: The category of instruments ('linear' for USDT perpetuals)
             count: Number of top symbols to return
-            min_volume_usdt: Minimum 24h volume in USDT to consider
+            min_volume_usdt: Minimum 24h volume in USDT to include
             
         Returns:
-            List of symbol names sorted by volume (highest first)
+            List of symbol names sorted by 24h volume (highest first)
         """
         try:
-            ticker_data = self.fetch_all_tickers(category)
-            
-            if 'result' not in ticker_data or 'list' not in ticker_data['result']:
-                self.logger.error(f"Unexpected ticker data structure: {ticker_data}")
-                return []
-                
-            tickers = ticker_data['result']['list']
+            # Fetch all tickers
+            tickers_response = self.fetch_all_tickers(category)
+            tickers_list = tickers_response.get('result', {}).get('list', [])
             
             # Filter and sort by volume
-            volume_data = []
-            for ticker in tickers:
+            valid_symbols = []
+            for ticker in tickers_list:
                 symbol = ticker.get('symbol', '')
-                volume24h = ticker.get('volume24h', '0')
-                turnover24h = ticker.get('turnover24h', '0')  # This is volume in USDT
+                volume_24h = float(ticker.get('turnover24h', 0))
                 
-                try:
-                    # Use turnover24h as it's the volume in USDT
-                    volume_usdt = float(turnover24h)
-                    
-                    # Filter out symbols that don't meet minimum volume requirements
-                    if volume_usdt >= min_volume_usdt and symbol.endswith('USDT'):
-                        volume_data.append((symbol, volume_usdt))
-                        
-                except (ValueError, TypeError):
-                    continue
+                # Filter by minimum volume and ensure it's USDT pair
+                if volume_24h >= min_volume_usdt and symbol.endswith('USDT'):
+                    valid_symbols.append((symbol, volume_24h))
             
-            # Sort by volume (highest first) and take top N
-            volume_data.sort(key=lambda x: x[1], reverse=True)
-            top_symbols = [symbol for symbol, volume in volume_data[:count]]
+            # Sort by volume (descending) and return top symbols
+            valid_symbols.sort(key=lambda x: x[1], reverse=True)
+            top_symbols = [symbol for symbol, volume in valid_symbols[:count]]
             
-            self.logger.info(f"Top {count} symbols by 24h volume: {top_symbols}")
-            if volume_data:
-                self.logger.debug(f"Volume data sample: {volume_data[:5]}")  # Log first 5 for debugging
-                
+            self.logger.info(f"Found {len(valid_symbols)} symbols with volume >= ${min_volume_usdt:,.0f}")
+            self.logger.debug(f"Top {count} symbols by volume: {top_symbols}")
+            
             return top_symbols
             
         except Exception as e:
             self.logger.error(f"Error getting top volume symbols: {e}")
-            return []
+            raise ExchangeError(f"Failed to get top volume symbols: {str(e)}") from e
+
+    def get_current_price(self, symbol: str) -> Optional[float]:
+        """
+        Get the current market price for a symbol.
+        
+        Args:
+            symbol: Trading pair (e.g., 'BTCUSDT')
+            
+        Returns:
+            Current price as float, or None if unable to fetch
+        """
+        try:
+            norm_symbol = symbol.replace("/", "").upper()
+            
+            # Use get_tickers to get current price
+            response = self._api_call_with_backoff(
+                self.client.get_tickers,
+                category='linear',
+                symbol=norm_symbol
+            )
+            
+            checked_response = self._check_response(response, f"get_current_price({norm_symbol})")
+            tickers_list = checked_response.get('result', {}).get('list', [])
+            
+            if tickers_list:
+                ticker = tickers_list[0]
+                last_price = ticker.get('lastPrice')
+                if last_price:
+                    price = float(last_price)
+                    self.logger.debug(f"Current price for {norm_symbol}: {price}")
+                    return price
+                    
+            self.logger.warning(f"No price data found for {norm_symbol}")
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching current price for {symbol}: {e}")
+            return None
 
     def set_leverage(self, symbol: str, leverage: int, category: str = 'linear') -> Dict[str, Any]:
         """

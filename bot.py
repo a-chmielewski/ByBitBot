@@ -9,6 +9,9 @@ from modules.order_manager import OrderManager, OrderExecutionError
 from modules.performance_tracker import PerformanceTracker
 from modules.market_analyzer import MarketAnalyzer, MarketAnalysisError
 from modules.strategy_matrix import StrategyMatrix
+from modules.session_manager import SessionManager
+from modules.real_time_monitor import RealTimeMonitor
+from modules.advanced_risk_manager import AdvancedRiskManager
 from datetime import datetime, timezone
 import time
 import warnings
@@ -16,6 +19,8 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 import re
+import atexit
+from typing import Dict, Any, Optional, List
 
 # Import StrategyTemplate for type checking in dynamic_import_strategy
 from strategies.strategy_template import StrategyTemplate
@@ -24,6 +29,28 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 
 CONFIG_PATH = 'config.json'
 STRATEGY_DIR = 'strategies'
+
+# Global variables for cleanup
+session_manager = None
+real_time_monitor = None
+
+
+def cleanup_on_exit():
+    """Cleanup function to ensure proper shutdown of all components"""
+    global session_manager, real_time_monitor
+    
+    try:
+        if real_time_monitor:
+            real_time_monitor.stop_monitoring()
+            
+        if session_manager:
+            session_manager.end_active_sessions("Bot shutdown")
+            
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
+
+# Register cleanup function
+atexit.register(cleanup_on_exit)
 
 
 def convert_strategy_class_to_module_name(strategy_class_name: str) -> str:
@@ -992,7 +1019,148 @@ def check_strategy_needs_change(analysis_results: dict, selected_symbol: str, cu
         logger_instance.info(reason)
         return False, current_strategy_class, current_timeframe, reason
 
-def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_class, symbol, timeframe, leverage, category, data_fetcher, order_manager, perf_tracker, exchange, config, analysis_results, bot_logger):
+def sync_strategy_position_with_exchange(strategy, symbol, exchange, category, logger):
+    """
+    Enhanced position synchronization between strategy and exchange.
+    Handles mismatches more intelligently by attempting reconciliation.
+    
+    Args:
+        strategy: Strategy instance with position tracking
+        symbol: Trading symbol
+        exchange: Exchange connector
+        category: Trading category
+        logger: Logger instance
+    
+    Returns:
+        Dict with sync results and actions taken
+    """
+    sync_result = {
+        'status': 'success',
+        'action': 'none',
+        'exchange_size': 0,
+        'strategy_size': 0,
+        'mismatch_detected': False,
+        'reconciled': False,
+        'error': None
+    }
+    
+    try:
+        # Get actual position from exchange
+        positions_response = exchange.fetch_positions(symbol, category)
+        positions_list = positions_response.get('result', {}).get('list', [])
+        
+        # Find position for this symbol
+        actual_position = None
+        for pos in positions_list:
+            if pos.get('symbol') == symbol.replace('/', '').upper():
+                actual_position = pos
+                break
+        
+        actual_size = float(actual_position.get('size', 0)) if actual_position else 0
+        actual_side = actual_position.get('side', '').lower() if actual_position else None
+        actual_entry_price = float(actual_position.get('avgPrice', 0)) if actual_position else 0
+        unrealized_pnl = float(actual_position.get('unrealisedPnl', 0)) if actual_position else 0
+        
+        # Get strategy position
+        strategy_position = strategy.position.get(symbol)
+        strategy_size = float(strategy_position.get('size', 0)) if strategy_position else 0
+        strategy_side = strategy_position.get('side', '').lower() if strategy_position else None
+        
+        sync_result['exchange_size'] = actual_size
+        sync_result['strategy_size'] = strategy_size
+        
+        # Check for mismatches
+        size_tolerance = 0.0001  # Allow small differences due to rounding (reduced for better detection)
+        
+        if abs(actual_size - strategy_size) > size_tolerance:
+            sync_result['mismatch_detected'] = True
+            
+            if actual_size == 0 and strategy_size != 0:
+                # Case 1: Exchange position closed, strategy still thinks it's open
+                sync_result['action'] = 'clear_strategy_position'
+                logger.warning(f"Position sync: {symbol} closed on exchange (likely SL/TP), clearing strategy position (size: {strategy_size})")
+                
+                # Record the trade closure in performance tracker if we have the position details
+                if strategy_position and hasattr(strategy, 'logger'):
+                    try:
+                        # Estimate PnL based on last known position data
+                        entry_price = strategy_position.get('entry_price', 0)
+                        if entry_price > 0:
+                            # This is an approximation since we don't know exact exit price
+                            estimated_exit_price = entry_price  # Conservative estimate
+                            logger.info(f"Recording estimated trade closure for position sync: {symbol}")
+                    except Exception as e:
+                        logger.debug(f"Could not estimate trade closure details: {e}")
+                
+                strategy.clear_position(symbol)
+                sync_result['reconciled'] = True
+                
+            elif actual_size != 0 and strategy_size == 0:
+                # Case 2: Exchange has position, strategy doesn't know about it
+                sync_result['action'] = 'adopt_exchange_position'
+                logger.warning(f"Position sync: Found untracked position on exchange for {symbol} (size: {actual_size}, side: {actual_side})")
+                
+                # Adopt the exchange position
+                if not hasattr(strategy, 'position'):
+                    strategy.position = {}
+                if not hasattr(strategy, 'order_pending'):
+                    strategy.order_pending = {}
+                if not hasattr(strategy, 'active_order_id'):
+                    strategy.active_order_id = {}
+                    
+                strategy.position[symbol] = {
+                    'main_order_id': f'adopted_{int(time.time())}',
+                    'symbol': symbol,
+                    'side': actual_side,
+                    'size': actual_size,
+                    'entry_price': actual_entry_price,
+                    'status': 'open',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'adopted': True,  # Mark as adopted
+                    'unrealized_pnl': unrealized_pnl
+                }
+                strategy.order_pending[symbol] = False
+                strategy.active_order_id[symbol] = strategy.position[symbol]['main_order_id']
+                
+                logger.info(f"Adopted exchange position: {symbol} {actual_side} {actual_size} @ {actual_entry_price}")
+                sync_result['reconciled'] = True
+                
+            elif actual_size != 0 and strategy_size != 0:
+                # Case 3: Both have positions but sizes differ (partial fills, etc.)
+                size_diff = abs(actual_size - strategy_size)
+                size_diff_pct = (size_diff / max(actual_size, strategy_size)) * 100
+                
+                if size_diff_pct > 5:  # More than 5% difference is significant
+                    sync_result['action'] = 'update_strategy_size'
+                    logger.warning(f"Position sync: Size mismatch for {symbol} - Exchange: {actual_size}, Strategy: {strategy_size} ({size_diff_pct:.1f}% diff)")
+                    
+                    # Update strategy with exchange size
+                    if strategy_position:
+                        strategy.position[symbol]['size'] = actual_size
+                        strategy.position[symbol]['entry_price'] = actual_entry_price  # Update if exchange has better data
+                        logger.info(f"Updated strategy position size: {symbol} -> {actual_size}")
+                        sync_result['reconciled'] = True
+                else:
+                    # Small difference, just log it
+                    logger.debug(f"Position sync: Minor size difference for {symbol} - Exchange: {actual_size}, Strategy: {strategy_size}")
+                    sync_result['action'] = 'minor_difference_ignored'
+        else:
+            # Positions are in sync
+            if actual_size > 0:
+                logger.debug(f"Position sync: {symbol} positions are synchronized (size: {actual_size})")
+            else:
+                logger.debug(f"Position sync: {symbol} no positions on either side")
+            sync_result['action'] = 'already_synced'
+        
+        return sync_result
+        
+    except Exception as e:
+        sync_result['status'] = 'error'
+        sync_result['error'] = str(e)
+        logger.error(f"Error during position sync for {symbol}: {e}")
+        return sync_result
+
+def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_class, symbol, timeframe, leverage, category, data_fetcher, order_manager, perf_tracker, exchange, config, analysis_results, bot_logger, session_manager, risk_manager, real_time_monitor):
     """
     Main trading loop with automatic strategy switching based on market conditions.
     
@@ -1141,9 +1309,48 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                                     
                                     bot_logger.info(f"Successfully switched from {current_strategy_name} to {new_strategy_class} on {new_timeframe}")
                                     
+                                    # Update session for strategy change
+                                    try:
+                                        # End current session
+                                        session_manager.end_active_sessions(f"Strategy change: {current_strategy_name} -> {new_strategy_class}")
+                                        
+                                        # Create new session with updated context
+                                        market_context = {}
+                                        if current_analysis and symbol in current_analysis:
+                                            for tf, data in current_analysis[symbol].items():
+                                                market_context[f"{tf}_market_type"] = data.get('market_type', 'UNKNOWN')
+                                                market_context[f"{tf}_volatility"] = data.get('volatility', 'UNKNOWN')
+                                        
+                                        new_session_id = session_manager.create_session(
+                                            strategy_name=new_strategy_class,
+                                            symbol=symbol,
+                                            timeframe=new_timeframe,
+                                            leverage=leverage,
+                                            market_conditions=market_context,
+                                            configuration={
+                                                'category': category,
+                                                'strategy_params': get_strategy_parameters(new_strategy_class),
+                                                'selection_reason': reason
+                                            }
+                                        )
+                                        bot_logger.info(f"New session created: {new_session_id}")
+                                        
+                                    except Exception as session_error:
+                                        bot_logger.error(f"Failed to update session for strategy change: {session_error}")
+                                    
                                     # Update current strategy references
                                     current_strategy = new_strategy_instance
                                     current_strategy_name = new_strategy_class
+                                    
+                                    # Update real-time monitor with new strategy info
+                                    if 'real_time_monitor' in locals():
+                                        real_time_monitor.set_current_strategy(new_strategy_class)
+                                        # Symbol remains the same, but update market context if needed
+                                        if current_analysis and symbol in current_analysis:
+                                            updated_market_summary = " | ".join([f"{tf}:{data.get('market_type', 'UNKNOWN')}" 
+                                                                                for tf, data in current_analysis[symbol].items() 
+                                                                                if data.get('market_type') != 'UNKNOWN'])
+                                            real_time_monitor.set_current_market_conditions(updated_market_summary)
                                     
                                     # Log strategy change
                                     current_strategy.log_state_change(symbol, "awaiting_entry", 
@@ -1170,6 +1377,78 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                 entry_signal = current_strategy.check_entry(symbol)
                 if entry_signal:
                     bot_logger.info(f"Entry signal detected by {current_strategy_name}: {entry_signal}")
+                    
+                    # Validate entry signal has required fields
+                    required_fields = ['side', 'sl_pct', 'tp_pct']
+                    missing_fields = [field for field in required_fields if entry_signal.get(field) is None]
+                    
+                    if missing_fields:
+                        bot_logger.error(f"Entry signal missing required fields {missing_fields}: {entry_signal}")
+                        continue  # Skip this signal
+                    
+                    # Handle missing or None size - calculate default size if needed
+                    signal_size = entry_signal.get('size')
+                    if signal_size is None:
+                        # Calculate a default position size using risk manager
+                        try:
+                            position_sizing = risk_manager.calculate_position_size(
+                                symbol=symbol,
+                                strategy_name=current_strategy_name,
+                                market_context={},
+                                risk_pct=1.0  # Default 1% risk
+                            )
+                            signal_size = position_sizing.get('recommended_size', 0.01)  # Fallback to 0.01
+                            bot_logger.info(f"Strategy provided size=None, calculated default size: {signal_size}")
+                            entry_signal['size'] = signal_size
+                        except Exception as size_calc_error:
+                            bot_logger.error(f"Failed to calculate default position size: {size_calc_error}")
+                            bot_logger.info("Using fallback size of 0.01")
+                            signal_size = 0.01
+                            entry_signal['size'] = signal_size
+                    
+                    # Advanced risk management pre-trade checks
+                    try:
+                        # Calculate stop loss and take profit prices for risk validation
+                        entry_price = entry_signal.get('price') or current_strategy.data.iloc[-1]['close']
+                        sl_pct = entry_signal.get('sl_pct', 2.0)
+                        tp_pct = entry_signal.get('tp_pct', 3.0)
+                        side = entry_signal.get('side')
+                        
+                        # Calculate stop loss and take profit prices
+                        if side == 'buy':
+                            stop_loss_price = entry_price * (1 - sl_pct / 100)
+                            take_profit_price = entry_price * (1 + tp_pct / 100)
+                        else:  # sell
+                            stop_loss_price = entry_price * (1 + sl_pct / 100)
+                            take_profit_price = entry_price * (1 - tp_pct / 100)
+                        
+                        # Pre-trade risk validation
+                        risk_assessment = risk_manager.validate_trade_risk(
+                            symbol=symbol,
+                            side=side,
+                            size=signal_size,  # Use validated size
+                            entry_price=entry_price,
+                            stop_loss_price=stop_loss_price,
+                            take_profit_price=take_profit_price,
+                            leverage=leverage
+                        )
+                        
+                        if risk_assessment.get('approved', True):
+                            # Risk approved - adjust size if needed
+                            adjusted_size = risk_assessment.get('adjusted_size', entry_signal.get('size'))
+                            if adjusted_size != entry_signal.get('size'):
+                                bot_logger.info(f"Risk manager adjusted position size from {entry_signal.get('size')} to {adjusted_size}")
+                                entry_signal['size'] = adjusted_size
+                        else:
+                            # Risk rejected
+                            risk_reason = risk_assessment.get('reason', 'Unknown risk violation')
+                            bot_logger.warning(f"Trade rejected by risk manager: {risk_reason}")
+                            continue  # Skip this trade
+                        
+                    except Exception as e:
+                        bot_logger.error(f"Risk assessment failed: {e}")
+                        continue  # Skip trade on risk assessment failure
+                    
                     try:
                         # Extract parameters from entry_signal for place_order_with_risk method
                         side = entry_signal.get('side')
@@ -1204,31 +1483,28 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
             
             # Check for exit if position exists
             if hasattr(current_strategy, 'position') and current_strategy.position.get(symbol):
-                # POSITION SYNC FIX: Verify position actually exists on exchange before attempting exit
+                # ENHANCED POSITION SYNC: Use the new intelligent sync function
                 try:
-                    positions_response = exchange.fetch_positions(symbol, category)
-                    positions_list = positions_response.get('result', {}).get('list', [])
+                    sync_result = sync_strategy_position_with_exchange(
+                        current_strategy, symbol, exchange, category, bot_logger
+                    )
                     
-                    # Find position for this symbol
-                    actual_position = None
-                    for pos in positions_list:
-                        if pos.get('symbol') == symbol.replace('/', '').upper():
-                            actual_position = pos
-                            break
+                    # Log sync results for analysis
+                    if sync_result['mismatch_detected']:
+                        bot_logger.info(f"Position sync completed for {symbol}: {sync_result['action']}")
+                        
+                        # If position was cleared or significantly changed, skip exit check
+                        if sync_result['action'] in ['clear_strategy_position']:
+                            continue  # Skip exit check since position is now cleared
+                        elif sync_result['action'] == 'adopt_exchange_position':
+                            bot_logger.info(f"Adopted exchange position for {symbol}, will monitor for exits")
                     
-                    actual_size = float(actual_position.get('size', 0)) if actual_position else 0
-                    strategy_position = current_strategy.position.get(symbol)
-                    strategy_size = float(strategy_position.get('size', 0)) if strategy_position else 0
-                    
-                    if actual_size == 0 and strategy_size != 0:
-                        # Position was already closed (likely by SL/TP) but strategy wasn't notified
-                        bot_logger.warning(f"Position sync mismatch detected for {symbol}: Strategy thinks it has position {strategy_size}, but exchange shows 0. Clearing strategy position.")
-                        current_strategy.clear_position(symbol)
-                        continue  # Skip exit check since position is already closed
-                    elif actual_size != 0:
-                        bot_logger.debug(f"Position sync confirmed for {symbol}: Strategy size {strategy_size}, Exchange size {actual_size}")
+                    # Continue with exit check only if we still have a position
+                    if not current_strategy.position.get(symbol):
+                        continue  # Position was cleared during sync
+                        
                 except Exception as e:
-                    bot_logger.warning(f"Failed to verify position for {symbol}: {e}. Proceeding with exit check.")
+                    bot_logger.warning(f"Position sync failed for {symbol}: {e}. Proceeding with exit check.")
                 
                 exit_signal = current_strategy.check_exit(symbol)
                 if exit_signal:
@@ -1258,6 +1534,8 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
             time.sleep(1)  # Pause before retrying
 
 def main():
+    global session_manager, real_time_monitor
+    
     config = load_config()
     # Initialize the main bot logger
     bot_logger = get_logger('bot') # Renamed to bot_logger for clarity
@@ -1266,6 +1544,38 @@ def main():
     # Exchange
     ex_cfg = config['bybit']
     exchange = ExchangeConnector(api_key=ex_cfg['api_key'], api_secret=ex_cfg['api_secret'], testnet=False, logger=bot_logger)
+    
+    # Initialize core management modules
+    bot_logger.info("="*60)
+    bot_logger.info("INITIALIZING CORE MODULES")
+    bot_logger.info("="*60)
+    
+    # Initialize PerformanceTracker first (required by other modules)
+    perf_tracker = PerformanceTracker(logger=bot_logger)
+    bot_logger.info("✅ PerformanceTracker initialized")
+    
+    # Initialize SessionManager
+    session_manager = SessionManager(
+        base_dir="sessions",
+        logger=bot_logger
+    )
+    bot_logger.info("✅ SessionManager initialized")
+    
+    # Initialize AdvancedRiskManager
+    risk_manager = AdvancedRiskManager(
+        exchange=exchange,
+        performance_tracker=perf_tracker,
+        logger=bot_logger
+    )
+    bot_logger.info("✅ AdvancedRiskManager initialized")
+    
+    # Initialize RealTimeMonitor (but don't start yet - will start after user selections)
+    real_time_monitor = RealTimeMonitor(
+        performance_tracker=perf_tracker,
+        session_manager=session_manager,
+        logger=bot_logger
+    )
+    bot_logger.info("✅ RealTimeMonitor initialized (will start after setup)")
     
     # RUN MARKET ANALYSIS FIRST - before strategy selection
     bot_logger.info("="*60)
@@ -1363,10 +1673,10 @@ def main():
     data_fetcher.start_websocket()
     bot_logger.info(f"Fetched initial OHLCV data: {len(data)} rows for {symbol} {timeframe}")
     
-    # Order manager
+    # Order manager (enhanced with risk management)
     order_manager = OrderManager(exchange, logger=bot_logger)
-    # Performance tracker
-    perf_tracker = PerformanceTracker(logger=bot_logger)
+    # Inject risk manager into order manager
+    order_manager.risk_manager = risk_manager
 
     # Initialize the selected strategy instance
     try:
@@ -1381,6 +1691,52 @@ def main():
         bot_logger.info('Bot session closed due to strategy initialization failure.')
         return
 
+    # Create trading session
+    bot_logger.info("="*60)
+    bot_logger.info("CREATING TRADING SESSION")
+    bot_logger.info("="*60)
+    
+    # Prepare market context for session
+    market_context = {}
+    if analysis_results and symbol in analysis_results:
+        for tf, data in analysis_results[symbol].items():
+            market_context[f"{tf}_market_type"] = data.get('market_type', 'UNKNOWN')
+            market_context[f"{tf}_volatility"] = data.get('volatility', 'UNKNOWN')
+    
+    # Create session
+    session_id = session_manager.create_session(
+        strategy_name=selected_strategy_class,
+        symbol=symbol,
+        timeframe=timeframe,
+        leverage=leverage,
+        market_conditions=market_context,
+        configuration={
+            'category': category,
+            'strategy_params': strategy_params,
+            'selection_reason': selection_reason if 'selection_reason' in locals() else 'Automatic selection'
+        }
+    )
+    
+    bot_logger.info(f"✅ Trading session created: {session_id}")
+    bot_logger.info(f"Strategy: {selected_strategy_class}")
+    bot_logger.info(f"Symbol: {symbol} | Timeframe: {timeframe} | Leverage: {leverage}x")
+    bot_logger.info(f"Market Context: {market_context}")
+
+    # NOW start real-time monitoring (after all setup is complete)
+    bot_logger.info("="*60)
+    bot_logger.info("STARTING REAL-TIME MONITORING")
+    bot_logger.info("="*60)
+    
+    # Set strategy, symbol, and market context for dashboard
+    real_time_monitor.set_current_strategy(selected_strategy_class)
+    real_time_monitor.set_current_symbol(symbol)
+    market_summary = " | ".join([f"{tf}:{ctx}" for tf, ctx in market_context.items() if ctx != 'UNKNOWN'])
+    real_time_monitor.set_current_market_conditions(market_summary)
+    
+    real_time_monitor.start_monitoring()
+    bot_logger.info("✅ RealTimeMonitor started - Live dashboard active")
+    bot_logger.info("📊 Dashboard will show updates every 30 seconds (faster during active trading)")
+
     # Initial state logging
     strategy_instance.log_state_change(symbol, "awaiting_entry", f"Strategy {type(strategy_instance).__name__} for {symbol}: Initialized. Looking for new entry conditions...")
 
@@ -1389,7 +1745,8 @@ def main():
         # Start trading loop with automatic strategy management
         run_trading_loop_with_auto_strategy(
             strategy_instance, selected_strategy_class, symbol, timeframe, leverage, category,
-            data_fetcher, order_manager, perf_tracker, exchange, config, analysis_results, bot_logger
+            data_fetcher, order_manager, perf_tracker, exchange, config, analysis_results, bot_logger,
+            session_manager, risk_manager, real_time_monitor
         )
     except KeyboardInterrupt:
         bot_logger.info('Bot shutting down (KeyboardInterrupt).')
@@ -1398,10 +1755,27 @@ def main():
         PerformanceTracker.persist_on_exception(perf_tracker)
         raise 
     finally:
-        if 'data_fetcher' in locals() and data_fetcher is not None:
-            data_fetcher.stop_websocket()
-        if 'perf_tracker' in locals() and perf_tracker is not None:
-            perf_tracker.close_session()
+        # Cleanup all modules
+        try:
+            if 'real_time_monitor' in locals() and real_time_monitor is not None:
+                real_time_monitor.stop_monitoring()
+                bot_logger.info("✅ RealTimeMonitor stopped")
+                
+            if 'session_manager' in locals() and session_manager is not None:
+                session_manager.end_active_sessions("Bot shutdown")
+                bot_logger.info("✅ Active sessions ended")
+                
+            if 'data_fetcher' in locals() and data_fetcher is not None:
+                data_fetcher.stop_websocket()
+                bot_logger.info("✅ WebSocket data feed stopped")
+                
+            if 'perf_tracker' in locals() and perf_tracker is not None:
+                perf_tracker.close_session()
+                bot_logger.info("✅ Performance tracker session closed")
+                
+        except Exception as cleanup_error:
+            bot_logger.error(f"Error during cleanup: {cleanup_error}")
+            
         bot_logger.info('Bot session closed.')
 
 if __name__ == '__main__':
