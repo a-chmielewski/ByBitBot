@@ -1,10 +1,11 @@
 import logging
 import os
-from logging.handlers import RotatingFileHandler
+from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 import json
 import colorama
 from colorama import Fore, Style
 import re
+import platform
 
 # Initialize colorama for Windows
 colorama.init()
@@ -93,7 +94,23 @@ def get_logger(name: str = 'bot') -> logging.Logger:
         
         # File handler with no colors
         file_formatter = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
-        fh = RotatingFileHandler(LOG_PATH, maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT, encoding='utf-8')
+        
+        # Use different rotation strategy based on platform
+        if platform.system() == 'Windows':
+            # Use time-based rotation on Windows to avoid file handle issues
+            fh = TimedRotatingFileHandler(
+                LOG_PATH, 
+                when='midnight', 
+                interval=1, 
+                backupCount=BACKUP_COUNT, 
+                encoding='utf-8'
+            )
+            # Set suffix after initialization
+            fh.suffix = '%Y-%m-%d'
+        else:
+            # Use size-based rotation on Unix systems
+            fh = RotatingFileHandler(LOG_PATH, maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT, encoding='utf-8')
+        
         fh.setLevel(LOG_LEVEL)
         fh.setFormatter(file_formatter)
         logger.addHandler(fh)

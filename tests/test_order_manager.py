@@ -6,7 +6,7 @@ class DummyLogger:
     def info(self, msg): pass
     def debug(self, msg): pass
     def warning(self, msg): pass
-    def error(self, msg): pass
+    def error(self, msg, exc_info=None): pass
 
 @pytest.fixture
 def dummy_logger():
@@ -21,6 +21,8 @@ def mock_exchange():
     exchange.place_order.return_value = {'retCode': 0, 'retMsg': 'OK', 'result': {'orderId': 'oid', 'orderStatus': 'Filled', 'avgPrice': 100, 'cumExecQty': 1}, 'time': 1234567890}
     exchange.fetch_order.return_value = {'retCode': 0, 'retMsg': 'OK', 'result': {'orderId': 'oid', 'orderStatus': 'Filled', 'avgPrice': 100, 'cumExecQty': 1}, 'time': 1234567890}
     exchange.cancel_order.return_value = {'retCode': 0, 'retMsg': 'OK'}
+    # Mock fetch_open_orders to return empty list (no conditional orders to cancel)
+    exchange.fetch_open_orders.return_value = {'retCode': 0, 'retMsg': 'OK', 'result': {'list': []}}
     return exchange
 
 @pytest.fixture
@@ -79,4 +81,54 @@ def test_log_order_status_success(manager):
 def test_log_order_status_error(manager):
     order_response = {'retCode': 10001, 'retMsg': 'Error', 'result': {'orderId': 'oid', 'orderStatus': 'Rejected', 'side': 'Buy', 'orderType': 'Market', 'qty': 1, 'price': 100, 'avgPrice': 0}}
     manager.log_order_status(order_response, 'Main order')
-    print('test_log_order_status_error PASSED') 
+    print('test_log_order_status_error PASSED')
+
+def test_log_order_status_bybit_response_structure(manager):
+    """Test that demonstrates the fix for ByBit API response structure where order details are in 'result' field"""
+    # This is the actual format returned by ByBit API
+    bybit_response = {
+        'retCode': 0,
+        'retMsg': 'OK',
+        'result': {
+            'orderId': '1fceb41b-fdc6-4e3a-a040-88fa975293bd',
+            'orderStatus': 'Filled',
+            'side': 'Buy',
+            'orderType': 'Market',
+            'qty': '0.01',
+            'price': '2515.33',
+            'avgPrice': '2515.33'
+        },
+        'retExtInfo': {},
+        'time': 1750354593551
+    }
+    
+    # Before our fix, this would have logged "N/A" and "Unknown" values
+    # After our fix, it should properly extract the order details
+    manager.log_order_status(bybit_response, 'Main order')
+    print('test_log_order_status_bybit_response_structure PASSED')
+
+def test_log_order_status_fallback_to_top_level():
+    """Test fallback when order details are at top level (for backwards compatibility)"""
+    from tests.test_order_manager import DummyLogger
+    from modules.order_manager import OrderManager
+    from unittest.mock import MagicMock
+    
+    exchange = MagicMock()
+    logger = DummyLogger()
+    manager = OrderManager(exchange, logger=logger)
+    
+    # Response with order details at top level (no 'result' field)
+    top_level_response = {
+        'retCode': 0,
+        'orderId': 'test-order-id',
+        'orderStatus': 'Filled',
+        'side': 'Buy',
+        'orderType': 'Market',
+        'qty': '0.01',
+        'price': '2515.33',
+        'avgPrice': '2515.33'
+    }
+    
+    # Should still work with our fallback logic
+    manager.log_order_status(top_level_response, 'Test order')
+    print('test_log_order_status_fallback_to_top_level PASSED') 

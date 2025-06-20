@@ -555,15 +555,21 @@ class OrderManager:
         raise OrderExecutionError(f"All retries failed for {getattr(func, '__name__', str(func))}: {last_exception}") from last_exception
 
     def log_order_status(self, order_response: Dict[str, Any], order_type_context: str):
-        order_id = order_response.get('orderId')
-        status = order_response.get('orderStatus')
-        side = order_response.get('side')
-        actual_order_type = order_response.get('orderType')
-        qty = order_response.get('qty')
-        price = order_response.get('price') 
-        avg_price = order_response.get('avgPrice')
-        ret_code = order_response.get('retCode', -1) # Default to -1 if not present
-        error_msg = order_response.get('retMsg')
+        # ByBit API returns order details in 'result' field, extract them first
+        order_data = order_response.get('result', {})
+        if not order_data:
+            # Fallback: try to use the response directly if 'result' is empty
+            order_data = order_response
+        
+        order_id = order_data.get('orderId')
+        status = order_data.get('orderStatus')
+        side = order_data.get('side')
+        actual_order_type = order_data.get('orderType')
+        qty = order_data.get('qty')
+        price = order_data.get('price') 
+        avg_price = order_data.get('avgPrice')
+        ret_code = order_response.get('retCode', -1) # retCode is at the top level
+        error_msg = order_response.get('retMsg') # retMsg is at the top level
 
         # Provide defaults for logging if values are None
         log_order_id = order_id if order_id is not None else "N/A"

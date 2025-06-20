@@ -755,6 +755,30 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
 
             current_position_details = strat_instance.position.get(symbol)
             if current_position_details and float(current_position_details.get('size', 0)) != 0:
+                # POSITION SYNC FIX: Verify position actually exists on exchange before attempting exit
+                try:
+                    positions_response = exchange.fetch_positions(symbol, category)
+                    positions_list = positions_response.get('result', {}).get('list', [])
+                    
+                    # Find position for this symbol
+                    actual_position = None
+                    for pos in positions_list:
+                        if pos.get('symbol') == symbol.replace('/', '').upper():
+                            actual_position = pos
+                            break
+                    
+                    actual_size = float(actual_position.get('size', 0)) if actual_position else 0
+                    
+                    if actual_size == 0:
+                        # Position was already closed (likely by SL/TP) but strategy wasn't notified
+                        bot_logger.warning(f"Position sync mismatch detected for {symbol}: Strategy thinks it has position {current_position_details.get('size', 0)}, but exchange shows 0. Clearing strategy position.")
+                        strat_instance.clear_position(symbol)
+                        continue  # Skip to next strategy since position is already closed
+                    else:
+                        bot_logger.debug(f"Position sync confirmed for {symbol}: Strategy size {current_position_details.get('size', 0)}, Exchange size {actual_size}")
+                except Exception as e:
+                    bot_logger.warning(f"Failed to verify position for {symbol}: {e}. Proceeding with exit attempt.")
+                
                 exit_signal = strat.check_exit(symbol=symbol)
                 if exit_signal:
                     bot_logger.info(f"Exit signal received from {type(strat).__name__} for {symbol}: {exit_signal}")
@@ -1180,6 +1204,32 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
             
             # Check for exit if position exists
             if hasattr(current_strategy, 'position') and current_strategy.position.get(symbol):
+                # POSITION SYNC FIX: Verify position actually exists on exchange before attempting exit
+                try:
+                    positions_response = exchange.fetch_positions(symbol, category)
+                    positions_list = positions_response.get('result', {}).get('list', [])
+                    
+                    # Find position for this symbol
+                    actual_position = None
+                    for pos in positions_list:
+                        if pos.get('symbol') == symbol.replace('/', '').upper():
+                            actual_position = pos
+                            break
+                    
+                    actual_size = float(actual_position.get('size', 0)) if actual_position else 0
+                    strategy_position = current_strategy.position.get(symbol)
+                    strategy_size = float(strategy_position.get('size', 0)) if strategy_position else 0
+                    
+                    if actual_size == 0 and strategy_size != 0:
+                        # Position was already closed (likely by SL/TP) but strategy wasn't notified
+                        bot_logger.warning(f"Position sync mismatch detected for {symbol}: Strategy thinks it has position {strategy_size}, but exchange shows 0. Clearing strategy position.")
+                        current_strategy.clear_position(symbol)
+                        continue  # Skip exit check since position is already closed
+                    elif actual_size != 0:
+                        bot_logger.debug(f"Position sync confirmed for {symbol}: Strategy size {strategy_size}, Exchange size {actual_size}")
+                except Exception as e:
+                    bot_logger.warning(f"Failed to verify position for {symbol}: {e}. Proceeding with exit check.")
+                
                 exit_signal = current_strategy.check_exit(symbol)
                 if exit_signal:
                     bot_logger.info(f"Exit signal detected by {current_strategy_name}: {exit_signal}")
@@ -1187,7 +1237,7 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                         # Get the position details from the strategy
                         position_to_close = current_strategy.position.get(symbol)
                         if position_to_close:
-                            exit_order_responses = order_manager.execute_strategy_exit(symbol, position_to_close)
+                            exit_order_responses = order_manager.execute_strategy_exit(symbol, position_to_close, category=category)
                             # Update strategy on successful exit
                             if exit_order_responses:
                                 current_strategy.clear_position(symbol)
