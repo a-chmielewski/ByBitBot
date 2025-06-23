@@ -2,6 +2,7 @@ import logging
 from typing import Any, Dict, Optional, List, Tuple
 import time
 import math
+import threading
 
 class OrderExecutionError(Exception):
     """Custom exception for order execution errors."""
@@ -38,85 +39,157 @@ class OrderManager:
 
     def _cancel_existing_conditional_orders(self, symbol: str, category: str = 'linear') -> None:
         """
-        Cancels all existing open conditional (stop-loss/take-profit) orders for a given symbol.
+        Enhanced method to cancel all existing conditional orders for a given symbol.
+        Uses multiple approaches to ensure comprehensive cleanup.
         """
-        self.logger.info(f"Attempting to cancel all existing conditional orders for {symbol} in category {category}.")
+        self.logger.info(f"🧹 ENHANCED: Attempting to cancel ALL conditional orders for {symbol} in category {category}.")
+        orders_cancelled = 0
+        
         try:
-            # Fetch all open stop orders (includes SL/TP for Bybit)
-            # Bybit API uses 'stopOrderType' to filter, or just fetches all conditional if not specified.
-            # We want to cancel both StopLoss and TakeProfit, which are conditional.
-            # The get_open_orders can filter by status 'Untriggered' for conditional orders.
+            # METHOD 1: Fetch open orders (standard approach)
             open_orders_response = self._retry_with_backoff(
                 self.exchange.fetch_open_orders,
                 symbol=symbol,
-                params={'category': category} # Pass category in params
+                params={'category': category}
             )
-            self._raise_on_retcode(open_orders_response, f"Fetching open orders for {symbol} to cancel existing conditional orders")
+            
+            # Handle different response formats
+            orders_list = []
+            
+            # Bybit V5 format: {'retCode': 0, 'result': {'list': [...]}}
+            if isinstance(open_orders_response, dict) and 'result' in open_orders_response:
+                if 'list' in open_orders_response['result']:
+                    orders_list = open_orders_response['result']['list']
+            # CCXT format: direct list
+            elif isinstance(open_orders_response, list):
+                orders_list = open_orders_response
+            # Raw response format
+            elif isinstance(open_orders_response, dict) and 'list' in open_orders_response:
+                orders_list = open_orders_response['list']
+            
+            self.logger.debug(f"Fetched {len(orders_list)} total open orders for {symbol}")
             
             orders_to_cancel = []
-            if open_orders_response and 'result' in open_orders_response and 'list' in open_orders_response['result']:
-                for order in open_orders_response['result']['list']:
-                    # Identify conditional orders: typically 'Stop' or 'Trigger' types, often Untriggered.
-                    # Bybit uses orderType 'Market' or 'Limit' with a stopOrderType like 'Stop', 'TakeProfit', 'StopLoss'.
-                    # Or, it might directly be a trigger order.
-                    # We are interested in orders that are conditional (SL/TP) and not yet triggered.
-                    order_status = order.get('orderStatus', '').lower()
-                    
-                    is_conditional = order.get('stopOrderType') is not None or \
-                                     order.get('triggerPrice') is not None or \
-                                     order.get('orderType', '').lower() in ['stop', 'trigger', 'stopmarket', 'stoplimit'] # Common older terms
-                    
-                    # More robust check for Bybit V5 conditional orders:
-                    # They are identified by having triggerPrice, stopLoss, takeProfit, or tpslMode set.
-                    # For simple SL/TP orders not attached to a position but placed as separate conditional orders:
-                    is_v5_stop_order = order.get('stopOrderType') in ['Stop', 'TakeProfit', 'StopLoss', 'PartialTakeProfit', 'PartialStopLoss', 'TrailingStop'] and \
-                                       order_status in ['untriggered', 'new'] # Untriggered or active but not yet processed.
-
-                    if is_v5_stop_order:
-                        orders_to_cancel.append(order)
-                        self.logger.debug(f"Identified conditional order to cancel: ID {order.get('orderId')}, Type: {order.get('stopOrderType')}, Status: {order_status}")
-
+            for order in orders_list:
+                # ENHANCED conditional order detection
+                order_id = order.get('orderId') or order.get('id')
+                order_status = order.get('orderStatus', '').lower()
+                stop_order_type = order.get('stopOrderType', '')
+                trigger_price = order.get('triggerPrice')
+                order_type = order.get('orderType', '').lower()
+                
+                # Comprehensive conditional order identification
+                is_conditional = (
+                    # Has stopOrderType (Bybit V5 conditional orders)
+                    stop_order_type in ['Stop', 'TakeProfit', 'StopLoss', 'PartialTakeProfit', 'PartialStopLoss', 'TrailingStop'] or
+                    # Has trigger price (trigger orders)
+                    trigger_price is not None or
+                    # Order type indicates conditional
+                    order_type in ['stop', 'trigger', 'stopmarket', 'stoplimit', 'conditional'] or
+                    # Status indicates conditional
+                    order_status in ['untriggered', 'triggered', 'active'] or
+                    # Any other conditional indicators
+                    order.get('triggerDirection') is not None or
+                    order.get('tpTriggerBy') is not None or
+                    order.get('slTriggerBy') is not None
+                )
+                
+                if is_conditional:
+                    orders_to_cancel.append(order)
+                    self.logger.debug(f"🎯 Found conditional order: ID={order_id}, Type={stop_order_type or order_type}, Status={order_status}")
+            
+            # METHOD 2: If no conditional orders found via standard method, try alternative approach
             if not orders_to_cancel:
-                self.logger.info(f"No existing conditional orders found to cancel for {symbol}.")
-                return
-
-            self.logger.info(f"Found {len(orders_to_cancel)} conditional orders to cancel for {symbol}.")
-            for order_to_cancel in orders_to_cancel:
-                order_id_to_cancel = order_to_cancel.get('orderId')
-                order_link_id_to_cancel = order_to_cancel.get('orderLinkId')
-                self.logger.info(f"Cancelling conditional order ID: {order_id_to_cancel} (LinkID: {order_link_id_to_cancel}) for {symbol}")
+                self.logger.info(f"No conditional orders found via standard fetch. Trying alternative detection...")
                 try:
-                    cancel_params = {'symbol': symbol, 'category': category}
-                    if order_id_to_cancel:
-                        # Corrected parameter name from 'id' to 'orderId' for cancel_order based on pybit unified_trading
-                        # The exchange.cancel_order wrapper expects 'order_id' as its direct named argument.
-                        # Additional parameters like 'category' go into its 'params' dict.
-                        final_cancel_call_params = {'symbol': symbol, 'order_id': order_id_to_cancel}
-                        if category: # Pass category if specified, via the params argument of cancel_order
-                            final_cancel_call_params['params'] = {'category': category}
-
-                    elif order_link_id_to_cancel:
-                        final_cancel_call_params = {'symbol': symbol, 'order_link_id': order_link_id_to_cancel}
-                        if category:
-                            final_cancel_call_params['params'] = {'category': category}
-                    else:
-                        self.logger.warning(f"Conditional order for {symbol} has neither orderId nor orderLinkId, cannot cancel: {order_to_cancel}")
-                        continue
-
-                    cancel_response = self._retry_with_backoff(
-                        self.exchange.cancel_order,
-                        **final_cancel_call_params
+                    # Try to fetch specifically conditional orders if exchange supports it
+                    conditional_orders_response = self._retry_with_backoff(
+                        self.exchange.fetch_open_orders,
+                        symbol=symbol,
+                        params={'category': category, 'orderFilter': 'StopOrder'}  # Bybit specific
                     )
-                    # Check retCode for successful cancellation
-                    if cancel_response.get('retCode') == 0:
-                        self.logger.info(f"Successfully cancelled conditional order ID: {order_id_to_cancel or order_link_id_to_cancel} for {symbol}.")
-                    else:
-                        # Log specific error from Bybit if cancellation failed
-                        self.logger.error(f"Failed to cancel conditional order ID: {order_id_to_cancel or order_link_id_to_cancel} for {symbol}. Response: {cancel_response}")
+                    
+                    if isinstance(conditional_orders_response, dict) and 'result' in conditional_orders_response:
+                        alt_orders = conditional_orders_response['result'].get('list', [])
+                        orders_to_cancel.extend(alt_orders)
+                        self.logger.info(f"Found {len(alt_orders)} additional conditional orders via alternative method")
+                        
                 except Exception as e:
-                    self.logger.error(f"Exception while cancelling conditional order ID: {order_id_to_cancel or order_link_id_to_cancel} for {symbol}: {e}", exc_info=True)
+                    self.logger.debug(f"Alternative conditional order fetch failed (this is normal): {e}")
+            
+            # Cancel all identified orders
+            if not orders_to_cancel:
+                self.logger.info(f"✅ No conditional orders found to cancel for {symbol}.")
+                return
+            
+            self.logger.warning(f"🚨 Found {len(orders_to_cancel)} conditional orders to cancel for {symbol}!")
+            
+            for order_to_cancel in orders_to_cancel:
+                order_id = order_to_cancel.get('orderId') or order_to_cancel.get('id')
+                order_link_id = order_to_cancel.get('orderLinkId')
+                stop_type = order_to_cancel.get('stopOrderType', 'conditional')
+                
+                self.logger.info(f"🗑️ Cancelling {stop_type} order ID: {order_id} (LinkID: {order_link_id}) for {symbol}")
+                
+                try:
+                    # Try cancellation with different parameter combinations
+                    cancel_attempts = []
+                    
+                    if order_id:
+                        cancel_attempts.append({
+                            'method': 'order_id',
+                            'params': {'symbol': symbol, 'order_id': order_id, 'params': {'category': category}}
+                        })
+                    
+                    if order_link_id:
+                        cancel_attempts.append({
+                            'method': 'order_link_id', 
+                            'params': {'symbol': symbol, 'order_link_id': order_link_id, 'params': {'category': category}}
+                        })
+                    
+                    cancelled = False
+                    for attempt in cancel_attempts:
+                        if cancelled:
+                            break
+                            
+                        try:
+                            self.logger.debug(f"Trying cancellation via {attempt['method']}")
+                            cancel_response = self._retry_with_backoff(
+                                self.exchange.cancel_order,
+                                **attempt['params']
+                            )
+                            
+                            # Check for success
+                            ret_code = cancel_response.get('retCode', 0)
+                            if ret_code == 0 or ret_code == '0':
+                                self.logger.info(f"✅ Successfully cancelled conditional order {order_id} via {attempt['method']}")
+                                cancelled = True
+                                orders_cancelled += 1
+                            else:
+                                self.logger.warning(f"❌ Cancel attempt via {attempt['method']} failed: retCode={ret_code}, {cancel_response.get('retMsg', '')}")
+                                
+                        except Exception as attempt_error:
+                            error_msg = str(attempt_error).lower()
+                            # Check for "already cancelled" type errors
+                            if any(phrase in error_msg for phrase in ['order_not_exists', 'order has been filled or canceled', 
+                                                                     'order does not exist', 'already been filled or cancelled',
+                                                                     'too late to cancel', '110001', '30034', '10001']):
+                                self.logger.info(f"✅ Order {order_id} already cancelled/filled: {attempt_error}")
+                                cancelled = True
+                                break
+                            else:
+                                self.logger.debug(f"Cancel attempt via {attempt['method']} failed: {attempt_error}")
+                    
+                    if not cancelled:
+                        self.logger.error(f"❌ Failed to cancel conditional order {order_id} after all attempts")
+                        
+                except Exception as e:
+                    self.logger.error(f"❌ Error cancelling conditional order {order_id}: {e}", exc_info=True)
+            
+            self.logger.info(f"🎯 Conditional order cleanup completed for {symbol}: {orders_cancelled}/{len(orders_to_cancel)} orders cancelled")
+            
         except Exception as e:
-            self.logger.error(f"Error in _cancel_existing_conditional_orders for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"❌ Error in enhanced conditional order cleanup for {symbol}: {e}", exc_info=True)
 
     def _cancel_unfilled_main_and_return(self, symbol, order_id, order_responses):
         """
@@ -932,15 +1005,69 @@ class OrderManager:
             # This is important to prevent cancelling SL/TP if the exit market order itself fails or is rejected.
             if exit_order_id:
                 self.logger.info(f"Strategy exit market order {exit_order_id} placed. Waiting for fill confirmation...")
-                # Simplified fill check; a more robust one would poll get_order_status
-                time.sleep(self.POSITION_UPDATE_DELAY_SECONDS) # Wait for propagation
-                # Ideally, confirm fill status of exit_order_id before proceeding
-
+                
+                # ENHANCED: Wait longer and verify the order is actually filled
+                fill_confirmed = False
+                max_wait_time = 10  # seconds
+                wait_time = 0
+                
+                while wait_time < max_wait_time and not fill_confirmed:
+                    time.sleep(1)
+                    wait_time += 1
+                    
+                    try:
+                        # Check if the exit order is filled
+                        order_status_response = self._retry_with_backoff(
+                            self.exchange.get_order_status,
+                            symbol=symbol,
+                            order_id=exit_order_id,
+                            params={'category': category}
+                        )
+                        
+                        if order_status_response.get('retCode') == 0:
+                            order_status = order_status_response.get('result', {}).get('orderStatus', '').lower()
+                            if order_status == 'filled':
+                                fill_confirmed = True
+                                self.logger.info(f"✅ Exit order {exit_order_id} confirmed filled after {wait_time}s")
+                            elif order_status in ['cancelled', 'rejected']:
+                                self.logger.error(f"❌ Exit order {exit_order_id} was {order_status}!")
+                                break
+                            else:
+                                self.logger.debug(f"Exit order {exit_order_id} status: {order_status} (waiting...)")
+                        else:
+                            self.logger.debug(f"Could not check exit order status: {order_status_response}")
+                            
+                    except Exception as e:
+                        self.logger.debug(f"Error checking exit order status: {e}")
+                        
+                if not fill_confirmed:
+                    self.logger.warning(f"⚠️ Could not confirm exit order {exit_order_id} fill status within {max_wait_time}s. Proceeding with conditional order cleanup anyway.")
+                
+                # Additional delay after fill confirmation to ensure exchange propagation
+                self.logger.info(f"💤 Waiting additional 3 seconds for exchange position update propagation...")
+                time.sleep(3)
+            
+            # ENHANCED CONDITIONAL ORDER CLEANUP SEQUENCE
+            self.logger.info(f"🧹 Starting comprehensive conditional order cleanup for {symbol}...")
+            
+            # STEP 1: Try targeted cancellation if we have main_order_id
             if main_order_id_of_position:
-                self.logger.info(f"Position for {symbol} (related to main order {main_order_id_of_position}) assumed closed by strategy exit. Cancelling associated SL/TP orders.")
+                self.logger.info(f"Step 1: Cancelling SL/TP orders linked to main order {main_order_id_of_position}")
                 self._cancel_all_sl_tp_for_main_order(symbol, main_order_id_of_position, category=category)
-            else:
-                self.logger.info(f"Position for {symbol} closed by strategy exit. No main_order_id was available, so targeted SL/TP cancellation skipped. Any active SL/TP for this symbol might need manual review or broader cleanup if not specific to this exited position.")
+            
+            # STEP 2: Always run comprehensive cleanup (catches any orders missed by targeted approach)
+            self.logger.info(f"Step 2: Running comprehensive conditional order cleanup for {symbol}")
+            self._cancel_existing_conditional_orders(symbol, category=category)
+            
+            # STEP 3: Wait a bit more for cleanup to propagate, then run orphaned order check
+            time.sleep(2)
+            self.logger.info(f"Step 3: Final orphaned order cleanup for {symbol}")
+            self.check_and_cancel_orphaned_conditional_orders(symbol, category=category)
+            
+            # STEP 4: Schedule delayed cleanup as safety net
+            self.delayed_conditional_cleanup(symbol, category=category, delay_seconds=30)
+            
+            self.logger.info(f"✅ Conditional order cleanup sequence completed for {symbol}")
 
 
         except OrderExecutionError as oee: # Catch OrderExecutionError from _retry_with_backoff or _raise_on_retcode
@@ -1005,6 +1132,32 @@ class OrderManager:
         #     pass # Complex logic, deferring to stopOrderType
 
         return None
+
+    def delayed_conditional_cleanup(self, symbol: str, category: str = 'linear', delay_seconds: int = 30):
+        """
+        Schedules a delayed cleanup of conditional orders for a symbol.
+        This is useful as a safety net to catch any orders that weren't cancelled immediately.
+        
+        Args:
+            symbol: Trading symbol
+            category: Trading category 
+            delay_seconds: Seconds to wait before cleanup
+        """
+        
+        def cleanup_after_delay():
+            try:
+                time.sleep(delay_seconds)
+                self.logger.info(f"🕐 Running delayed conditional order cleanup for {symbol} (after {delay_seconds}s)")
+                self._cancel_existing_conditional_orders(symbol, category=category)
+                self.check_and_cancel_orphaned_conditional_orders(symbol, category=category)
+                self.logger.info(f"✅ Delayed cleanup completed for {symbol}")
+            except Exception as e:
+                self.logger.error(f"❌ Error in delayed cleanup for {symbol}: {e}")
+        
+        # Start cleanup in background thread
+        cleanup_thread = threading.Thread(target=cleanup_after_delay, daemon=True)
+        cleanup_thread.start()
+        self.logger.info(f"⏰ Scheduled delayed conditional order cleanup for {symbol} in {delay_seconds} seconds")
 
     def check_and_cancel_orphaned_conditional_orders(self, symbol: str, category: str = 'linear'):
         """
@@ -1111,18 +1264,25 @@ class OrderManager:
             for tp_order in open_tp_orders:
                 orders_to_cancel.append((tp_order, "No active position"))
         else: 
-            if len(open_sl_orders) == 1 and len(open_tp_orders) == 0:
-                self.logger.debug(f"Found 1 SL order and 0 TP orders for active position on {symbol}. Cancelling SL.")
-                orders_to_cancel.append((open_sl_orders[0], "Lone SL with active position"))
-            elif len(open_tp_orders) == 1 and len(open_sl_orders) == 0:
-                self.logger.debug(f"Found 1 TP order and 0 SL orders for active position on {symbol}. Cancelling TP.")
-                orders_to_cancel.append((open_tp_orders[0], "Lone TP with active position"))
+            # Position exists - be more conservative about canceling orders
+            if len(open_sl_orders) > 1 or len(open_tp_orders) > 1:
+                self.logger.warning(f"Multiple SL ({len(open_sl_orders)}) or TP ({len(open_tp_orders)}) orders found for {symbol} with an active position. Cancelling duplicates to prevent conflicts.")
+                # Cancel excess SL orders (keep only the first one)
+                for i, sl_order in enumerate(open_sl_orders):
+                    if i > 0:  # Keep first, cancel rest
+                        orders_to_cancel.append((sl_order, f"Duplicate SL order #{i+1}"))
+                # Cancel excess TP orders (keep only the first one)
+                for i, tp_order in enumerate(open_tp_orders):
+                    if i > 0:  # Keep first, cancel rest
+                        orders_to_cancel.append((tp_order, f"Duplicate TP order #{i+1}"))
             elif len(open_sl_orders) == 0 and len(open_tp_orders) == 0:
                 self.logger.debug(f"Position exists for {symbol}, but no SL/TP orders found. This is normal.")
-            elif len(open_sl_orders) > 1 or len(open_tp_orders) > 1:
-                 self.logger.warning(f"Multiple SL ({len(open_sl_orders)}) or TP ({len(open_tp_orders)}) orders found for {symbol} with an active position. Manual review might be needed. No automatic cancellation for this scenario.")
             elif len(open_sl_orders) == 1 and len(open_tp_orders) == 1:
                 self.logger.debug(f"Found 1 SL and 1 TP order for active position on {symbol}. Looks good.")
+            elif len(open_sl_orders) == 1 and len(open_tp_orders) == 0:
+                self.logger.debug(f"Found 1 SL order and 0 TP orders for active position on {symbol}. This is acceptable.")
+            elif len(open_tp_orders) == 1 and len(open_sl_orders) == 0:
+                self.logger.debug(f"Found 1 TP order and 0 SL orders for active position on {symbol}. This is acceptable.")
             
 
         for order_to_cancel, reason in orders_to_cancel:

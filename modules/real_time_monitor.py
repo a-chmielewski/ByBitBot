@@ -305,6 +305,9 @@ class RealTimeMonitor:
                                 f"total_unrealized_pnl={total_unrealized_pnl}, "
                                 f"realized_pnl={realized_pnl}, total_pnl={total_pnl}")
                 
+                # Check if we have new trades for immediate dashboard update
+                new_trades_detected = stats.get('total_trades', 0) > self.last_trade_count
+                
                 # Update current metrics
                 self.current_metrics = RealTimeMetrics(
                     timestamp=datetime.now(timezone.utc).isoformat(),
@@ -323,6 +326,12 @@ class RealTimeMonitor:
                     session_duration_hours=stats.get('session_duration_hours', 0.0),
                     trades_per_hour=self._calculate_trades_per_hour()
                 )
+                
+                # Log when new trades are detected
+                if new_trades_detected:
+                    self.logger.info(f"📊 Dashboard detected new trade(s)! Total: {self.current_metrics.total_trades}, "
+                                   f"New cumulative P&L: ${self.current_metrics.cumulative_pnl:.2f}")
+                    self.last_trade_count = self.current_metrics.total_trades
                 
                 self.logger.debug(f"update_metrics: Updated current_metrics.active_positions={self.current_metrics.active_positions}, "
                                 f"current_metrics.cumulative_pnl={self.current_metrics.cumulative_pnl}")

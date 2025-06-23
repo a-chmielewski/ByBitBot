@@ -189,9 +189,9 @@ class PerformanceTracker:
                 # Invalidate cache
                 self._invalidate_cache()
                 
-                self.logger.info(f"Recorded trade {trade_id}: {trade_record.strategy} {trade_record.side} "
-                               f"{trade_record.symbol} PnL: {trade_record.pnl:.2f} "
-                               f"(Cumulative: {self.cumulative_pnl:.2f})")
+                self.logger.info(f"✅ TRADE RECORDED {trade_id}: {trade_record.strategy} {trade_record.side} "
+                               f"{trade_record.symbol} PnL: ${trade_record.pnl:.2f} "
+                               f"(Cumulative: ${self.cumulative_pnl:.2f}) [Total trades: {len(self.trades)}]")
                 
                 return trade_id
                 

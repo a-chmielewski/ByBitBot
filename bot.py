@@ -639,7 +639,7 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
         adopted_orders = order_manager.sync_active_orders_with_exchange(symbol, category=category)
         bot_logger.debug("order_manager.sync_active_orders_with_exchange() returned.")
 
-        # Check for and cancel orphaned conditional orders
+        # Check for and cancel orphaned conditional orders more frequently
         bot_logger.debug(f"Calling order_manager.check_and_cancel_orphaned_conditional_orders for {symbol} ({category})")
         try:
             order_manager.check_and_cancel_orphaned_conditional_orders(symbol, category=category)
@@ -1504,6 +1504,12 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                         current_strategy.order_pending[symbol] = False  # Reset pending state
                         current_strategy.active_order_id[symbol] = None
             
+            # Check for and cancel orphaned conditional orders
+            try:
+                order_manager.check_and_cancel_orphaned_conditional_orders(symbol, category=category)
+            except Exception as e_orphan_check:
+                bot_logger.error(f"Error during orphaned order cleanup: {e_orphan_check}", exc_info=True)
+            
             # Check for exit if position exists
             if hasattr(current_strategy, 'position') and current_strategy.position.get(symbol):
                 # ENHANCED POSITION SYNC: Use the new intelligent sync function
@@ -1537,6 +1543,47 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                         position_to_close = current_strategy.position.get(symbol)
                         if position_to_close:
                             exit_order_responses = order_manager.execute_strategy_exit(symbol, position_to_close, category=category)
+                            
+                            # Record trade to performance tracker after successful exit
+                            # Note: execute_strategy_exit returns {'exit_market_order': response}
+                            exit_market_order = exit_order_responses.get('exit_market_order', {})
+                            exit_result = exit_market_order.get('result', {})
+                            
+                            if exit_order_responses and exit_result.get('orderStatus', '').lower() == 'filled':
+                                # Calculate PnL based on entry vs exit price and position size
+                                entry_price = safe_float_convert(position_to_close.get('entry_price', 0))
+                                exit_price = safe_float_convert(exit_result.get('avgPrice', 0))
+                                size = safe_float_convert(position_to_close.get('size', 0))
+                                side = position_to_close.get('side', '')
+                                
+                                # Calculate PnL: (exit_price - entry_price) * size for buy, (entry_price - exit_price) * size for sell
+                                if side.lower() == 'buy':
+                                    calculated_pnl = (exit_price - entry_price) * size
+                                else:  # sell
+                                    calculated_pnl = (entry_price - exit_price) * size
+                                
+                                trade_summary = {
+                                    'strategy': current_strategy_name,
+                                    'symbol': symbol,
+                                    'entry_price': entry_price,
+                                    'exit_price': exit_price,
+                                    'size': size,
+                                    'side': side,
+                                    'pnl': calculated_pnl,
+                                    'entry_timestamp': position_to_close.get('timestamp', datetime.now(timezone.utc).isoformat()),
+                                    'exit_timestamp': datetime.now(timezone.utc).isoformat()
+                                }
+                                perf_tracker.record_trade(trade_summary)
+                                bot_logger.info(f"Trade recorded for {current_strategy_name}: PnL=${calculated_pnl:.2f}, Entry=${entry_price}, Exit=${exit_price}")
+                                
+                                # Immediately update real-time monitor to reflect the new trade
+                                if 'real_time_monitor' in locals() and real_time_monitor:
+                                    real_time_monitor.update_metrics(force_update=True)
+                                    bot_logger.debug("Triggered immediate dashboard update after trade recording")
+                            else:
+                                bot_logger.warning(f"Exit order not filled or missing data - trade not recorded. Status: {exit_result.get('orderStatus', 'UNKNOWN')}")
+                                bot_logger.debug(f"Exit order response structure: {exit_order_responses}")
+                            
                             # Update strategy on successful exit
                             if exit_order_responses:
                                 current_strategy.clear_position(symbol)
