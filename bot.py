@@ -781,7 +781,7 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                 strat_instance.position = {} # Initialize if not a dict to prevent errors
 
             current_position_details = strat_instance.position.get(symbol)
-            if current_position_details and float(current_position_details.get('size', 0)) != 0:
+            if current_position_details and safe_float_convert(current_position_details.get('size', 0)) != 0:
                 # POSITION SYNC FIX: Verify position actually exists on exchange before attempting exit
                 try:
                     positions_response = exchange.fetch_positions(symbol, category)
@@ -794,7 +794,7 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                             actual_position = pos
                             break
                     
-                    actual_size = float(actual_position.get('size', 0)) if actual_position else 0
+                    actual_size = safe_float_convert(actual_position.get('size', 0)) if actual_position else 0
                     
                     if actual_size == 0:
                         # Position was already closed (likely by SL/TP) but strategy wasn't notified
@@ -824,11 +824,11 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                             trade_summary = {
                                 'strategy': type(strat).__name__,
                                 'symbol': symbol,
-                                'entry_price': float(current_position_details.get('entry_price', 0)),
-                                'exit_price': float(exit_order_response['exit_order']['result'].get('avgPrice', 0)),
-                                'size': float(current_position_details.get('size', 0)),
+                                'entry_price': safe_float_convert(current_position_details.get('entry_price', 0)),
+                                'exit_price': safe_float_convert(exit_order_response['exit_order']['result'].get('avgPrice', 0)),
+                                'size': safe_float_convert(current_position_details.get('size', 0)),
                                 'side': current_position_details.get('side'),
-                                'pnl': float(exit_order_response.get('pnl', 0)), # Assuming OrderManager calculates this
+                                'pnl': safe_float_convert(exit_order_response.get('pnl', 0)), # Assuming OrderManager calculates this
                                 'timestamp': datetime.now(timezone.utc).isoformat()
                             }
                             perf_tracker.record_trade(trade_summary)
@@ -1019,6 +1019,24 @@ def check_strategy_needs_change(analysis_results: dict, selected_symbol: str, cu
         logger_instance.info(reason)
         return False, current_strategy_class, current_timeframe, reason
 
+def safe_float_convert(value, default=0.0):
+    """
+    Safely convert a value to float, handling empty strings and None values.
+    
+    Args:
+        value: Value to convert
+        default: Default value if conversion fails
+    
+    Returns:
+        float: Converted value or default
+    """
+    if value is None or value == '' or value == 'null':
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
 def sync_strategy_position_with_exchange(strategy, symbol, exchange, category, logger):
     """
     Enhanced position synchronization between strategy and exchange.
@@ -1056,14 +1074,14 @@ def sync_strategy_position_with_exchange(strategy, symbol, exchange, category, l
                 actual_position = pos
                 break
         
-        actual_size = float(actual_position.get('size', 0)) if actual_position else 0
+        actual_size = safe_float_convert(actual_position.get('size', 0)) if actual_position else 0
         actual_side = actual_position.get('side', '').lower() if actual_position else None
-        actual_entry_price = float(actual_position.get('avgPrice', 0)) if actual_position else 0
-        unrealized_pnl = float(actual_position.get('unrealisedPnl', 0)) if actual_position else 0
+        actual_entry_price = safe_float_convert(actual_position.get('avgPrice', 0)) if actual_position else 0
+        unrealized_pnl = safe_float_convert(actual_position.get('unrealisedPnl', 0)) if actual_position else 0
         
         # Get strategy position
         strategy_position = strategy.position.get(symbol)
-        strategy_size = float(strategy_position.get('size', 0)) if strategy_position else 0
+        strategy_size = safe_float_convert(strategy_position.get('size', 0)) if strategy_position else 0
         strategy_side = strategy_position.get('side', '').lower() if strategy_position else None
         
         sync_result['exchange_size'] = actual_size
@@ -1200,6 +1218,11 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
             # Update data using the LiveDataFetcher interface
             try:
                 latest_data = data_fetcher.update_data()
+                
+                # Update real-time monitor with current price for P&L calculation
+                if not latest_data.empty and current_strategy.position.get(symbol):
+                    current_price = float(latest_data.iloc[-1]['close'])
+                    real_time_monitor.update_position_pnl(symbol, current_price)
                 
                 # Check if strategy data has indicators (avoid overwriting them)
                 if current_strategy.data is not None and not current_strategy.data.empty:
@@ -1732,6 +1755,10 @@ def main():
     real_time_monitor.set_current_symbol(symbol)
     market_summary = " | ".join([f"{tf}:{ctx}" for tf, ctx in market_context.items() if ctx != 'UNKNOWN'])
     real_time_monitor.set_current_market_conditions(market_summary)
+    
+    # Register the strategy for position tracking
+    real_time_monitor.add_strategy_for_tracking(strategy_instance)
+    bot_logger.info("✅ Strategy registered with RealTimeMonitor for position tracking")
     
     real_time_monitor.start_monitoring()
     bot_logger.info("✅ RealTimeMonitor started - Live dashboard active")

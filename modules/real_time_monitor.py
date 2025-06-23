@@ -185,6 +185,14 @@ class RealTimeMonitor:
         
         self.alert_channels = alert_channels or [AlertChannel.CONSOLE, AlertChannel.LOG]
         
+        # Active position tracking
+        self.active_positions: Dict[str, Dict[str, Any]] = {}  # symbol -> position_info
+        self.position_start_times: Dict[str, datetime] = {}  # symbol -> entry_time
+        self.unrealized_pnl: Dict[str, float] = {}  # symbol -> unrealized_pnl
+        
+        # Strategy reference for position tracking
+        self.tracked_strategies: List[Any] = []  # List of strategy instances to monitor
+        
         # Real-time metrics
         self.current_metrics = RealTimeMetrics(
             timestamp=datetime.now(timezone.utc).isoformat(),
@@ -267,8 +275,35 @@ class RealTimeMonitor:
                 # Get comprehensive stats from PerformanceTracker
                 stats = self.performance_tracker.get_comprehensive_statistics()
                 
+                # Handle case where there are no completed trades yet
                 if 'error' in stats:
-                    return
+                    # Initialize default stats for when no trades exist yet
+                    stats = {
+                        'session_id': self.performance_tracker.session_id,
+                        'total_trades': 0,
+                        'win_rate': 0.0,
+                        'cumulative_pnl': 0.0,
+                        'max_drawdown': 0.0,
+                        'consecutive_wins': 0,
+                        'consecutive_losses': 0,
+                        'profit_factor': 0.0,
+                        'expectancy': 0.0,
+                        'avg_trade_duration': 0.0,
+                        'session_duration_hours': (datetime.now(timezone.utc) - self.performance_tracker.session_start_time).total_seconds() / 3600
+                    }
+                
+                # Get active positions count and calculate total unrealized P&L
+                active_positions_count = self._get_active_positions_count()
+                total_unrealized_pnl = sum(self.unrealized_pnl.values())
+                
+                # Calculate total P&L including unrealized gains/losses
+                realized_pnl = stats.get('cumulative_pnl', 0.0)
+                total_pnl = realized_pnl + total_unrealized_pnl
+                
+                # Debug logging
+                self.logger.debug(f"update_metrics: active_positions_count={active_positions_count}, "
+                                f"total_unrealized_pnl={total_unrealized_pnl}, "
+                                f"realized_pnl={realized_pnl}, total_pnl={total_pnl}")
                 
                 # Update current metrics
                 self.current_metrics = RealTimeMetrics(
@@ -276,7 +311,7 @@ class RealTimeMonitor:
                     session_id=stats.get('session_id', ''),
                     total_trades=stats.get('total_trades', 0),
                     win_rate=stats.get('win_rate', 0.0),
-                    cumulative_pnl=stats.get('cumulative_pnl', 0.0),
+                    cumulative_pnl=total_pnl,  # Include unrealized P&L
                     current_drawdown=self._calculate_current_drawdown_pct(),
                     max_drawdown=stats.get('max_drawdown', 0.0),
                     consecutive_wins=stats.get('consecutive_wins', 0),
@@ -284,10 +319,13 @@ class RealTimeMonitor:
                     profit_factor=stats.get('profit_factor', 0.0),
                     expectancy=stats.get('expectancy', 0.0),
                     avg_trade_duration=stats.get('avg_trade_duration', 0.0) / 3600.0,  # Convert to hours
-                    active_positions=self._get_active_positions_count(),
+                    active_positions=active_positions_count,
                     session_duration_hours=stats.get('session_duration_hours', 0.0),
                     trades_per_hour=self._calculate_trades_per_hour()
                 )
+                
+                self.logger.debug(f"update_metrics: Updated current_metrics.active_positions={self.current_metrics.active_positions}, "
+                                f"current_metrics.cumulative_pnl={self.current_metrics.cumulative_pnl}")
                 
                 # Store in history
                 self.metrics_history.append(self.current_metrics)
@@ -314,10 +352,56 @@ class RealTimeMonitor:
         return ((high_watermark - current_pnl) / abs(high_watermark)) * 100
     
     def _get_active_positions_count(self) -> int:
-        """Get count of active positions (placeholder - would integrate with position tracking)"""
-        # This would integrate with your position tracking system
-        # For now, return 0 as a placeholder
-        return 0
+        """Get count of active positions from tracked strategies"""
+        try:
+            active_count = 0
+            current_positions = {}
+            
+            # Check all tracked strategies for active positions
+            for strategy in self.tracked_strategies:
+                if hasattr(strategy, 'position') and strategy.position:
+                    for symbol, position_info in strategy.position.items():
+                        if position_info and float(position_info.get('size', 0)) != 0:
+                            active_count += 1
+                            current_positions[symbol] = True  # Mark as currently active
+                            
+                            # Update our tracked positions
+                            self.active_positions[symbol] = {
+                                'strategy': type(strategy).__name__,
+                                'symbol': symbol,
+                                'side': position_info.get('side', 'unknown'),
+                                'size': float(position_info.get('size', 0)),
+                                'entry_price': float(position_info.get('entry_price', 0)),
+                                'entry_time': position_info.get('timestamp', datetime.now(timezone.utc).isoformat()),
+                                'unrealized_pnl': position_info.get('unrealized_pnl', 0),
+                                'status': position_info.get('status', 'open')
+                            }
+                            
+                            # Track position start time if not already tracked
+                            if symbol not in self.position_start_times:
+                                try:
+                                    entry_time_str = position_info.get('timestamp', datetime.now(timezone.utc).isoformat())
+                                    self.position_start_times[symbol] = datetime.fromisoformat(entry_time_str.replace('Z', '+00:00'))
+                                except Exception:
+                                    self.position_start_times[symbol] = datetime.now(timezone.utc)
+            
+            # Clean up positions that are no longer active
+            symbols_to_remove = []
+            for symbol in self.active_positions:
+                if symbol not in current_positions:
+                    # Position was closed
+                    symbols_to_remove.append(symbol)
+            
+            for symbol in symbols_to_remove:
+                self.active_positions.pop(symbol, None)
+                self.position_start_times.pop(symbol, None)
+                self.unrealized_pnl.pop(symbol, None)
+            
+            return active_count
+            
+        except Exception as e:
+            self.logger.debug(f"Error getting active positions count: {e}")
+            return len(self.active_positions)  # Fallback to cached count
     
     def _calculate_trades_per_hour(self) -> float:
         """Calculate trades per hour rate"""
@@ -540,6 +624,7 @@ class RealTimeMonitor:
         
         # Base intervals
         high_activity_interval = 1.0  # 1 second when trading
+        medium_activity_interval = 3.0  # 3 seconds when positions are open
         low_activity_interval = 10.0  # 10 seconds when idle
         
         # Check if there's recent trading activity
@@ -547,9 +632,12 @@ class RealTimeMonitor:
             # New trades - high frequency updates
             self.last_trade_count = self.current_metrics.total_trades
             return high_activity_interval
+        elif self.current_metrics.active_positions > 0 or self.active_positions:
+            # Active positions - medium frequency for real-time P&L
+            return medium_activity_interval
         elif self.current_metrics.total_trades == 0:
-            # No trades yet - very low frequency
-            return 30.0  # 30 seconds when no trades
+            # No trades yet and no positions - moderate frequency
+            return low_activity_interval  # Changed from 30.0 to 10.0
         else:
             # No new trades - moderate frequency
             return low_activity_interval
@@ -558,6 +646,10 @@ class RealTimeMonitor:
         """Determine if dashboard should be updated"""
         # Always update if there are new trades
         if self.current_metrics.total_trades > self.last_trade_count:
+            return True
+        
+        # Update if there are active positions (to show real-time P&L)
+        if self.current_metrics.active_positions > 0 or self.active_positions:
             return True
         
         # Update if there are active alerts
@@ -612,10 +704,35 @@ class RealTimeMonitor:
         lines.append(session_info)
         lines.append("")
         
-        # Key metrics row 1
-        trades_info = f"Trades: {self.current_metrics.total_trades} | Win Rate: {ConsoleFormatter.format_percentage(self.current_metrics.win_rate)}"
+        # Key metrics row 1 - enhanced with active positions
+        trades_info = f"Trades: {self.current_metrics.total_trades}"
+        if self.current_metrics.active_positions > 0:
+            trades_info += f" + {self.current_metrics.active_positions} open"
+        trades_info += f" | Win Rate: {ConsoleFormatter.format_percentage(self.current_metrics.win_rate)}"
         pnl_info = f"P&L: {ConsoleFormatter.format_currency(self.current_metrics.cumulative_pnl)}"
         lines.append(f"{trades_info} | {pnl_info}")
+        
+        # Active positions details
+        if self.active_positions:
+            lines.append("")
+            lines.append("📊 ACTIVE POSITIONS:")
+            for symbol, pos in self.active_positions.items():
+                side_emoji = "🟢" if pos['side'].lower() == 'buy' else "🔴"
+                # Use the latest unrealized P&L from our tracking dict, fallback to position dict
+                unrealized = self.unrealized_pnl.get(symbol, pos.get('unrealized_pnl', 0))
+                duration = ""
+                if symbol in self.position_start_times:
+                    duration_secs = (datetime.now(timezone.utc) - self.position_start_times[symbol]).total_seconds()
+                    hours = int(duration_secs // 3600)
+                    minutes = int((duration_secs % 3600) // 60)
+                    duration = f"{hours}h{minutes}m"
+                
+                pos_line = f"   {side_emoji} {symbol} {pos['side'].upper()} {pos['size']:.4f} @ ${pos['entry_price']:.2f}"
+                if unrealized != 0:
+                    pos_line += f" | P&L: {ConsoleFormatter.format_currency(unrealized)}"
+                if duration:
+                    pos_line += f" | {duration}"
+                lines.append(pos_line)
         
         # Key metrics row 2
         drawdown_info = f"Current DD: {ConsoleFormatter.format_percentage(self.current_metrics.current_drawdown, colored=True)}"
@@ -931,4 +1048,34 @@ class RealTimeMonitor:
             'average_session_duration': avg_duration,
             'best_session_pnl': max(session.final_pnl for session in session_history.values()),
             'worst_session_pnl': min(session.final_pnl for session in session_history.values())
-        } 
+        }
+    
+    def add_strategy_for_tracking(self, strategy_instance):
+        """Add a strategy instance to track for active positions"""
+        if strategy_instance not in self.tracked_strategies:
+            self.tracked_strategies.append(strategy_instance)
+            self.logger.info(f"Added strategy {type(strategy_instance).__name__} for position tracking")
+    
+    def remove_strategy_from_tracking(self, strategy_instance):
+        """Remove a strategy instance from tracking"""
+        if strategy_instance in self.tracked_strategies:
+            self.tracked_strategies.remove(strategy_instance)
+            self.logger.info(f"Removed strategy {type(strategy_instance).__name__} from position tracking")
+            
+    def update_position_pnl(self, symbol: str, current_price: float):
+        """Update unrealized P&L for an active position"""
+        if symbol in self.active_positions:
+            position = self.active_positions[symbol]
+            entry_price = position.get('entry_price', 0)
+            size = position.get('size', 0)
+            side = position.get('side', 'buy')
+            
+            if entry_price > 0 and size > 0:
+                if side.lower() == 'buy':
+                    pnl = (current_price - entry_price) * size
+                else:  # sell/short
+                    pnl = (entry_price - current_price) * size
+                
+                self.unrealized_pnl[symbol] = pnl
+                position['unrealized_pnl'] = pnl
+                position['current_price'] = current_price 
