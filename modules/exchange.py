@@ -278,7 +278,7 @@ class ExchangeConnector:
                 raise ExchangeError("Client not authenticated")
             response = self._api_call_with_backoff(self.client.place_order, **kwargs)
             checked = self._check_response(response, context="place_order")
-            self.logger.info(f"Order placed")
+            self.logger.info("Order placed")
             self.logger.debug(f"Order placed: {kwargs} | Response: {checked}")
             return checked
         except Exception as e:
@@ -516,8 +516,9 @@ class ExchangeConnector:
         if info and info.get('priceFilter') and info['priceFilter'].get('tickSize'):
             tick_size_str = str(info['priceFilter']['tickSize'])
             if '.' in tick_size_str:
-                return len(tick_size_str.split('.')[1])
-            return 0 # No decimal places if integer or not found
+                decimal_part = tick_size_str.split('.')[1].rstrip('0')
+                return len(decimal_part)
+            return 0  # No decimal places if integer or not found
         self.logger.warning(f"Could not determine price precision for {symbol}, defaulting to 8.")
         return 8 # Default precision
 
@@ -526,8 +527,9 @@ class ExchangeConnector:
         if info and info.get('lotSizeFilter') and info['lotSizeFilter'].get('qtyStep'):
             qty_step_str = str(info['lotSizeFilter']['qtyStep'])
             if '.' in qty_step_str:
-                return len(qty_step_str.split('.')[1])
-            return 0 # No decimal places
+                decimal_part = qty_step_str.split('.')[1].rstrip('0')
+                return len(decimal_part)
+            return 0  # No decimal places
         self.logger.warning(f"Could not determine qty precision for {symbol}, defaulting to 3.")
         return 3 # Default precision
 
