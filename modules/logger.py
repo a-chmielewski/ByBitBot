@@ -11,7 +11,15 @@ import platform
 colorama.init()
 
 LOG_DIR = 'logs'
-LOG_FILE = 'bot.log'
+from datetime import datetime
+
+# Get current date in YYYYMMDD format
+current_date_str = datetime.now().strftime('%Y%m%d')
+
+# Attempt to get symbol from environment variable, fallback to 'ALL'
+symbol = os.environ.get('BOT_SYMBOL', 'ALL')
+
+LOG_FILE = f'bot_{symbol}_{current_date_str}.log'
 LOG_PATH = os.path.join(LOG_DIR, LOG_FILE)
 
 os.makedirs(LOG_DIR, exist_ok=True)

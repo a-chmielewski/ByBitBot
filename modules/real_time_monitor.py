@@ -308,6 +308,16 @@ class RealTimeMonitor:
                 # Check if we have new trades for immediate dashboard update
                 new_trades_detected = stats.get('total_trades', 0) > self.last_trade_count
                 
+                # *** FIX: Preserve symbol, strategy, and market conditions when updating metrics ***
+                # Store current display settings before creating new metrics object
+                preserved_symbol = getattr(self.current_metrics, 'current_symbol', None)
+                preserved_strategy = getattr(self.current_metrics, 'current_strategy', None)
+                preserved_conditions = getattr(self.current_metrics, 'current_market_conditions', None)
+                
+                # Debug: Log what we're preserving
+                if preserved_symbol:
+                    self.logger.debug(f"📊 Preserving symbol in metrics update: '{preserved_symbol}'")
+                
                 # Update current metrics
                 self.current_metrics = RealTimeMetrics(
                     timestamp=datetime.now(timezone.utc).isoformat(),
@@ -324,8 +334,19 @@ class RealTimeMonitor:
                     avg_trade_duration=stats.get('avg_trade_duration', 0.0) / 3600.0,  # Convert to hours
                     active_positions=active_positions_count,
                     session_duration_hours=stats.get('session_duration_hours', 0.0),
-                    trades_per_hour=self._calculate_trades_per_hour()
+                    trades_per_hour=self._calculate_trades_per_hour(),
+                    # *** CRITICAL: Restore preserved display settings ***
+                    current_symbol=preserved_symbol,
+                    current_strategy=preserved_strategy,
+                    current_market_conditions=preserved_conditions
                 )
+                
+                # Debug: Verify preserved values were restored
+                if preserved_symbol:
+                    if self.current_metrics.current_symbol == preserved_symbol:
+                        self.logger.debug(f"✅ Symbol successfully preserved in updated metrics: '{preserved_symbol}'")
+                    else:
+                        self.logger.error(f"❌ Symbol preservation failed! Expected: '{preserved_symbol}', Got: '{self.current_metrics.current_symbol}'")
                 
                 # Log when new trades are detected
                 if new_trades_detected:
@@ -719,9 +740,13 @@ class RealTimeMonitor:
         session_info = f"Session: {self.current_metrics.session_id[:16]}... | Duration: {self.current_metrics.session_duration_hours:.1f}h"
         if self.current_metrics.current_symbol:
             session_info += f" | Symbol: {self.current_metrics.current_symbol}"
+            self.logger.debug(f"📊 Dashboard displaying symbol: '{self.current_metrics.current_symbol}'")
         else:
-            # Debug: Log when symbol is missing from display
-            self.logger.debug(f"DEBUG: Symbol not displayed - current_symbol is: '{self.current_metrics.current_symbol}'")
+            # Enhanced debug logging when symbol is missing
+            self.logger.warning(f"❌ Symbol missing from dashboard display! current_symbol = '{self.current_metrics.current_symbol}'")
+            self.logger.debug(f"Current metrics object: {type(self.current_metrics)}")
+            # Add visual indicator in dashboard when symbol is missing
+            session_info += " | Symbol: [NOT SET]"
         lines.append(session_info)
         lines.append("")
         
@@ -854,8 +879,13 @@ class RealTimeMonitor:
         """Set current trading symbol for dashboard display"""
         self.current_metrics.current_symbol = symbol
         self.logger.info(f"✅ Symbol set for dashboard: {symbol}")
-        # Log for debugging
+        # Log for debugging  
         self.logger.debug(f"Dashboard symbol set to: '{self.current_metrics.current_symbol}'")
+        # Verify it's actually set
+        if self.current_metrics.current_symbol == symbol:
+            self.logger.debug(f"✅ Symbol verified in current_metrics: '{symbol}'")
+        else:
+            self.logger.error(f"❌ Symbol mismatch! Expected: '{symbol}', Got: '{self.current_metrics.current_symbol}'")
         # Force immediate dashboard update to ensure symbol is displayed
         if self.dashboard_enabled:
             self._force_dashboard_update()
