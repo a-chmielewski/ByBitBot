@@ -4,6 +4,9 @@ from typing import Any, Dict, Optional, List
 from pybit.unified_trading import HTTP
 from requests.exceptions import ReadTimeout, RequestException, ConnectionError
 from urllib3.exceptions import ReadTimeoutError as URLLib3ReadTimeoutError
+from datetime import datetime, timedelta
+import random
+from collections import deque
 
 class ExchangeError(Exception):
     pass
@@ -24,6 +27,30 @@ class ExchangeConnector:
         self._time_offset = 0  # Track time difference with server
         self.client = None
         
+        # Enhanced API health monitoring and circuit breaker
+        self._api_health_window = 300  # 5 minutes
+        self._api_calls_history = deque(maxlen=1000)  # Track last 1000 API calls
+        self._error_rates = {
+            'connection_errors': deque(maxlen=100),
+            'rate_limit_errors': deque(maxlen=100),
+            'server_errors': deque(maxlen=100),
+            'timeout_errors': deque(maxlen=100)
+        }
+        
+        # Circuit breaker state
+        self._circuit_state = "closed"  # closed, half_open, open
+        self._circuit_failure_count = 0
+        self._circuit_failure_threshold = 5  # failures before opening circuit
+        self._circuit_recovery_timeout = 60  # seconds to wait before half_open
+        self._circuit_open_time = None
+        self._circuit_success_threshold = 3  # successes needed to close from half_open
+        self._circuit_success_count = 0
+        
+        # Rate limiting and health tracking
+        self._last_api_call_time = 0
+        self._min_api_call_interval = 0.05  # 50ms minimum between calls
+        self._rate_limit_detected_until = None  # Timestamp until when to slow down
+        
         # Initialize with a larger recv_window
         self._initialize_client()
         # Initial time sync after client is initialized
@@ -32,14 +59,16 @@ class ExchangeConnector:
     def _initialize_client(self):
         """Initialize the HTTP client with proper configuration."""
         try:
+            # Use a much larger recv_window to handle timestamp sync issues
+            # ByBit allows up to 60000ms (60 seconds)
             self.client = HTTP(
                 testnet=self.testnet,
                 api_key=self.api_key,
                 api_secret=self.api_secret,
-                recv_window=30000,  # Increased to 30 seconds
-                timeout=30  # Increased client-side timeout to 30 seconds
+                recv_window=60000,  # Maximum allowed: 60 seconds
+                timeout=60  # Increase client timeout as well
             )
-            self.logger.info(f"Initialized ByBit client ({'testnet' if self.testnet else 'mainnet'})")
+            self.logger.info(f"Initialized ByBit client with 60s recv_window ({'testnet' if self.testnet else 'mainnet'})")
         except Exception as e:
             self.logger.error(f"Client initialization failed: {e}")
             raise ExchangeError("Client initialization failed")
@@ -51,50 +80,76 @@ class ExchangeConnector:
             return
 
         try:
-            resp = self.client.get_server_time()
-            if not isinstance(resp, dict):
-                raise ValueError(f"Unexpected response type: {resp!r}")
+            # Perform multiple time sync attempts for better accuracy
+            offsets = []
+            for attempt in range(3):
+                start_local = time.time()
+                resp = self.client.get_server_time()
+                end_local = time.time()
+                
+                if not isinstance(resp, dict):
+                    raise ValueError(f"Unexpected response type: {resp!r}")
 
-            # 1) Try top-level 'time' (ms)
-            server_ms = resp.get("time")
+                # 1) Try top-level 'time' (ms)
+                server_ms = resp.get("time")
 
-            # 2) Fallback to result.timeNano (ns → ms)
-            if not server_ms:
-                result = resp.get("result", {})
-                time_nano = result.get("timeNano")
-                if time_nano:
-                    server_ms = int(int(time_nano) / 1_000_000)
+                # 2) Fallback to result.timeNano (ns → ms)
+                if not server_ms:
+                    result = resp.get("result", {})
+                    time_nano = result.get("timeNano")
+                    if time_nano:
+                        server_ms = int(int(time_nano) / 1_000_000)
 
-            # 3) Fallback to result.timeSecond (s → ms)
-            if not server_ms:
-                result = resp.get("result", {})
-                time_sec = result.get("timeSecond")
-                if time_sec:
-                    server_ms = int(float(time_sec) * 1000)
+                # 3) Fallback to result.timeSecond (s → ms)
+                if not server_ms:
+                    result = resp.get("result", {})
+                    time_sec = result.get("timeSecond")
+                    if time_sec:
+                        server_ms = int(float(time_sec) * 1000)
 
-            if not server_ms:
-                self.logger.error(f"Unable to parse server time from: {resp}")
-                return
+                if not server_ms:
+                    self.logger.error(f"Unable to parse server time from: {resp}")
+                    continue
 
-            local_ms = int(time.time() * 1000)
-            # Offset in seconds
-            self._time_offset = (server_ms - local_ms) / 1000.0
-
-            self.logger.info(
-                f"Time synchronized with ByBit server. Offset: {self._time_offset:.3f}s"
-            )
-            self.logger.debug(
-                f"  server_ms={server_ms}  local_ms={local_ms}"
-            )
+                # Account for network latency by using the midpoint of the request
+                midpoint_local = (start_local + end_local) / 2
+                local_ms = int(midpoint_local * 1000)
+                
+                # Calculate offset and add to list
+                offset = (server_ms - local_ms) / 1000.0
+                offsets.append(offset)
+                
+                # Small delay between attempts
+                if attempt < 2:
+                    time.sleep(0.1)
+            
+            if offsets:
+                # Use median offset for better accuracy
+                offsets.sort()
+                if len(offsets) % 2 == 0:
+                    self._time_offset = (offsets[len(offsets)//2-1] + offsets[len(offsets)//2]) / 2
+                else:
+                    self._time_offset = offsets[len(offsets)//2]
+                
+                self.logger.info(
+                    f"Time synchronized with ByBit server. Offset: {self._time_offset:.3f}s (median of {len(offsets)} attempts)"
+                )
+                self.logger.debug(f"  All offsets: {[f'{o:.3f}s' for o in offsets]}")
+            else:
+                self.logger.error("Failed to get any valid time sync responses")
 
         except Exception as e:
             self.logger.error(f"Failed to sync time with ByBit server: {e}")
             # Don't raise so your bot can still run, but your next _api_call will retry
 
     def _get_adjusted_timestamp(self) -> int:
-        """Get timestamp adjusted for server time offset."""
+        """Get timestamp adjusted for server time offset with conservative approach."""
         current_time = time.time()
-        adjusted_time = current_time + self._time_offset
+        
+        # Apply offset with additional conservative adjustment for network latency
+        # Subtract a small buffer to ensure we're not ahead of server time
+        conservative_offset = self._time_offset - 0.5  # Subtract 500ms buffer
+        adjusted_time = current_time + conservative_offset
         timestamp_ms = int(adjusted_time * 1000)
         
         # Safeguard: ensure timestamp is reasonable (not in far future or past)
@@ -102,12 +157,12 @@ class ExchangeConnector:
         max_offset_ms = 300000  # 5 minutes in milliseconds
         
         if abs(timestamp_ms - current_ms) > max_offset_ms:
-            self.logger.warning(f"Adjusted timestamp {timestamp_ms} seems unreasonable. Using current time instead.")
+            self.logger.warning(f"Adjusted timestamp {timestamp_ms} seems unreasonable. Using current time with small buffer.")
             self.logger.debug(f"  current_ms={current_ms}, offset={self._time_offset}, adjusted={timestamp_ms}")
-            # Reset offset and use current time
-            self._time_offset = 0
-            timestamp_ms = current_ms
+            # Use current time minus small buffer as fallback
+            timestamp_ms = current_ms - 1000  # 1 second behind current time
             
+        self.logger.debug(f"Generated timestamp: {timestamp_ms} (offset: {self._time_offset:.3f}s, conservative_offset: {conservative_offset:.3f}s)")
         return timestamp_ms
 
     def _check_response(self, response: dict, context: str = "API call") -> dict:
@@ -146,38 +201,291 @@ class ExchangeConnector:
 
         return response
 
+    def _record_api_call(self, method_name: str, success: bool, error_type: str = None, response_time: float = None):
+        """Record API call result for health monitoring and circuit breaker logic."""
+        now = datetime.now()
+        
+        call_record = {
+            'timestamp': now,
+            'method': method_name,
+            'success': success,
+            'error_type': error_type,
+            'response_time': response_time
+        }
+        
+        self._api_calls_history.append(call_record)
+        
+        # Record specific error types
+        if not success and error_type:
+            if error_type in self._error_rates:
+                self._error_rates[error_type].append(now)
+        
+        # Update circuit breaker state
+        if success:
+            self._circuit_success_count += 1
+            if self._circuit_state == "half_open" and self._circuit_success_count >= self._circuit_success_threshold:
+                self._circuit_state = "closed"
+                self._circuit_failure_count = 0
+                self._circuit_success_count = 0
+                self.logger.info("Circuit breaker closed - API calls restored to normal")
+        else:
+            self._circuit_failure_count += 1
+            self._circuit_success_count = 0
+            
+            if self._circuit_state == "closed" and self._circuit_failure_count >= self._circuit_failure_threshold:
+                self._circuit_state = "open"
+                self._circuit_open_time = now
+                self.logger.error(f"Circuit breaker opened - API calls will be limited for {self._circuit_recovery_timeout}s")
+
+    def _check_circuit_breaker(self, method_name: str) -> bool:
+        """Check if circuit breaker allows the API call. Returns True if call should proceed."""
+        now = datetime.now()
+        
+        if self._circuit_state == "closed":
+            return True
+        elif self._circuit_state == "open":
+            # Check if recovery timeout has elapsed
+            if self._circuit_open_time and (now - self._circuit_open_time).total_seconds() >= self._circuit_recovery_timeout:
+                self._circuit_state = "half_open"
+                self._circuit_success_count = 0
+                self.logger.info("Circuit breaker entering half-open state - testing API calls")
+                return True
+            else:
+                # Circuit is open, reject non-critical calls
+                critical_methods = {'get_positions', 'cancel_order', 'get_wallet_balance'}
+                if method_name not in critical_methods:
+                    self.logger.warning(f"Circuit breaker open - rejecting non-critical API call: {method_name}")
+                    return False
+                else:
+                    self.logger.warning(f"Circuit breaker open - allowing critical API call: {method_name}")
+                    return True
+        elif self._circuit_state == "half_open":
+            # Allow calls but monitor closely
+            return True
+        
+        return True
+
+    def _calculate_backoff_with_jitter(self, attempt: int) -> float:
+        """Calculate exponential backoff delay with jitter to prevent thundering herd."""
+        # Base exponential backoff
+        delay = self.backoff_base * (2 ** min(attempt, 6))  # Cap at 2^6 = 64x multiplier
+        
+        # Add jitter (±25% random variation)
+        jitter = delay * 0.25 * (2 * random.random() - 1)  # -25% to +25%
+        delay += jitter
+        
+        # Additional delay if rate limiting detected
+        if self._rate_limit_detected_until and datetime.now() < self._rate_limit_detected_until:
+            delay += 2.0  # Add 2 seconds if we're in rate limit cooldown
+        
+        return max(0.1, delay)  # Minimum 100ms delay
+
+    def _apply_rate_limiting(self):
+        """Apply rate limiting between API calls."""
+        now = time.time()
+        time_since_last_call = now - self._last_api_call_time
+        
+        if time_since_last_call < self._min_api_call_interval:
+            sleep_time = self._min_api_call_interval - time_since_last_call
+            time.sleep(sleep_time)
+        
+        self._last_api_call_time = time.time()
+
+    def get_api_health_status(self) -> Dict[str, Any]:
+        """Get current API health status and circuit breaker state."""
+        now = datetime.now()
+        cutoff_time = now - timedelta(seconds=self._api_health_window)
+        
+        # Calculate recent error rates
+        recent_calls = [call for call in self._api_calls_history if call['timestamp'] > cutoff_time]
+        total_recent_calls = len(recent_calls)
+        failed_recent_calls = len([call for call in recent_calls if not call['success']])
+        
+        error_rates = {}
+        for error_type, error_deque in self._error_rates.items():
+            recent_errors = len([ts for ts in error_deque if ts > cutoff_time])
+            error_rates[error_type] = recent_errors
+        
+        # Calculate average response time
+        response_times = [call.get('response_time') for call in recent_calls if call.get('response_time')]
+        avg_response_time = sum(response_times) / len(response_times) if response_times else None
+        
+        return {
+            'circuit_state': self._circuit_state,
+            'circuit_failure_count': self._circuit_failure_count,
+            'total_api_calls': len(self._api_calls_history),
+            'recent_calls': total_recent_calls,
+            'recent_failures': failed_recent_calls,
+            'success_rate': (total_recent_calls - failed_recent_calls) / total_recent_calls if total_recent_calls > 0 else 1.0,
+            'error_rates': error_rates,
+            'average_response_time': avg_response_time,
+            'rate_limit_active': self._rate_limit_detected_until is not None and datetime.now() < self._rate_limit_detected_until,
+            'time_offset': self._time_offset
+        }
+
+    def reset_circuit_breaker(self, reason: str = "Manual reset"):
+        """
+        Manually reset the circuit breaker to closed state.
+        
+        Args:
+            reason: Reason for the reset (for logging)
+        """
+        old_state = self._circuit_state
+        self._circuit_state = "closed"
+        self._circuit_failure_count = 0
+        self._circuit_success_count = 0
+        self._circuit_open_time = None
+        
+        self.logger.info(f"Circuit breaker manually reset from '{old_state}' to 'closed'. Reason: {reason}")
+
+    def force_time_resync(self):
+        """Force a time resynchronization with the ByBit server."""
+        self.logger.info("Forcing time resynchronization with ByBit server...")
+        old_offset = self._time_offset
+        self._sync_time()
+        new_offset = self._time_offset
+        
+        if abs(new_offset - old_offset) > 1.0:  # More than 1 second difference
+            self.logger.warning(f"Significant time offset change detected: {old_offset:.3f}s -> {new_offset:.3f}s")
+        else:
+            self.logger.info(f"Time resynchronization completed: offset = {new_offset:.3f}s")
+
+    def get_comprehensive_diagnostics(self) -> Dict[str, Any]:
+        """
+        Get comprehensive diagnostics including API health, circuit breaker state, 
+        connection status, and recent error patterns.
+        """
+        api_health = self.get_api_health_status()
+        now = datetime.now()
+        
+        # Analyze recent errors for patterns
+        recent_errors = {}
+        for error_type, error_times in self._error_rates.items():
+            recent_errors[error_type] = len([ts for ts in error_times if (now - ts).total_seconds() < 300])
+        
+        # Calculate uptime
+        if hasattr(self, '_start_time'):
+            uptime_seconds = (now - self._start_time).total_seconds()
+        else:
+            uptime_seconds = None
+        
+        return {
+            'api_health': api_health,
+            'client_info': {
+                'testnet': self.testnet,
+                'recv_window': 60000,
+                'uptime_seconds': uptime_seconds
+            },
+            'error_analysis': {
+                'recent_errors_5min': recent_errors,
+                'circuit_breaker_trips': getattr(self, '_circuit_trips_history', []),
+                'total_api_calls': len(self._api_calls_history)
+            },
+            'performance_metrics': {
+                'avg_response_time': api_health.get('average_response_time'),
+                'success_rate': api_health.get('success_rate'),
+                'rate_limit_incidents': len([ts for ts in self._error_rates.get('rate_limit_errors', []) 
+                                           if (now - ts).total_seconds() < 3600])  # Last hour
+            },
+            'recommendations': self._generate_health_recommendations(api_health, recent_errors)
+        }
+
+    def _generate_health_recommendations(self, api_health: Dict, recent_errors: Dict) -> List[str]:
+        """Generate health recommendations based on current status."""
+        recommendations = []
+        
+        if api_health.get('success_rate', 1.0) < 0.8:
+            recommendations.append("Low API success rate - consider reducing request frequency")
+        
+        if api_health.get('circuit_state') == 'open':
+            recommendations.append("Circuit breaker is open - check network connectivity and ByBit API status")
+        
+        if recent_errors.get('rate_limit_errors', 0) > 3:
+            recommendations.append("Frequent rate limiting detected - implement longer delays between requests")
+        
+        if recent_errors.get('timeout_errors', 0) > 5:
+            recommendations.append("High timeout rate - check network stability and consider increasing timeout values")
+        
+        if api_health.get('average_response_time', 0) > 2.0:
+            recommendations.append("High API response times - monitor ByBit server status")
+        
+        if not recommendations:
+            recommendations.append("API health is good - no issues detected")
+        
+        return recommendations
+
     def _api_call_with_backoff(self, func, *args, **kwargs):
+        method_name = getattr(func, '__name__', str(func))
+        start_time = time.time()
         retries = 0
+        
+        # Check circuit breaker
+        if not self._check_circuit_breaker(method_name):
+            raise ExchangeError(f"Circuit breaker open - API call {method_name} rejected")
+        
         while True:
             try:
-                # Add timestamp to kwargs if not present
-                if 'timestamp' not in kwargs:
+                # Apply rate limiting
+                self._apply_rate_limiting()
+                
+                # Only add timestamp to methods that actually need it
+                # Some ByBit methods (like set_leverage) don't accept timestamp parameters
+                timestamp_required_methods = {
+                    'place_order', 'cancel_order', 'cancel_all_orders', 'amend_order',
+                    'get_open_orders', 'get_order_history', 'get_trade_history'
+                }
+                
+                if method_name in timestamp_required_methods and 'timestamp' not in kwargs:
                     kwargs['timestamp'] = self._get_adjusted_timestamp()
                 
+                call_start = time.time()
                 response = func(*args, **kwargs)
+                response_time = time.time() - call_start
                 
                 # Check for HTTP error codes in response if available
                 if hasattr(response, 'status_code') and response.status_code in (429, 500, 502, 503, 504):
-                    self.logger.warning(f"'{func.__name__}' returned HTTP error {response.status_code}. Raising ExchangeError to trigger retry.")
+                    self.logger.warning(f"'{method_name}' returned HTTP error {response.status_code}. Raising ExchangeError to trigger retry.")
                     raise ExchangeError(f"HTTP error {response.status_code} from response object")
-                    
+                
+                # Record successful API call
+                self._record_api_call(method_name, True, response_time=response_time)
+                
+                # Log successful retry if this wasn't the first attempt
+                if retries > 0:
+                    total_time = time.time() - start_time
+                    self.logger.info(f"✅ API call '{method_name}' succeeded after {retries} retries in {total_time:.2f}s")
+                
                 return response
                 
             except (ReadTimeout, URLLib3ReadTimeoutError) as e:
+                self._record_api_call(method_name, False, 'timeout_errors')
+                
                 if retries < self.max_retries:
-                    wait = self.backoff_base * (2 ** retries)
+                    wait = self._calculate_backoff_with_jitter(retries)
                     self.logger.warning(
-                        f"Read timeout for '{func.__name__}'. Attempt {retries + 1}/{self.max_retries}. "
+                        f"Read timeout for '{method_name}'. Attempt {retries + 1}/{self.max_retries}. "
                         f"Retrying in {wait:.2f}s. Error: {str(e)}"
                     )
                     time.sleep(wait)
                     retries += 1
                     continue
-                self.logger.error(f"API call '{func.__name__}' failed after {self.max_retries} retries due to ReadTimeout: {str(e)}")
-                raise ExchangeError(f"API call '{func.__name__}' failed after {self.max_retries} retries (ReadTimeout.)") from e
+                
+                total_time = time.time() - start_time
+                self.logger.error(f"API call '{method_name}' failed after {self.max_retries} retries due to ReadTimeout in {total_time:.2f}s: {str(e)}")
+                raise ExchangeError(f"API call '{method_name}' failed after {self.max_retries} retries (ReadTimeout.)") from e
 
             except RequestException as e: # Catches ConnectionError, HTTPError (if pybit raises them), etc.
                 err_msg_lower = str(e).lower()
+                
+                # Classify error type for monitoring
+                error_type = 'connection_errors' if isinstance(e, ConnectionError) else 'server_errors'
+                if "429" in err_msg_lower or "rate limit" in err_msg_lower or "too many visits" in err_msg_lower:
+                    error_type = 'rate_limit_errors'
+                    # Set rate limit cooldown period
+                    self._rate_limit_detected_until = datetime.now() + timedelta(seconds=30)
+                
+                self._record_api_call(method_name, False, error_type)
+                
                 # Determine if this specific RequestException is retryable
                 is_retryable_http_error = (
                     "429" in err_msg_lower or "rate limit" in err_msg_lower or "too many visits" in err_msg_lower or
@@ -187,18 +495,19 @@ class ExchangeConnector:
                 is_connection_error = isinstance(e, ConnectionError)
 
                 if (is_retryable_http_error or is_connection_error) and retries < self.max_retries:
-                    wait = self.backoff_base * (2 ** retries)
+                    wait = self._calculate_backoff_with_jitter(retries)
                     log_event_type = "Retryable HTTP/Server Error" if is_retryable_http_error else "Connection Error"
                     self.logger.warning(
-                        f"{log_event_type} for '{func.__name__}'. Attempt {retries + 1}/{self.max_retries}. "
+                        f"{log_event_type} for '{method_name}'. Attempt {retries + 1}/{self.max_retries}. "
                         f"Retrying in {wait:.2f}s. Error: {str(e)}"
                     )
                     time.sleep(wait)
                     retries += 1
                     continue
                 
-                self.logger.error(f"API call '{func.__name__}' failed due to non-retried RequestException: {str(e)}")
-                raise ExchangeError(f"API call '{func.__name__}' failed (RequestException.)") from e
+                total_time = time.time() - start_time
+                self.logger.error(f"API call '{method_name}' failed due to non-retried RequestException in {total_time:.2f}s: {str(e)}")
+                raise ExchangeError(f"API call '{method_name}' failed (RequestException.)") from e
 
             except Exception as e: # General fallback, including handling self-raised ExchangeError from status_code check
                 err_msg_lower = str(e).lower()
@@ -231,16 +540,30 @@ class ExchangeConnector:
                 
                 # Handle timestamp errors
                 if "timestamp" in err_msg_lower and retries < self.max_retries:
-                    self.logger.warning(f"Timestamp error detected for '{func.__name__}'. Resyncing time with server...")
+                    self._record_api_call(method_name, False, 'server_errors')  # Timestamp is usually a server sync issue
+                    self.logger.warning(f"Timestamp error detected for '{method_name}'. Resyncing time with server...")
                     self._sync_time()  # Resync time
-                    wait = self.backoff_base * (2 ** retries)
+                    wait = self._calculate_backoff_with_jitter(retries)
                     self.logger.warning(
-                        f"Retrying '{func.__name__}' after timestamp resync. Attempt {retries + 1}/{self.max_retries}. "
+                        f"Retrying '{method_name}' after timestamp resync. Attempt {retries + 1}/{self.max_retries}. "
                         f"Retrying in {wait:.2f}s..."
                     )
                     time.sleep(wait)
                     retries += 1
                     continue
+                
+                # Classify error type for monitoring
+                error_type = 'server_errors'  # Default classification
+                if "429" in err_msg_lower or "rate limit" in err_msg_lower or "too many visits" in err_msg_lower:
+                    error_type = 'rate_limit_errors'
+                    # Set rate limit cooldown period
+                    self._rate_limit_detected_until = datetime.now() + timedelta(seconds=30)
+                elif "connection" in err_msg_lower or "network" in err_msg_lower:
+                    error_type = 'connection_errors'
+                elif "timeout" in err_msg_lower:
+                    error_type = 'timeout_errors'
+                
+                self._record_api_call(method_name, False, error_type)
                     
                 # Handle rate limits/server errors if they came as a generic Exception or our self-raised ExchangeError
                 is_retryable_keyword_error = (
@@ -250,16 +573,17 @@ class ExchangeConnector:
                 )
 
                 if is_retryable_keyword_error and retries < self.max_retries:
-                    wait = self.backoff_base * (2 ** retries)
+                    wait = self._calculate_backoff_with_jitter(retries)
                     self.logger.warning(
-                        f"Generic error with retryable keywords for '{func.__name__}'. Attempt {retries + 1}/{self.max_retries}. "
+                        f"Generic error with retryable keywords for '{method_name}'. Attempt {retries + 1}/{self.max_retries}. "
                         f"Retrying in {wait:.2f}s. Error: {str(e)}"
                     )
                     time.sleep(wait)
                     retries += 1
                     continue
-                    
-                self.logger.error(f"API call '{func.__name__}' failed after {retries} retries with unhandled exception: {str(e)}")
+                
+                total_time = time.time() - start_time
+                self.logger.error(f"API call '{method_name}' failed after {retries} retries with unhandled exception in {total_time:.2f}s: {str(e)}")
                 if isinstance(e, ExchangeError):
                     raise # Re-raise if it's already an ExchangeError we classified
                 else:
@@ -322,6 +646,25 @@ class ExchangeConnector:
         except Exception as e:
             self.logger.error(f"Fetch positions failed: {e}")
             raise ExchangeError(f"Fetch positions failed: {str(e)}")
+
+    def fetch_all_positions(self, category: str = "linear") -> Dict[str, Any]:
+        """
+        Fetch all open positions across all symbols for USDT pairs.
+        Args:
+            category: Bybit category (default 'linear')
+        Returns:
+            Positions dict
+        """
+        try:
+            if not self.client:
+                raise ExchangeError("Client not authenticated")
+            response = self._api_call_with_backoff(self.client.get_positions, category=category, settleCoin="USDT")
+            checked = self._check_response(response, context="fetch_all_positions")
+            self.logger.debug(f"Fetched all positions: Found {len(checked.get('list', []))} positions")
+            return checked
+        except Exception as e:
+            self.logger.error(f"Fetch all positions failed: {e}")
+            raise ExchangeError(f"Fetch all positions failed: {str(e)}")
 
     def fetch_ohlcv(self, symbol: str, timeframe: str = '1m', limit: int = 1000) -> Any:
         """
@@ -406,6 +749,31 @@ class ExchangeConnector:
         except Exception as e:
             self.logger.error(f"Fetch open orders failed: {e}")
             raise ExchangeError(f"Fetch open orders failed: {str(e)}")
+
+    def fetch_all_open_orders(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Fetch all open orders across all symbols for USDT pairs.
+        Args:
+            params: Additional parameters
+        Returns:
+            API response dict
+        """
+        try:
+            if not self.client:
+                raise ExchangeError("Client not authenticated")
+            open_params = {
+                "category": "linear",
+                "settleCoin": "USDT"  # Filter for USDT-based contracts to avoid API error
+            }
+            if params:
+                open_params.update(params)
+            response = self._api_call_with_backoff(self.client.get_open_orders, **open_params)
+            checked = self._check_response(response, context="fetch_all_open_orders")
+            self.logger.debug(f"Fetched all open orders: {open_params} | Found {len(checked.get('list', []))} orders")
+            return checked
+        except Exception as e:
+            self.logger.error(f"Fetch all open orders failed: {e}")
+            raise ExchangeError(f"Fetch all open orders failed: {str(e)}")
 
     def fetch_order(self, symbol: str, order_id: str, category: str = "linear", params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
@@ -693,13 +1061,12 @@ class ExchangeConnector:
         try:
             self.logger.info(f"Setting leverage to {leverage}x for {symbol} ({category})")
             
-            # Call the API directly without backoff wrapper to handle 110043 ourselves
+            # Rely on Pybit's internal timestamp handling to avoid 10002 errors
             response = self.client.set_leverage(
                 category=category,
                 symbol=symbol,
                 buyLeverage=str(leverage),
-                sellLeverage=str(leverage),
-                timestamp=self._get_adjusted_timestamp()
+                sellLeverage=str(leverage)
             )
             
             # Handle specific case where leverage is already set (error code 110043)
@@ -732,6 +1099,90 @@ class ExchangeConnector:
                     "result": {},
                     "time": int(time.time() * 1000)
                 }
+            elif "timestamp" in error_msg or "recv_window" in error_msg or "10002" in error_msg or "bad request" in error_msg:
+                # Timestamp/sync errors - implement comprehensive fallback strategy
+                self.logger.warning(f"Leverage setting failed due to timestamp/sync issues for {symbol}.")
+                self.logger.warning(f"Error details: {str(e)}")
+                
+                # Try alternative approach: resync time and retry once
+                self.logger.info("Attempting time resync and single retry...")
+                try:
+                    # Force time resync
+                    self._sync_time()
+                    time.sleep(1)  # Brief pause after sync
+                    
+                    # Retry once letting Pybit supply its own timestamp
+                    retry_response = self.client.set_leverage(
+                        category=category,
+                        symbol=symbol,
+                        buyLeverage=str(leverage),
+                        sellLeverage=str(leverage)
+                    )
+                    
+                    # If retry succeeds, check and return
+                    checked_response = self._check_response(retry_response, f"set_leverage_retry({symbol}, {leverage}x)")
+                    self.logger.info(f"✅ Successfully set leverage to {leverage}x for {symbol} after retry")
+                    return checked_response
+                    
+                except Exception as retry_err:
+                    self.logger.warning(f"Retry also failed: {retry_err}")
+
+                # Final explicit attempt: use server time minus a small buffer (<1s)
+                try:
+                    self.logger.info("Attempting final leverage set using server time reference…")
+
+                    server_time_resp = self.client.get_server_time()
+                    # Extract server time in ms (covers different response shapes)
+                    server_ms = server_time_resp.get("time") or \
+                               int(int(server_time_resp.get("result", {}).get("timeNano", 0)) / 1_000_000) or \
+                               int(float(server_time_resp.get("result", {}).get("timeSecond", 0)) * 1000)
+
+                    if not server_ms:
+                        raise ValueError(f"Unexpected server_time response: {server_time_resp}")
+
+                    safe_timestamp = server_ms - 500  # 0.5 s behind server, always valid
+
+                    final_response = self.client.set_leverage(
+                        category=category,
+                        symbol=symbol,
+                        buyLeverage=str(leverage),
+                        sellLeverage=str(leverage),
+                        timestamp=safe_timestamp
+                    )
+
+                    checked_final = self._check_response(final_response, f"set_leverage_final({symbol}, {leverage}x)")
+                    self.logger.info(f"✅ Successfully set leverage to {leverage}x for {symbol} with server-time reference")
+                    return checked_final
+
+                except Exception as final_err:
+                    self.logger.warning(f"Final server-time attempt failed: {final_err}")
+                
+                # Final fallback - check current leverage and continue
+                self.logger.warning(f"Leverage setting completely failed for {symbol}. Bot will continue with existing leverage.")
+                try:
+                    positions = self.fetch_positions(symbol, category)
+                    current_leverage_info = positions.get('result', {}).get('list', [])
+                    if current_leverage_info:
+                        current_leverage = current_leverage_info[0].get('leverage', 'unknown')
+                        self.logger.info(f"📊 Current leverage for {symbol}: {current_leverage}x (timestamp sync issues prevented changes)")
+                    else:
+                        self.logger.info(f"📊 No existing position found for {symbol}. Default leverage will be used.")
+                        current_leverage = 'default'
+                    
+                    return {
+                        "retCode": 0,
+                        "retMsg": f"Leverage setting bypassed due to persistent timestamp issues. Trading will continue.",
+                        "result": {"current_leverage": current_leverage, "bypass_reason": "timestamp_sync_failure"},
+                        "time": int(time.time() * 1000)
+                    }
+                except Exception as pos_err:
+                    self.logger.debug(f"Could not fetch current position info: {pos_err}")
+                    return {
+                        "retCode": 0,
+                        "retMsg": f"Leverage setting bypassed due to timestamp issues. Bot will continue with default settings.",
+                        "result": {"bypass_reason": "timestamp_sync_failure"},
+                        "time": int(time.time() * 1000)
+                    }
             else:
                 self.logger.error(f"Error setting leverage to {leverage}x for {symbol}: {e}")
                 raise ExchangeError(f"Failed to set leverage for {symbol}: {str(e)}") from e 

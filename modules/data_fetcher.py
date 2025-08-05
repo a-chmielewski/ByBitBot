@@ -6,6 +6,8 @@ import pandas as pd
 from pybit.unified_trading import WebSocket
 import threading
 import time
+from datetime import datetime, timedelta
+import random
 
 DEFAULT_WINDOW_SIZE = 1000
 
@@ -73,6 +75,17 @@ class LiveDataFetcher:
         self.ws_running = False
         self._ws_thread = None
         self._ws_lock = threading.Lock()
+        
+        # Enhanced WebSocket connection management
+        self._connection_state = "disconnected"  # disconnected, connecting, connected, error
+        self._reconnect_attempts = 0
+        self._max_reconnect_attempts = 10
+        self._base_reconnect_delay = 1.0  # seconds
+        self._max_reconnect_delay = 60.0  # seconds
+        self._last_successful_connection = None
+        self._last_data_received = None
+        self._connection_timeout = 30.0  # seconds to wait for first data after connection
+        self._data_timeout = 120.0  # seconds without data before considering connection stale
 
     def _ohlcv_to_df(self, ohlcv_raw: list) -> pd.DataFrame:
         """
@@ -170,48 +183,173 @@ class LiveDataFetcher:
             self.logger.error(f"Remove old data failed: {exc}")
             raise
 
+    def _calculate_reconnect_delay(self) -> float:
+        """
+        Calculate exponential backoff delay with jitter for reconnection attempts.
+        
+        Returns:
+            Delay in seconds before next reconnection attempt
+        """
+        # Exponential backoff: base_delay * (2 ^ attempt_number)
+        delay = self._base_reconnect_delay * (2 ** min(self._reconnect_attempts, 6))  # Cap at 2^6 = 64x multiplier
+        delay = min(delay, self._max_reconnect_delay)
+        
+        # Add jitter (±25% random variation) to prevent thundering herd
+        jitter = delay * 0.25 * (2 * random.random() - 1)  # -25% to +25%
+        delay += jitter
+        
+        return max(0.1, delay)  # Minimum 100ms delay
+
+    def _is_connection_stale(self) -> bool:
+        """
+        Check if the WebSocket connection is stale (no data received for too long).
+        
+        Returns:
+            True if connection should be considered stale and needs reconnection
+        """
+        if not self._last_data_received:
+            # No data received yet - check if we've waited too long since connection
+            if self._last_successful_connection:
+                time_since_connection = (datetime.now() - self._last_successful_connection).total_seconds()
+                return time_since_connection > self._connection_timeout
+            return False
+        
+        # Check if too much time has passed since last data
+        time_since_data = (datetime.now() - self._last_data_received).total_seconds()
+        return time_since_data > self._data_timeout
+
+    def _reset_connection_state(self):
+        """Reset connection state tracking for a fresh start."""
+        self._connection_state = "disconnected"
+        self._reconnect_attempts = 0
+        self._last_successful_connection = None
+        self._last_data_received = None
+
     def start_websocket(self):
         """
-        Start the WebSocket client and subscribe to k-line updates.
-        Implements reconnect logic: on error, sleeps and re-subscribes while ws_running is True.
+        Start the WebSocket client with enhanced error recovery and connection management.
+        Implements exponential backoff, connection health monitoring, and automatic recovery.
         Raises:
-            Exception: If WebSocket fails to start.
+            Exception: If WebSocket fails to start initially.
         """
         try:
             if self.ws_running:
                 self.logger.info("WebSocket already running.")
                 return
+                
             self.ws_running = True
+            self._reset_connection_state()
+            
             def ws_run():
                 while self.ws_running:
                     try:
+                        # Check if we've exceeded maximum reconnection attempts
+                        if self._reconnect_attempts >= self._max_reconnect_attempts:
+                            self.logger.error(f"WebSocket connection failed after {self._max_reconnect_attempts} attempts. "
+                                           f"Stopping reconnection attempts for {self.symbol} {self.timeframe_orig}")
+                            self._connection_state = "error"
+                            break
+                        
+                        # Calculate and apply reconnection delay if this is a retry
+                        if self._reconnect_attempts > 0:
+                            delay = self._calculate_reconnect_delay()
+                            self.logger.info(f"WebSocket reconnection attempt {self._reconnect_attempts + 1}/{self._max_reconnect_attempts} "
+                                           f"for {self.symbol} {self.timeframe_orig} in {delay:.1f} seconds...")
+                            time.sleep(delay)
+                        
+                        # Attempt connection
+                        self._connection_state = "connecting"
+                        self._reconnect_attempts += 1
+                        
                         self.ws_client = WebSocket(
                             testnet=self.exchange.testnet,
                             channel_type="linear"
                         )
+                        
                         self.ws_client.kline_stream(
                             symbol=self.symbol,
                             interval=self.bybit_interval,
                             callback=self.on_kline_message
                         )
-                        self.logger.debug(f"\nWebSocket started for {self.symbol} {self.timeframe_orig}")
-                        while self.ws_running:
-                            time.sleep(0.1)
+                        
+                        self._connection_state = "connected"
+                        self._last_successful_connection = datetime.now()
+                        
+                        # Reset reconnect attempts on successful connection
+                        if self._reconnect_attempts > 1:
+                            self.logger.info(f"✅ WebSocket reconnected successfully for {self.symbol} {self.timeframe_orig} "
+                                           f"after {self._reconnect_attempts} attempts")
+                        else:
+                            self.logger.info(f"✅ WebSocket connected for {self.symbol} {self.timeframe_orig}")
+                        
+                        self._reconnect_attempts = 0
+                        
+                        # Main connection monitoring loop
+                        while self.ws_running and self._connection_state == "connected":
+                            time.sleep(1)  # Check every second
+                            
+                            # Check for stale connection
+                            if self._is_connection_stale():
+                                self.logger.warning(f"WebSocket connection stale for {self.symbol} {self.timeframe_orig} "
+                                                  f"(no data for {self._data_timeout}s). Triggering reconnection...")
+                                self._connection_state = "error"
+                                break
+                        
+                        # If we exit the monitoring loop but ws_running is still True, it means we detected an issue
+                        if self.ws_running and self._connection_state == "error":
+                            raise Exception("Connection became stale or unhealthy")
+                            
                     except Exception as exc:
-                        self.logger.error(f"WebSocket error: {exc}")
-                        if self.ws_running:
-                            time.sleep(1)
+                        self._connection_state = "error"
+                        
+                        # Classify error types
+                        error_type = "unknown"
+                        is_recoverable = True
+                        
+                        if "authentication" in str(exc).lower() or "unauthorized" in str(exc).lower():
+                            error_type = "authentication"
+                            is_recoverable = False
+                        elif "invalid symbol" in str(exc).lower() or "not found" in str(exc).lower():
+                            error_type = "invalid_symbol"
+                            is_recoverable = False
+                        elif "network" in str(exc).lower() or "connection" in str(exc).lower() or "timeout" in str(exc).lower():
+                            error_type = "network"
+                            is_recoverable = True
+                        elif "rate limit" in str(exc).lower() or "too many" in str(exc).lower():
+                            error_type = "rate_limit"
+                            is_recoverable = True
+                        
+                        if not is_recoverable:
+                            self.logger.error(f"WebSocket unrecoverable error ({error_type}) for {self.symbol} {self.timeframe_orig}: {exc}")
+                            break
+                        else:
+                            self.logger.warning(f"WebSocket recoverable error ({error_type}) for {self.symbol} {self.timeframe_orig}: {exc}")
+                        
+                        # Don't retry if we're stopping
+                        if not self.ws_running:
+                            break
+                            
                     finally:
+                        # Clean up current connection
                         if self.ws_client:
                             try:
                                 self.ws_client.exit()
                             except Exception:
-                                pass
+                                pass  # Ignore cleanup errors
                             self.ws_client = None
+                
+                # Final state update
+                if self._connection_state != "error":
+                    self._connection_state = "disconnected"
+                    
+                self.logger.info(f"WebSocket thread ended for {self.symbol} {self.timeframe_orig}")
+            
             self._ws_thread = threading.Thread(target=ws_run, daemon=True)
             self._ws_thread.start()
+            
         except Exception as exc:
             self.logger.error(f"Failed to start WebSocket: {exc}")
+            self._connection_state = "error"
             raise
 
     def stop_websocket(self):
@@ -236,10 +374,14 @@ class LiveDataFetcher:
     def on_kline_message(self, message: Dict[str, Any]):
         """
         Handle incoming k-line message and update the rolling window.
+        Updates connection health tracking.
         Args:
             message: The k-line message dict from Pybit WebSocket.
         """
         try:
+            # Update connection health tracking
+            self._last_data_received = datetime.now()
+            
             kline = message.get('data')
             data_list = message.get('data') or []
             if not isinstance(data_list, list) or not data_list:
@@ -261,4 +403,47 @@ class LiveDataFetcher:
                 self.remove_old_data()
             self.logger.debug(f"WebSocket kline update: {row['timestamp']} {self.symbol} {self.timeframe_orig}")
         except Exception as exc:
-            self.logger.error(f"Failed to process kline message: {exc}")  
+            self.logger.error(f"Failed to process kline message for {self.symbol} {self.timeframe_orig}: {exc}")
+            # Don't update _last_data_received on processing errors
+
+    def get_connection_status(self) -> Dict[str, Any]:
+        """
+        Get current WebSocket connection status and health information.
+        
+        Returns:
+            Dictionary containing connection state, health metrics, and diagnostics
+        """
+        now = datetime.now()
+        
+        # Calculate time since last data
+        time_since_data = None
+        if self._last_data_received:
+            time_since_data = (now - self._last_data_received).total_seconds()
+        
+        # Calculate time since connection
+        time_since_connection = None
+        if self._last_successful_connection:
+            time_since_connection = (now - self._last_successful_connection).total_seconds()
+        
+        # Determine overall health
+        is_healthy = (
+            self.ws_running and 
+            self._connection_state == "connected" and
+            not self._is_connection_stale()
+        )
+        
+        return {
+            'symbol': self.symbol,
+            'timeframe': self.timeframe_orig,
+            'ws_running': self.ws_running,
+            'connection_state': self._connection_state,
+            'is_healthy': is_healthy,
+            'reconnect_attempts': self._reconnect_attempts,
+            'max_reconnect_attempts': self._max_reconnect_attempts,
+            'time_since_last_data': time_since_data,
+            'time_since_connection': time_since_connection,
+            'is_connection_stale': self._is_connection_stale(),
+            'data_rows': len(self.data) if not self.data.empty else 0,
+            'connection_timeout': self._connection_timeout,
+            'data_timeout': self._data_timeout
+        }

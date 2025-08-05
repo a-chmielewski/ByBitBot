@@ -6,7 +6,7 @@ from modules.logger import get_logger
 from modules.exchange import ExchangeConnector
 from modules.data_fetcher import LiveDataFetcher
 from modules.order_manager import OrderManager, OrderExecutionError
-from modules.performance_tracker import PerformanceTracker
+from modules.performance_tracker import PerformanceTracker, TradeRecord, MarketContext, OrderDetails, RiskMetrics, TradeStatus
 from modules.market_analyzer import MarketAnalyzer, MarketAnalysisError
 from modules.strategy_matrix import StrategyMatrix
 from modules.session_manager import SessionManager
@@ -44,6 +44,37 @@ def cleanup_on_exit():
             real_time_monitor.stop_monitoring()
             
         if session_manager:
+            # Export session data before ending sessions
+            try:
+                # Get active sessions for export
+                active_sessions = session_manager.get_active_sessions()
+                if active_sessions:
+                    print("🔄 Exporting session data before shutdown...")
+                    
+                    # Export in both JSON and CSV formats for maximum data preservation
+                    active_session_ids = list(active_sessions.keys())
+                    
+                    # Export JSON (comprehensive data)
+                    json_file = session_manager.export_session_data(active_session_ids, format='json')
+                    print(f"✅ Session data exported to: {json_file}")
+                    
+                    # Export CSV (tabular data for analysis)
+                    csv_file = session_manager.export_session_data(active_session_ids, format='csv')
+                    print(f"✅ Session data exported to: {csv_file}")
+                    
+                    # Also export all historical sessions for complete backup
+                    all_session_ids = list(session_manager.get_session_history().keys()) + active_session_ids
+                    if all_session_ids:
+                        json_full = session_manager.export_session_data(all_session_ids, format='json')
+                        print(f"📊 Complete session history exported to: {json_full}")
+                        
+                else:
+                    print("ℹ️  No active sessions to export")
+                    
+            except Exception as export_error:
+                print(f"⚠️  Warning: Failed to export session data during shutdown: {export_error}")
+            
+            # End active sessions after export
             session_manager.end_active_sessions("Bot shutdown")
             
     except Exception as e:
@@ -1113,6 +1144,13 @@ def sync_strategy_position_with_exchange(strategy, symbol, exchange, category, l
                 strategy.clear_position(symbol)
                 sync_result['reconciled'] = True
                 
+                # *** CRITICAL FIX: Clean up remaining conditional orders when position auto-closed ***
+                # When position closes via SL/TP, the other conditional order (TP/SL) remains orphaned
+                # Signal the main trading loop to handle immediate cleanup
+                logger.info(f"🧹 Position auto-closed detected for {symbol} - signaling conditional order cleanup...")
+                sync_result['needs_conditional_cleanup'] = True
+                logger.info(f"✅ Conditional order cleanup will be handled immediately by main loop for {symbol}")
+                
             elif actual_size != 0 and strategy_size == 0:
                 # Case 2: Exchange has position, strategy doesn't know about it
                 sync_result['action'] = 'adopt_exchange_position'
@@ -1514,24 +1552,97 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
             if hasattr(current_strategy, 'position') and current_strategy.position.get(symbol):
                 # ENHANCED POSITION SYNC: Use the new intelligent sync function
                 try:
+                    # Capture a snapshot of the current strategy position *before* sync – used if the
+                    # sync detects that the position disappeared on-exchange (SL/TP fill not routed
+                    # through OrderManager).
+                    import copy
+                    prev_position_snapshot = copy.deepcopy(current_strategy.position.get(symbol, {}))
+
                     sync_result = sync_strategy_position_with_exchange(
                         current_strategy, symbol, exchange, category, bot_logger
                     )
-                    
+
+                    # If exchange shows the position is gone but the strategy had it, we assume a
+                    # protective SL/TP closed the trade. Record it now so PerformanceTracker &
+                    # dashboard are up-to-date.
+                    if (sync_result.get('action') == 'clear_strategy_position' and
+                        prev_position_snapshot and prev_position_snapshot.get('size')):
+
+                        entry_price   = safe_float_convert(prev_position_snapshot.get('entry_price', 0))
+                        exit_price    = safe_float_convert(prev_position_snapshot.get('exit_price', entry_price))  # Fallback
+                        size          = safe_float_convert(prev_position_snapshot.get('size', 0))
+                        side          = prev_position_snapshot.get('side', '')
+
+                        # PnL estimation – if we don't have exit_price, use 0 so metrics at least
+                        # reflect a closed trade; more precise calculation can be added later.
+                        if exit_price == entry_price:
+                            calculated_pnl = 0.0
+                        else:
+                            if side.lower() == 'buy':
+                                calculated_pnl = (exit_price - entry_price) * size
+                            else:
+                                calculated_pnl = (entry_price - exit_price) * size
+
+                        trade_summary = {
+                            'strategy': current_strategy_name,
+                            'symbol': symbol,
+                            'entry_price': entry_price,
+                            'exit_price': exit_price,
+                            'size': size,
+                            'side': side,
+                            'pnl': calculated_pnl,
+                            'entry_timestamp': prev_position_snapshot.get('timestamp', datetime.now(timezone.utc).isoformat()),
+                            'exit_timestamp': datetime.now(timezone.utc).isoformat(),
+                            'exit_reason': 'sl_tp_auto_close'
+                        }
+                        perf_tracker.record_trade(trade_summary)
+                        bot_logger.info(f"Trade recorded via position-sync for {current_strategy_name}: PnL=${calculated_pnl:.2f}")
+
+                        # Update dashboard immediately
+                        if real_time_monitor:
+                            real_time_monitor.update_metrics(force_update=True)
+                            bot_logger.debug("Dashboard updated after auto-closure trade recording")
+                 
                     # Log sync results for analysis
                     if sync_result['mismatch_detected']:
                         bot_logger.info(f"Position sync completed for {symbol}: {sync_result['action']}")
-                        
-                        # If position was cleared or significantly changed, skip exit check
-                        if sync_result['action'] in ['clear_strategy_position']:
-                            continue  # Skip exit check since position is now cleared
-                        elif sync_result['action'] == 'adopt_exchange_position':
-                            bot_logger.info(f"Adopted exchange position for {symbol}, will monitor for exits")
-                    
-                    # Continue with exit check only if we still have a position
+                        bot_logger.info(f"Position sync details: {sync_result}")
+
+                    if sync_result['action'] == 'clear_strategy_position':
+                        # *** CRITICAL FIX: Handle conditional order cleanup when position auto-closed ***
+                        if sync_result.get('needs_conditional_cleanup'):
+                            bot_logger.info(f"🧹 Executing immediate conditional order cleanup for auto-closed position: {symbol}")
+                            try:
+                                order_manager._cancel_existing_conditional_orders(symbol, category=category)
+                                bot_logger.info(f"✅ Successfully cleaned up remaining conditional orders for {symbol}")
+                            except Exception as cleanup_error:
+                                bot_logger.error(f"❌ Failed to clean up conditional orders for {symbol}: {cleanup_error}")
+                                # Still continue - don't let cleanup failure stop the bot
+                        continue
+                    elif sync_result['action'] == 'adopt_exchange_position':
+                        bot_logger.info("Position was adopted from exchange")
+                    elif sync_result['action'] == 'update_strategy_size':
+                        bot_logger.info(
+                            f"Position size updated on exchange: {sync_result['exchange_size']} -> {sync_result['strategy_size']}"
+                        )
+                    elif sync_result['action'] == 'minor_difference_ignored':
+                        bot_logger.debug("Position size difference within tolerance, no action taken")
+                    elif sync_result['action'] == 'already_synced':
+                        bot_logger.debug("Positions are properly synchronized between strategy and exchange")
+                    else:
+                        bot_logger.warning(f"Unexpected position sync action detected: '{sync_result['action']}'. "
+                                         f"Full sync result: {sync_result}")
+
+                    # If position was cleared or significantly changed, skip exit check
+                    if sync_result['action'] in ['clear_strategy_position']:
+                        continue  # Skip exit check since position was cleared
+                    elif sync_result['action'] == 'adopt_exchange_position':
+                        bot_logger.info(f"Adopted exchange position for {symbol}, will monitor for exits")
+
+                # Continue with exit check only if we still have a position
                     if not current_strategy.position.get(symbol):
-                        continue  # Position was cleared during sync
-                        
+                         continue  # Position was cleared during sync
+                     
                 except Exception as e:
                     bot_logger.warning(f"Position sync failed for {symbol}: {e}. Proceeding with exit check.")
                 
@@ -1562,19 +1673,29 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                                 else:  # sell
                                     calculated_pnl = (entry_price - exit_price) * size
                                 
-                                trade_summary = {
-                                    'strategy': current_strategy_name,
-                                    'symbol': symbol,
-                                    'entry_price': entry_price,
-                                    'exit_price': exit_price,
-                                    'size': size,
-                                    'side': side,
-                                    'pnl': calculated_pnl,
-                                    'entry_timestamp': position_to_close.get('timestamp', datetime.now(timezone.utc).isoformat()),
-                                    'exit_timestamp': datetime.now(timezone.utc).isoformat()
-                                }
-                                perf_tracker.record_trade(trade_summary)
-                                bot_logger.info(f"Trade recorded for {current_strategy_name}: PnL=${calculated_pnl:.2f}, Entry=${entry_price}, Exit=${exit_price}")
+                                # CREATE ENHANCED TRADE RECORD with full context
+                                enhanced_trade_record = create_enhanced_trade_record(
+                                    strategy_name=current_strategy_name,
+                                    symbol=symbol,
+                                    side=side,
+                                    entry_price=entry_price,
+                                    exit_price=exit_price,
+                                    size=size,
+                                    pnl=calculated_pnl,
+                                    entry_timestamp=position_to_close.get('timestamp', datetime.now(timezone.utc).isoformat()),
+                                    exit_timestamp=datetime.now(timezone.utc).isoformat(),
+                                    market_analysis_data=analysis_results if 'analysis_results' in locals() else None,
+                                    order_response_data=exit_order_responses,
+                                    position_data=position_to_close,
+                                    leverage=leverage if 'leverage' in locals() else None,
+                                    session_id=session_manager.get_active_session_id() if session_manager else None,
+                                    exit_reason='strategy_exit_signal',
+                                    sl_pct=position_to_close.get('planned_sl_pct'),
+                                    tp_pct=position_to_close.get('planned_tp_pct')
+                                )
+                                
+                                perf_tracker.record_trade(enhanced_trade_record)
+                                bot_logger.info(f"✅ Enhanced trade recorded for {current_strategy_name}: PnL=${calculated_pnl:.2f}, Entry=${entry_price}, Exit=${exit_price}")
                                 
                                 # Immediately update real-time monitor to reflect the new trade
                                 if 'real_time_monitor' in locals() and real_time_monitor:
@@ -1603,6 +1724,639 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
             bot_logger.error(f"Error in trading loop: {e}", exc_info=True)
             time.sleep(1)  # Pause before retrying
 
+# Enhanced Performance Tracker Integration Functions
+def create_enhanced_trade_record(
+    strategy_name: str,
+    symbol: str,
+    side: str,
+    entry_price: float,
+    exit_price: float,
+    size: float,
+    pnl: float,
+    entry_timestamp: str,
+    exit_timestamp: str,
+    market_analysis_data: Optional[Dict] = None,
+    order_response_data: Optional[Dict] = None,
+    position_data: Optional[Dict] = None,
+    leverage: Optional[float] = None,
+    session_id: Optional[str] = None,
+    exit_reason: Optional[str] = None,
+    sl_pct: Optional[float] = None,
+    tp_pct: Optional[float] = None
+) -> Dict[str, Any]:
+    """
+    Create an enhanced trade record with comprehensive market context, order details, and risk metrics.
+    
+    Args:
+        strategy_name: Name of the trading strategy
+        symbol: Trading symbol
+        side: Trade side (buy/sell)
+        entry_price: Entry execution price
+        exit_price: Exit execution price
+        size: Position size
+        pnl: Realized profit/loss
+        entry_timestamp: Trade entry timestamp
+        exit_timestamp: Trade exit timestamp
+        market_analysis_data: Market analysis results for context
+        order_response_data: Order execution response data
+        position_data: Position tracking data
+        leverage: Leverage used
+        session_id: Current session ID
+        exit_reason: Reason for trade exit
+        sl_pct: Stop loss percentage used
+        tp_pct: Take profit percentage used
+        
+    Returns:
+        Enhanced trade record dictionary compatible with PerformanceTracker
+    """
+    try:
+        # Generate unique trade ID
+        trade_id = f"trade_{int(datetime.now().timestamp())}_{symbol}_{side}"
+        
+        # Create Market Context
+        market_context = None
+        if market_analysis_data and symbol in market_analysis_data:
+            symbol_data = market_analysis_data[symbol]
+            market_5m = symbol_data.get('5m', {}).get('market_type', 'UNKNOWN')
+            market_1m = symbol_data.get('1m', {}).get('market_type', 'UNKNOWN')
+            
+            # Determine strategy selection reason
+            from modules.strategy_matrix import StrategyMatrix
+            strategy_matrix = StrategyMatrix()
+            _, _, selection_reason = strategy_matrix.select_strategy_and_timeframe(market_5m, market_1m)
+            
+            # Determine execution timeframe from strategy matrix
+            execution_timeframe = '5m' if (market_5m == 'TRENDING' and market_1m == 'TRENDING') else '1m'
+            
+            # Determine market session based on current time
+            current_hour = datetime.now().hour
+            if 0 <= current_hour < 8:
+                market_session = "Asia"
+            elif 8 <= current_hour < 16:
+                market_session = "Europe"
+            else:
+                market_session = "US"
+            
+            market_context = MarketContext(
+                market_5m=market_5m,
+                market_1m=market_1m,
+                strategy_selection_reason=selection_reason,
+                execution_timeframe=execution_timeframe,
+                volatility_regime=symbol_data.get('5m', {}).get('analysis_details', {}).get('volatility_regime'),
+                trend_strength=symbol_data.get('5m', {}).get('analysis_details', {}).get('trend_strength'),
+                market_session=market_session
+            )
+        
+        # Create Order Details
+        order_details = None
+        if order_response_data:
+            main_order = order_response_data.get('main_order', {}).get('result', {})
+            sl_order = order_response_data.get('sl_order', {}).get('result', {})
+            tp_order = order_response_data.get('tp_order', {}).get('result', {})
+            
+            # Calculate slippage if we have expected vs actual price
+            slippage_pct = None
+            if order_response_data.get('signal_price') and entry_price:
+                expected_price = float(order_response_data['signal_price'])
+                if expected_price > 0:
+                    slippage_pct = abs(entry_price - expected_price) / expected_price * 100
+            
+            order_details = OrderDetails(
+                main_order_id=main_order.get('orderId'),
+                sl_order_id=sl_order.get('orderId'),
+                tp_order_id=tp_order.get('orderId'),
+                retry_attempts=order_response_data.get('retry_attempts', 0),
+                slippage_pct=slippage_pct,
+                order_type=order_response_data.get('order_type', 'market'),
+                time_in_force=order_response_data.get('time_in_force', 'GoodTillCancel'),
+                reduce_only=order_response_data.get('reduce_only', False)
+            )
+        
+        # Create Risk Metrics
+        risk_metrics = None
+        if entry_price > 0:
+            # Calculate actual SL/TP percentages
+            actual_sl_pct = None
+            actual_tp_pct = None
+            
+            if exit_price > 0:
+                if side.lower() == 'buy':
+                    if exit_price < entry_price:  # Loss (SL triggered)
+                        actual_sl_pct = (entry_price - exit_price) / entry_price * 100
+                    else:  # Profit (TP triggered or manual exit)
+                        actual_tp_pct = (exit_price - entry_price) / entry_price * 100
+                else:  # sell
+                    if exit_price > entry_price:  # Loss (SL triggered)
+                        actual_sl_pct = (exit_price - entry_price) / entry_price * 100
+                    else:  # Profit (TP triggered or manual exit)
+                        actual_tp_pct = (entry_price - exit_price) / entry_price * 100
+            
+            # Calculate risk-reward ratio
+            risk_reward_ratio = None
+            if sl_pct and tp_pct:
+                risk_reward_ratio = tp_pct / sl_pct
+            
+            # Calculate position size percentage (if we have account info)
+            position_size_pct = None
+            if position_data and position_data.get('account_balance'):
+                position_value = size * entry_price
+                position_size_pct = (position_value / position_data['account_balance']) * 100
+            
+            risk_metrics = RiskMetrics(
+                planned_sl_pct=sl_pct,
+                actual_sl_pct=actual_sl_pct,
+                planned_tp_pct=tp_pct,
+                actual_tp_pct=actual_tp_pct,
+                risk_reward_ratio=risk_reward_ratio,
+                position_size_pct=position_size_pct,
+                leverage_used=leverage
+            )
+        
+        # Calculate trade duration
+        trade_duration_seconds = None
+        if entry_timestamp and exit_timestamp:
+            try:
+                entry_dt = pd.to_datetime(entry_timestamp)
+                exit_dt = pd.to_datetime(exit_timestamp)
+                trade_duration_seconds = (exit_dt - entry_dt).total_seconds()
+            except Exception as e:
+                # Log the error but don't fail the trade recording process
+                logger = logging.getLogger('bot.trade_tracking')
+                logger.warning(f"Failed to calculate trade duration for trade {trade_id}: {e}. "
+                             f"Entry: {entry_timestamp}, Exit: {exit_timestamp}")
+                trade_duration_seconds = None
+        
+        # Calculate return percentage
+        return_pct = None
+        if entry_price > 0:
+            return_pct = (pnl / (size * entry_price)) * 100
+        
+        # Create enhanced trade record
+        enhanced_trade = {
+            'trade_id': trade_id,
+            'strategy': strategy_name,
+            'symbol': symbol,
+            'side': side,
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'size': size,
+            'pnl': pnl,
+            'entry_timestamp': entry_timestamp,
+            'exit_timestamp': exit_timestamp,
+            'market_context': market_context,
+            'order_details': order_details,
+            'risk_metrics': risk_metrics,
+            'status': TradeStatus.FILLED,
+            'exit_reason': exit_reason,
+            'trade_duration_seconds': trade_duration_seconds,
+            'return_pct': return_pct,
+            'session_id': session_id
+        }
+        
+        return enhanced_trade
+        
+    except Exception as e:
+        # Fallback to basic format if enhancement fails
+        return {
+            'strategy': strategy_name,
+            'symbol': symbol,
+            'side': side,
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'size': size,
+            'pnl': pnl,
+            'entry_timestamp': entry_timestamp,
+            'exit_timestamp': exit_timestamp,
+            'exit_reason': exit_reason
+        }
+
+def start_trade_tracking(
+    trade_id: str,
+    strategy_name: str,
+    symbol: str,
+    side: str,
+    size: float,
+    entry_price: float,
+    perf_tracker: 'PerformanceTracker',
+    session_id: Optional[str] = None,
+    market_analysis_data: Optional[Dict] = None,
+    order_response_data: Optional[Dict] = None
+) -> str:
+    """
+    Start tracking a trade in the performance tracker with PENDING status.
+    
+    Args:
+        trade_id: Unique trade identifier
+        strategy_name: Name of the trading strategy
+        symbol: Trading symbol
+        side: Trade side (buy/sell)
+        size: Position size
+        entry_price: Entry execution price
+        perf_tracker: PerformanceTracker instance
+        session_id: Current session ID
+        market_analysis_data: Market analysis results
+        order_response_data: Order execution response data
+        
+    Returns:
+        Trade ID for tracking
+    """
+    try:
+        # Create initial trade record with PENDING status
+        initial_trade = create_enhanced_trade_record(
+            strategy_name=strategy_name,
+            symbol=symbol,
+            side=side,
+            entry_price=entry_price,
+            exit_price=0.0,  # Will be updated on exit
+            size=size,
+            pnl=0.0,  # Will be calculated on exit
+            entry_timestamp=datetime.now(timezone.utc).isoformat(),
+            exit_timestamp=None,
+            market_analysis_data=market_analysis_data,
+            order_response_data=order_response_data,
+            session_id=session_id
+        )
+        
+        # Override status to PENDING
+        initial_trade['status'] = TradeStatus.PENDING
+        
+        # Record the trade
+        actual_trade_id = perf_tracker.record_trade(initial_trade)
+        return actual_trade_id
+        
+    except Exception as e:
+        # Return the provided trade_id if tracking setup fails
+        return trade_id
+
+def update_trade_status(
+    trade_id: str,
+    status: TradeStatus,
+    perf_tracker: 'PerformanceTracker',
+    notes: Optional[str] = None
+):
+    """Update trade status in the performance tracker."""
+    try:
+        perf_tracker.update_trade_status(trade_id, status, notes)
+    except Exception as e:
+        # Log error but don't fail the trading process
+        logger = logging.getLogger('bot.trade_tracking')
+        logger.error(f"Failed to update trade status for trade {trade_id} to {status}: {e}. "
+                    f"Notes: {notes}. Trade tracking may be incomplete but trading will continue.")
+        # Optionally, we could try to persist the status update to a backup file
+        try:
+            backup_dir = "logs/trade_status_failures"
+            os.makedirs(backup_dir, exist_ok=True)
+            
+            failure_record = {
+                'timestamp': datetime.now().isoformat(),
+                'trade_id': trade_id,
+                'intended_status': str(status),
+                'notes': notes,
+                'error': str(e)
+            }
+            
+            backup_file = os.path.join(backup_dir, f"failed_status_updates_{datetime.now().strftime('%Y%m%d')}.json")
+            
+            # Append to daily backup file
+            existing_data = []
+            if os.path.exists(backup_file):
+                try:
+                    with open(backup_file, 'r') as f:
+                        existing_data = json.load(f)
+                except:
+                    existing_data = []
+            
+            existing_data.append(failure_record)
+            
+            with open(backup_file, 'w') as f:
+                json.dump(existing_data, f, indent=2)
+                
+            logger.info(f"Trade status update failure backed up to {backup_file}")
+        except Exception as backup_error:
+            logger.debug(f"Failed to backup trade status update failure: {backup_error}")
+
+def complete_trade_tracking(
+    trade_id: str,
+    exit_price: float,
+    pnl: float,
+    perf_tracker: 'PerformanceTracker',
+    exit_reason: Optional[str] = None,
+    order_response_data: Optional[Dict] = None
+):
+    """
+    Complete trade tracking by updating the existing trade record with exit details.
+    
+    Args:
+        trade_id: Trade ID to update
+        exit_price: Exit execution price
+        pnl: Realized profit/loss
+        perf_tracker: PerformanceTracker instance
+        exit_reason: Reason for trade exit
+        order_response_data: Exit order response data
+    """
+    try:
+        # Get the existing trade record
+        trade_record = perf_tracker.get_trade_by_id(trade_id)
+        if not trade_record:
+            return
+        
+        # Update exit details
+        trade_record.exit_price = exit_price
+        trade_record.pnl = pnl
+        trade_record.exit_timestamp = datetime.now(timezone.utc).isoformat()
+        trade_record.status = TradeStatus.FILLED
+        trade_record.exit_reason = exit_reason
+        
+        # Calculate trade duration
+        if trade_record.entry_timestamp:
+            try:
+                entry_dt = pd.to_datetime(trade_record.entry_timestamp)
+                exit_dt = pd.to_datetime(trade_record.exit_timestamp)
+                trade_record.trade_duration_seconds = (exit_dt - entry_dt).total_seconds()
+            except Exception as e:
+                # Log error but continue with trade record completion
+                logger = logging.getLogger('bot.trade_tracking')
+                logger.warning(f"Failed to calculate trade duration for trade {trade_id} during completion: {e}. "
+                             f"Entry: {trade_record.entry_timestamp}, Exit: {trade_record.exit_timestamp}")
+                trade_record.trade_duration_seconds = None
+        
+        # Calculate return percentage
+        if trade_record.entry_price > 0:
+            trade_record.return_pct = (pnl / (trade_record.size * trade_record.entry_price)) * 100
+        
+        # Update risk metrics with actual values
+        if trade_record.risk_metrics and exit_price > 0:
+            if trade_record.side.lower() == 'buy':
+                if exit_price < trade_record.entry_price:  # Loss
+                    trade_record.risk_metrics.actual_sl_pct = (trade_record.entry_price - exit_price) / trade_record.entry_price * 100
+                else:  # Profit
+                    trade_record.risk_metrics.actual_tp_pct = (exit_price - trade_record.entry_price) / trade_record.entry_price * 100
+            else:  # sell
+                if exit_price > trade_record.entry_price:  # Loss
+                    trade_record.risk_metrics.actual_sl_pct = (exit_price - trade_record.entry_price) / trade_record.entry_price * 100
+                else:  # Profit
+                    trade_record.risk_metrics.actual_tp_pct = (trade_record.entry_price - exit_price) / trade_record.entry_price * 100
+        
+        # Update order details if provided
+        if order_response_data and trade_record.order_details:
+            exit_order = order_response_data.get('exit_order', {}).get('result', {})
+            # Could add exit order details here if needed
+        
+        perf_tracker.logger.info(f"✅ TRADE COMPLETED {trade_id}: {trade_record.strategy} {trade_record.side} "
+                               f"{trade_record.symbol} PnL: ${pnl:.2f} Duration: {trade_record.trade_duration_seconds:.1f}s")
+        
+    except Exception as e:
+        perf_tracker.logger.error(f"Failed to complete trade tracking for {trade_id}: {e}")
+
+def get_performance_analytics(perf_tracker: 'PerformanceTracker') -> Dict[str, Any]:
+    """
+    Get comprehensive performance analytics using the enhanced tracker capabilities.
+    
+    Args:
+        perf_tracker: PerformanceTracker instance
+        
+    Returns:
+        Dictionary with comprehensive performance analytics
+    """
+    try:
+        analytics = {
+            'comprehensive_stats': perf_tracker.get_comprehensive_statistics(),
+            'strategy_performance': perf_tracker.get_strategy_performance(),
+            'risk_metrics_summary': perf_tracker.get_risk_metrics_summary(),
+            'market_context_performance': perf_tracker.get_market_context_performance()
+        }
+        
+        # Add advanced analytics if enough trades
+        if len(perf_tracker.trades) >= 10:
+            analytics['rolling_sharpe'] = perf_tracker.rolling_sharpe(window=10)
+            analytics['rolling_drawdown'] = perf_tracker.rolling_drawdown_curve(window=10)
+        
+        return analytics
+        
+    except Exception as e:
+        perf_tracker.logger.error(f"Failed to get performance analytics: {e}")
+        return {}
+
+def check_existing_orders_and_positions(exchange, config, logger, symbol=None):
+    """
+    Check for existing orders and positions for a specific symbol (or all if None) and ask user what to do with them.
+    
+    Args:
+        exchange: Exchange connector instance
+        config: Bot configuration
+        logger: Logger instance  
+        symbol: Specific symbol to check (e.g., 'SOLUSDT'). If None, checks all symbols.
+        
+    Returns:
+        Dict with recovered orders/positions info or None if user chooses to ignore
+    """
+    symbol_text = f" FOR {symbol}" if symbol else ""
+    logger.info("="*60)
+    logger.info(f"CHECKING FOR EXISTING ORDERS AND POSITIONS{symbol_text}")
+    logger.info("="*60)
+    
+    try:
+        # Get all open orders
+        open_orders_response = exchange.fetch_all_open_orders()
+        open_orders = []
+        
+        if isinstance(open_orders_response, dict) and 'result' in open_orders_response:
+            open_orders = open_orders_response['result'].get('list', [])
+        elif isinstance(open_orders_response, dict) and 'list' in open_orders_response:
+            open_orders = open_orders_response.get('list', [])
+        elif isinstance(open_orders_response, list):
+            open_orders = open_orders_response
+        
+        # Get all positions
+        positions_response = exchange.fetch_all_positions()
+        positions = []
+        
+        if isinstance(positions_response, dict) and 'result' in positions_response:
+            positions = positions_response['result'].get('list', [])
+        elif isinstance(positions_response, dict) and 'list' in positions_response:
+            positions = positions_response.get('list', [])
+        elif isinstance(positions_response, list):
+            positions = positions_response
+        
+        # Filter for specific symbol if provided
+        if symbol:
+            target_symbol = symbol.replace("/", "").upper()  # Normalize symbol (SOLUSDT)
+            open_orders = [order for order in open_orders if order.get('symbol', '').upper() == target_symbol]
+            positions = [pos for pos in positions if pos.get('symbol', '').upper() == target_symbol]
+        
+        # Filter for non-zero positions
+        active_positions = [pos for pos in positions if float(pos.get('size', 0)) != 0]
+        
+        # Filter for relevant open orders (not just SL/TP orphaned ones)
+        main_orders = []
+        conditional_orders = []
+        
+        for order in open_orders:
+            order_type = order.get('orderType', '').lower()
+            stop_order_type = order.get('stopOrderType', '')
+            
+            if stop_order_type in ['Stop', 'TakeProfit', 'StopLoss']:
+                conditional_orders.append(order)  
+            else:
+                main_orders.append(order)
+        
+        # Check if there's anything to recover
+        if not main_orders and not active_positions:
+            symbol_msg = f" for {symbol}" if symbol else ""
+            logger.info(f"✅ No existing orders or positions found{symbol_msg}. Starting fresh.")
+            return None
+        
+        # Display findings
+        symbol_msg = f" for {symbol}" if symbol else ""
+        logger.info(f"🔍 Found existing trading activity{symbol_msg}:")
+        if main_orders:
+            logger.info(f"   📋 {len(main_orders)} open orders")
+        if active_positions:
+            logger.info(f"   📊 {len(active_positions)} active positions")  
+        if conditional_orders:
+            logger.info(f"   ⚠️  {len(conditional_orders)} conditional orders (SL/TP)")
+        
+        symbol_header = f" FOR {symbol}" if symbol else ""
+        print(f"\n" + "="*70)
+        print(f"🚨 EXISTING TRADING ACTIVITY DETECTED{symbol_header}")
+        print("="*70)
+        
+        if main_orders:
+            print("\n📋 OPEN ORDERS:")
+            for i, order in enumerate(main_orders):
+                symbol = order.get('symbol', 'N/A')
+                side = order.get('side', 'N/A').upper()
+                size = order.get('qty', 'N/A')
+                price = order.get('price', 'N/A')
+                order_type = order.get('orderType', 'N/A')
+                order_id = order.get('orderId', 'N/A')
+                
+                print(f"   {i+1}. {symbol} - {side} {size} @ ${price} ({order_type}) [ID: {order_id[:8]}...]")
+        
+        if active_positions:
+            print("\n📊 ACTIVE POSITIONS:")
+            for i, pos in enumerate(active_positions):
+                symbol = pos.get('symbol', 'N/A')
+                side = pos.get('side', 'N/A').upper()
+                size = pos.get('size', 'N/A')
+                entry_price = pos.get('avgPrice', 'N/A')
+                unrealized_pnl = float(pos.get('unrealisedPnl', 0))
+                
+                pnl_display = f"${unrealized_pnl:,.2f}" if unrealized_pnl != 0 else "$0.00"
+                pnl_color = "📈" if unrealized_pnl > 0 else "📉" if unrealized_pnl < 0 else "➡️"
+                
+                print(f"   {i+1}. {symbol} - {side} {size} @ ${entry_price} | P&L: {pnl_color} {pnl_display}")
+        
+        print("\n" + "="*70)
+        print("RECOVERY OPTIONS:")
+        print("="*70)
+        print("1. 🔄 ADOPT & TRACK - Import existing orders/positions into bot for monitoring")
+        print("2. 🚫 IGNORE & CONTINUE - Start fresh (existing orders/positions remain but untracked)")
+        print("3. ❌ CANCEL & CLEAN - Cancel all orders, close positions, then start fresh")
+        print("4. 🛑 EXIT - Stop bot startup to handle manually")
+        print("="*70)
+        
+        while True:
+            choice = input("\nSelect option (1-4): ").strip()
+            logger.info(f"User recovery choice: '{choice}'")
+            
+            if choice == "1":
+                logger.info("User chose to adopt and track existing orders/positions")
+                return {
+                    'action': 'adopt',
+                    'main_orders': main_orders,
+                    'positions': active_positions,
+                    'conditional_orders': conditional_orders
+                }
+            elif choice == "2":
+                logger.info("User chose to ignore existing orders/positions")
+                print("⚠️  Note: Existing orders and positions will remain active but won't be tracked by the bot.")
+                print("   You can manage them manually through the exchange interface.")
+                return None
+            elif choice == "3":
+                logger.info("User chose to cancel and clean existing orders/positions")
+                return {
+                    'action': 'cancel_and_clean',
+                    'main_orders': main_orders,
+                    'positions': active_positions,
+                    'conditional_orders': conditional_orders
+                }
+            elif choice == "4":
+                logger.info("User chose to exit bot startup")
+                print("👋 Bot startup cancelled. Handle existing orders/positions manually and restart when ready.")
+                return {'action': 'exit'}
+            else:
+                print("Invalid choice. Please enter 1, 2, 3, or 4.")
+    
+    except Exception as e:
+        logger.error(f"Error checking existing orders/positions: {e}")
+        logger.warning("Continuing with normal startup...")
+        return None
+
+def handle_recovery_action(recovery_info, exchange, config, logger):
+    """Handle the user's choice for recovering existing orders/positions."""
+    if not recovery_info:
+        return True  # Continue normal startup
+    
+    action = recovery_info.get('action')
+    
+    if action == 'exit':
+        logger.info("Exiting bot as requested by user")
+        return False  # Stop startup
+    
+    elif action == 'cancel_and_clean':
+        logger.info("Cancelling all orders and closing positions...")
+        
+        try:
+            # Cancel all open orders
+            for order in recovery_info.get('main_orders', []) + recovery_info.get('conditional_orders', []):
+                try:
+                    symbol = order.get('symbol')
+                    order_id = order.get('orderId')
+                    logger.info(f"Cancelling order {order_id} for {symbol}")
+                    
+                    cancel_response = exchange.cancel_order(symbol=symbol, order_id=order_id, params={'category': 'linear'})
+                    logger.info(f"✅ Cancelled order {order_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to cancel order {order_id}: {e}")
+            
+            # Close all positions  
+            for position in recovery_info.get('positions', []):
+                try:
+                    symbol = position.get('symbol')
+                    side = position.get('side')
+                    size = float(position.get('size', 0))
+                    
+                    if size > 0:
+                        # Place market order to close position
+                        close_side = 'Sell' if side.lower() == 'buy' else 'Buy'
+                        logger.info(f"Closing position {symbol} {side} {size}")
+                        
+                        close_response = exchange.place_order(
+                            symbol=symbol,
+                            side=close_side,
+                            orderType='Market',
+                            qty=str(size),
+                            params={'category': 'linear', 'reduceOnly': True}
+                        )
+                        logger.info(f"✅ Closed position {symbol}")
+                except Exception as e:
+                    logger.warning(f"Failed to close position {symbol}: {e}")
+            
+            logger.info("✅ Cleanup completed. Starting fresh.")
+            return True  # Continue normal startup
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+            return True  # Continue despite errors
+    
+    elif action == 'adopt':
+        logger.info("Adoption selected - will integrate existing orders/positions into strategy")
+        # The actual adoption logic will be handled in the strategy initialization
+        return True
+    
+    return True
+
 def main():
     global session_manager, real_time_monitor
     
@@ -1614,6 +2368,8 @@ def main():
     # Exchange
     ex_cfg = config['bybit']
     exchange = ExchangeConnector(api_key=ex_cfg['api_key'], api_secret=ex_cfg['api_secret'], testnet=False, logger=bot_logger)
+    
+    # Note: Order detection moved to after symbol selection for better UX
     
     # Initialize core management modules
     bot_logger.info("="*60)
@@ -1675,6 +2431,14 @@ def main():
     # Let user select symbol from analyzed markets
     selected_symbol = select_symbol(analysis_results, bot_logger)
     
+    # CHECK FOR EXISTING ORDERS/POSITIONS FOR THE SELECTED SYMBOL
+    recovery_info = check_existing_orders_and_positions(exchange, config, bot_logger, selected_symbol)
+    
+    # Handle user's recovery choice  
+    if not handle_recovery_action(recovery_info, exchange, config, bot_logger):
+        bot_logger.info("Bot startup cancelled by user")
+        return
+    
     # Let user select leverage
     selected_leverage = select_leverage(bot_logger)
     
@@ -1728,8 +2492,16 @@ def main():
     # Set leverage on the exchange for the selected symbol
     try:
         bot_logger.info(f"Setting leverage to {leverage}x for {symbol}")
-        exchange.set_leverage(symbol, leverage, category)
-        bot_logger.info(f"✅ Successfully set leverage to {leverage}x for {symbol}")
+        leverage_response = exchange.set_leverage(symbol, leverage, category)
+        
+        # Check if leverage was bypassed due to timestamp issues
+        if leverage_response.get('result', {}).get('bypass_reason') == 'timestamp_sync_failure':
+            current_leverage = leverage_response.get('result', {}).get('current_leverage', 'unknown')
+            bot_logger.warning(f"⚠️  Leverage setting bypassed due to timestamp sync issues")
+            bot_logger.info(f"📊 Current leverage for {symbol}: {current_leverage}x")
+            bot_logger.info(f"🚀 Bot will continue trading with existing leverage settings")
+        else:
+            bot_logger.info(f"✅ Successfully set leverage to {leverage}x for {symbol}")
     except Exception as e:
         bot_logger.error(f"Failed to set leverage to {leverage}x for {symbol}: {e}")
         bot_logger.error("Bot will continue, but orders may fail if current leverage is insufficient")
@@ -1754,6 +2526,82 @@ def main():
         strategy_logger = get_logger(selected_strategy_class.lower())
         strategy_instance = StratClass(data.copy(), config, logger=strategy_logger)
         bot_logger.info(f"Successfully initialized strategy: {type(strategy_instance).__name__}")
+        
+        # HANDLE ADOPTION OF EXISTING ORDERS/POSITIONS
+        if recovery_info and recovery_info.get('action') == 'adopt':
+            bot_logger.info("="*60)
+            bot_logger.info("ADOPTING EXISTING ORDERS AND POSITIONS")
+            bot_logger.info("="*60)
+            
+            try:
+                adopted_count = 0
+                
+                # Adopt existing positions
+                for position in recovery_info.get('positions', []):
+                    symbol_to_adopt = position.get('symbol')
+                    
+                    # Only adopt positions for the selected symbol
+                    if symbol_to_adopt == symbol.replace('/', ''):
+                        side = position.get('side', '').lower()
+                        size = float(position.get('size', 0))
+                        entry_price = float(position.get('avgPrice', 0))
+                        unrealized_pnl = float(position.get('unrealisedPnl', 0))
+                        
+                        # Initialize strategy position tracking if not exists
+                        if not hasattr(strategy_instance, 'position'):
+                            strategy_instance.position = {}
+                        if not hasattr(strategy_instance, 'order_pending'):
+                            strategy_instance.order_pending = {}
+                        if not hasattr(strategy_instance, 'active_order_id'):
+                            strategy_instance.active_order_id = {}
+                        
+                        # Create adopted position record
+                        strategy_instance.position[symbol] = {
+                            'main_order_id': f'adopted_{int(time.time())}',
+                            'symbol': symbol,
+                            'side': side,
+                            'size': size,
+                            'entry_price': entry_price,
+                            'status': 'open',
+                            'timestamp': datetime.now(timezone.utc).isoformat(),
+                            'adopted': True,
+                            'unrealized_pnl': unrealized_pnl,
+                            'exchange_position_data': position  # Store original exchange data
+                        }
+                        strategy_instance.order_pending[symbol] = False
+                        strategy_instance.active_order_id[symbol] = strategy_instance.position[symbol]['main_order_id']
+                        
+                        bot_logger.info(f"✅ Adopted position: {symbol} {side.upper()} {size} @ ${entry_price} (P&L: ${unrealized_pnl:.2f})")
+                        adopted_count += 1
+                
+                # Adopt pending orders (for the selected symbol only)
+                for order in recovery_info.get('main_orders', []):
+                    order_symbol = order.get('symbol')
+                    
+                    if order_symbol == symbol.replace('/', ''):
+                        # For now, just log the pending orders - full order adoption could be complex
+                        # depending on the strategy's order management logic
+                        side = order.get('side', '').upper()
+                        size = order.get('qty', 'N/A')
+                        price = order.get('price', 'N/A')
+                        order_type = order.get('orderType', 'N/A')
+                        order_id = order.get('orderId', 'N/A')
+                        
+                        bot_logger.info(f"ℹ️  Detected pending order: {order_symbol} {side} {size} @ ${price} ({order_type})")
+                        bot_logger.info(f"   Order ID: {order_id} - Will be monitored but not directly managed by strategy")
+                
+                if adopted_count > 0:
+                    bot_logger.info(f"✅ Successfully adopted {adopted_count} position(s) for tracking")
+                    # Log the adoption in strategy state
+                    strategy_instance.log_state_change(symbol, "position_adopted", 
+                        f"Strategy {type(strategy_instance).__name__} for {symbol}: Adopted existing position on restart. Monitoring for exit conditions...")
+                else:
+                    bot_logger.info("ℹ️  No positions adopted (none matched the selected trading symbol)")
+                    
+            except Exception as adoption_error:
+                bot_logger.error(f"Error during position adoption: {adoption_error}")
+                bot_logger.info("Continuing with normal strategy initialization...")
+        
     except Exception as e:
         bot_logger.error(f"Failed to initialize strategy class {StratClass.__name__}: {e}", exc_info=True)
         if 'data_fetcher' in locals() and data_fetcher is not None:
@@ -1799,9 +2647,16 @@ def main():
     
     # Set strategy, symbol, and market context for dashboard
     real_time_monitor.set_current_strategy(selected_strategy_class)
-    real_time_monitor.set_current_symbol(symbol)
+    real_time_monitor.set_current_symbol(symbol)  # This should display as "Symbol: BTCUSDT" in dashboard
     market_summary = " | ".join([f"{tf}:{ctx}" for tf, ctx in market_context.items() if ctx != 'UNKNOWN'])
-    real_time_monitor.set_current_market_conditions(market_summary)
+    if market_summary:
+        real_time_monitor.set_current_market_conditions(market_summary)
+    
+    # Log dashboard setup for verification
+    bot_logger.info(f"📊 Dashboard configured:")
+    bot_logger.info(f"   Strategy: {selected_strategy_class}")
+    bot_logger.info(f"   Symbol: {symbol}")
+    bot_logger.info(f"   Market conditions: {market_summary if market_summary else 'Not set'}")
     
     # Register the strategy for position tracking
     real_time_monitor.add_strategy_for_tracking(strategy_instance)
@@ -1835,7 +2690,26 @@ def main():
                 real_time_monitor.stop_monitoring()
                 bot_logger.info("✅ RealTimeMonitor stopped")
                 
+            # Export session data before ending sessions (backup export mechanism)
             if 'session_manager' in locals() and session_manager is not None:
+                try:
+                    active_sessions = session_manager.get_active_sessions()
+                    if active_sessions:
+                        bot_logger.info("🔄 Exporting session data before final cleanup...")
+                        
+                        # Export active sessions in both formats
+                        active_session_ids = list(active_sessions.keys())
+                        
+                        json_file = session_manager.export_session_data(active_session_ids, format='json')
+                        bot_logger.info(f"✅ Final session export (JSON): {json_file}")
+                        
+                        csv_file = session_manager.export_session_data(active_session_ids, format='csv')
+                        bot_logger.info(f"✅ Final session export (CSV): {csv_file}")
+                        
+                except Exception as export_error:
+                    bot_logger.warning(f"⚠️  Session export failed during cleanup: {export_error}")
+                
+                # End sessions after export attempt
                 session_manager.end_active_sessions("Bot shutdown")
                 bot_logger.info("✅ Active sessions ended")
                 

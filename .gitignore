@@ -3,6 +3,9 @@
 /logs
 /venv
 /performance
+/sessions
+/.pytest_cache
+/test_sessions
 /strategies/High-Volatility Market Strategies - BACKTEST
 /strategies/Low-Volatility Market Strategies - BACKTEST/
 /strategies/Ranging Market Strategies - BACKTEST/

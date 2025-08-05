@@ -697,6 +697,15 @@ class RealTimeMonitor:
         except Exception as e:
             self.logger.error(f"Error updating console dashboard: {e}")
     
+    def _force_dashboard_update(self):
+        """Force an immediate dashboard update (used when symbol/strategy changes)"""
+        try:
+            if self.dashboard_enabled:
+                self.update_metrics(force_update=True)
+                self._update_console_dashboard()
+        except Exception as e:
+            self.logger.error(f"Error in forced dashboard update: {e}")
+    
     def _build_dashboard_content(self) -> List[str]:
         """Build the console dashboard content"""
         lines = []
@@ -710,6 +719,9 @@ class RealTimeMonitor:
         session_info = f"Session: {self.current_metrics.session_id[:16]}... | Duration: {self.current_metrics.session_duration_hours:.1f}h"
         if self.current_metrics.current_symbol:
             session_info += f" | Symbol: {self.current_metrics.current_symbol}"
+        else:
+            # Debug: Log when symbol is missing from display
+            self.logger.debug(f"DEBUG: Symbol not displayed - current_symbol is: '{self.current_metrics.current_symbol}'")
         lines.append(session_info)
         lines.append("")
         
@@ -841,6 +853,12 @@ class RealTimeMonitor:
     def set_current_symbol(self, symbol: str):
         """Set current trading symbol for dashboard display"""
         self.current_metrics.current_symbol = symbol
+        self.logger.info(f"✅ Symbol set for dashboard: {symbol}")
+        # Log for debugging
+        self.logger.debug(f"Dashboard symbol set to: '{self.current_metrics.current_symbol}'")
+        # Force immediate dashboard update to ensure symbol is displayed
+        if self.dashboard_enabled:
+            self._force_dashboard_update()
 
     def disable_dashboard(self):
         """Disable the live dashboard"""
