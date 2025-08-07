@@ -47,8 +47,8 @@ A sophisticated, modular cryptocurrency trading bot designed for automated tradi
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourusername/bybit-trading-bot.git
-   cd bybit-trading-bot
+   git clone https://github.com/a-chmielewski/ByBitBot.git
+   cd ByBitBot-bot
    ```
 
 2. **Run the setup script**
