@@ -978,6 +978,61 @@ class OrderManager:
             # If main_order_id is None, _cancel_all_sl_tp_for_main_order will not find orders to cancel.
             # This is acceptable if the position was adopted and we don't have its original main_order_id.
 
+        # 🔧 CRITICAL FIX: Verify position actually exists on exchange before attempting exit
+        try:
+            self.logger.info(f"🔍 Verifying position exists on exchange before exit attempt for {symbol}")
+            positions_response = self.exchange.fetch_positions(symbol, category)
+            positions_list = positions_response.get('result', {}).get('list', [])
+            
+            # Find position for this symbol
+            actual_position = None
+            for pos in positions_list:
+                if pos.get('symbol') == symbol.replace('/', '').upper():
+                    actual_position = pos
+                    break
+            
+            actual_size = float(actual_position.get('size', 0)) if actual_position else 0.0
+            
+            if actual_size == 0.0:
+                # Position was already closed (likely by SL/TP)
+                self.logger.warning(f"🚨 POSITION SYNC ISSUE DETECTED: Strategy wants to exit {symbol} but position is already closed on exchange!")
+                self.logger.info(f"📊 Strategy position size: {position_size}, Exchange position size: {actual_size}")
+                
+                # Clean up any orphaned conditional orders since position is closed
+                try:
+                    self.logger.info(f"🧹 Cleaning up orphaned conditional orders for closed position {symbol}")
+                    self.check_and_cancel_orphaned_conditional_orders(symbol, category)
+                except Exception as cleanup_error:
+                    self.logger.error(f"Error during orphaned order cleanup: {cleanup_error}")
+                
+                # Return success response since position is already closed (which is what we wanted)
+                return {
+                    'exit_market_order': {
+                        'retCode': 0,
+                        'retMsg': 'Position already closed on exchange',
+                        'result': {'position_already_closed': True, 'symbol': symbol}
+                    },
+                    'position_already_closed': True,
+                    'cleanup_performed': True
+                }
+            else:
+                # Verify position side matches what strategy expects
+                actual_side = actual_position.get('side', '').lower()
+                expected_side = original_side.lower()
+                
+                if actual_side != expected_side:
+                    self.logger.warning(f"⚠️ Position side mismatch for {symbol}: Strategy expects {expected_side}, Exchange shows {actual_side}")
+                
+                # Update position size to match exchange reality
+                if abs(actual_size - position_size) > 0.001:  # Allow for small floating point differences
+                    self.logger.info(f"📊 Position size mismatch for {symbol}: Strategy={position_size}, Exchange={actual_size}. Using exchange size.")
+                    position_size = actual_size
+                
+                self.logger.info(f"✅ Position verified on exchange: {symbol} {actual_side} {actual_size}")
+                
+        except Exception as verify_error:
+            self.logger.error(f"❌ Failed to verify position for {symbol}: {verify_error}. Proceeding with exit attempt anyway.")
+
         exit_side = 'sell' if original_side.lower() == 'buy' else 'buy'
         
         try:

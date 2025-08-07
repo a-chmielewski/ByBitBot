@@ -101,13 +101,44 @@ class StrategyATRMomentumBreakout(StrategyTemplate):
        - Exit on momentum fade signals
        - Protect profits from volatility reversals
     
-    Risk Management:
-    --------------
-    - ATR-based dynamic stops (1.5x ATR)
-    - ATR-based profit targets (2.0x ATR)
-    - Quick scalping with partial exits
-    - Time stops for failed breakouts
-    - Volatility-adjusted position sizing
+    Enhanced Risk Management (Strategy Matrix Integration):
+    ------------------------------------------------------
+    This strategy's risk parameters are centrally managed via the Strategy Matrix.
+    The following parameters are automatically applied from the risk profile:
+    
+    Stop Loss Configuration:
+    - Mode: atr_mult (ATR-based dynamic stops)
+    - ATR Multiplier: 1.5x (automatically applied)
+    - Max Loss: 4.0% (safety cap)
+    
+    Take Profit Configuration:
+    - Mode: progressive_levels (partial profit taking)
+    - Levels: [2.0%, 3.5%, 5.0%] (automatically applied)
+    - Partial Exit Sizes: [50%, 30%, 20%] (automatically applied)
+    
+    Position Sizing:
+    - Mode: vol_normalized (volatility-adjusted sizing)
+    - Risk Per Trade: 1.2% of account equity
+    - Max Position: 3.0% of account equity
+    
+    Leverage by Volatility Regime:
+    - Low Volatility: 1.0x leverage (cautious in unexpected calm)
+    - Normal Volatility: 0.9x leverage (slightly reduced)
+    - High Volatility: 0.6x leverage (significant reduction for safety)
+    
+    Trading Limits:
+    - Max Concurrent Trades: 4 (allows multiple breakout opportunities)
+    - Min Time Between Trades: 180 seconds (3 minute cooldown)
+    - Daily Trade Limit: 20 trades
+    
+    Portfolio Classification:
+    - Factor: momentum (momentum-based strategy)
+    - Correlation Group: high_vol_breakout (grouped with similar strategies)
+    - Volatility Range: 1.5% - 15.0% (only trades in volatile conditions)
+    
+    Note: These parameters are automatically loaded from the Strategy Matrix.
+    Individual strategies should NOT override get_risk_parameters() unless
+    they need dynamic adjustments beyond the centralized configuration.
     """
     
     MARKET_TYPE_TAGS: List[str] = ['HIGH_VOLATILITY']

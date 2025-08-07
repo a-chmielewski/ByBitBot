@@ -1,12 +1,105 @@
 """
-Strategy Matrix Module
+Enhanced Strategy Matrix Module
 
-This module implements the Strategy Matrix for automatic strategy selection
-based on market conditions analysis of 1-minute and 5-minute timeframes.
+This module implements the comprehensive Strategy Matrix for automatic strategy selection
+based on market conditions analysis, including detailed risk management parameters,
+portfolio constraints, and correlation grouping for each strategy.
 """
 
 import logging
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
+from dataclasses import dataclass, asdict
+
+@dataclass
+class StopLossConfig:
+    """Stop loss configuration for strategies"""
+    mode: str = 'fixed_pct'  # 'fixed_pct' | 'atr_mult'
+    fixed_pct: float = 0.02  # Fixed percentage (2%)
+    atr_multiplier: float = 1.5  # ATR multiplier for dynamic stops
+    max_loss_pct: float = 0.05  # Maximum loss percentage (5%)
+
+@dataclass
+class TakeProfitConfig:
+    """Take profit configuration for strategies"""
+    mode: str = 'fixed_pct'  # 'fixed_pct' | 'progressive_levels'
+    fixed_pct: float = 0.04  # Fixed percentage (4%)
+    progressive_levels: List[float] = None  # Progressive levels [0.02, 0.04, 0.06]
+    partial_exit_sizes: List[float] = None  # Partial exit sizes [0.5, 0.3, 0.2]
+    
+    def __post_init__(self):
+        if self.progressive_levels is None:
+            self.progressive_levels = [0.02, 0.04, 0.06]
+        if self.partial_exit_sizes is None:
+            self.partial_exit_sizes = [0.5, 0.3, 0.2]
+
+@dataclass
+class TrailingStopConfig:
+    """Trailing stop configuration for strategies"""
+    enabled: bool = False
+    mode: str = 'price_pct'  # 'price_pct' | 'atr_mult'
+    offset_pct: float = 0.015  # 1.5% trailing offset
+    atr_multiplier: float = 1.5  # ATR multiplier for trailing offset
+    activation_pct: float = 0.01  # Activate after 1% profit
+
+@dataclass
+class PositionSizingConfig:
+    """Position sizing configuration for strategies"""
+    mode: str = 'fixed_notional'  # 'fixed_notional' | 'vol_normalized' | 'kelly_capped'
+    fixed_notional: float = 1000.0  # Fixed dollar amount
+    risk_per_trade: float = 0.01  # Risk per trade (1% of equity)
+    kelly_cap: float = 0.1  # Kelly criterion cap (10%)
+    tick_value: float = 0.01  # Tick value for calculations
+    max_position_pct: float = 5.0  # Max position as % of equity
+
+@dataclass
+class LeverageByRegimeConfig:
+    """Leverage multipliers by volatility regime"""
+    low: float = 1.2    # 20% higher leverage in low volatility
+    normal: float = 1.0  # Base leverage in normal volatility
+    high: float = 0.8   # 20% lower leverage in high volatility
+
+@dataclass
+class PortfolioTagsConfig:
+    """Portfolio tags for correlation grouping"""
+    sector: str = 'crypto'  # Sector classification (crypto, forex, commodities)
+    factor: str = 'momentum'  # Factor exposure (momentum, mean_reversion, volatility)
+    correlation_group: str = 'btc_correlated'  # Correlation group identifier
+    market_cap_tier: str = 'large'  # Market cap tier (large, mid, small)
+
+@dataclass
+class TradingLimitsConfig:
+    """Trading limits and constraints"""
+    max_concurrent_trades: int = 3  # Max concurrent trades for this strategy
+    max_per_symbol: int = 1  # Max trades per symbol
+    min_time_between_trades: int = 300  # Min seconds between trades (5 min)
+    daily_trade_limit: int = 20  # Max trades per day
+    max_daily_drawdown_pct: float = 0.05  # Max daily drawdown (5%)
+
+@dataclass
+class StrategyRiskProfile:
+    """Complete risk profile for a strategy"""
+    strategy_name: str
+    description: str
+    market_type_tags: List[str]
+    execution_timeframe: str
+    
+    # Risk management components
+    stop_loss: StopLossConfig
+    take_profit: TakeProfitConfig
+    trailing_stop: TrailingStopConfig
+    position_sizing: PositionSizingConfig
+    leverage_by_regime: LeverageByRegimeConfig
+    portfolio_tags: PortfolioTagsConfig
+    trading_limits: TradingLimitsConfig
+    
+    # Additional metadata
+    min_volatility_pct: float = 0.5  # Minimum volatility to trade
+    max_volatility_pct: float = 10.0  # Maximum volatility to trade
+    preferred_sessions: List[str] = None  # Preferred trading sessions
+    
+    def __post_init__(self):
+        if self.preferred_sessions is None:
+            self.preferred_sessions = ['london', 'new_york', 'tokyo']
 
 class StrategyMatrix:
     """
@@ -18,44 +111,210 @@ class StrategyMatrix:
     - Cells: Optimal strategy and execution timeframe for each combination
     """
     
-    # Strategy Matrix mapping (5min_condition, 1min_condition) -> (strategy_class_name, execution_timeframe)
-    STRATEGY_MATRIX = {
-        # (5-min condition, 1-min condition): (strategy_class_name, execution_timeframe)
+    # Comprehensive Strategy Risk Profiles
+    STRATEGY_RISK_PROFILES = {
+        'StrategyEMATrendRider': StrategyRiskProfile(
+            strategy_name='StrategyEMATrendRider',
+            description='EMA Trend Rider with ADX Filter - Stable trend-following on 5m timeframe',
+            market_type_tags=['TRENDING'],
+            execution_timeframe='5m',
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=1.8, fixed_pct=0.015),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.015, 0.03, 0.045]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.2),
+            position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.008, max_position_pct=4.0),
+            leverage_by_regime=LeverageByRegimeConfig(low=1.3, normal=1.0, high=0.7),
+            portfolio_tags=PortfolioTagsConfig(factor='trend_following', correlation_group='trend_momentum'),
+            trading_limits=TradingLimitsConfig(max_concurrent_trades=2, min_time_between_trades=900),
+            min_volatility_pct=0.3, max_volatility_pct=3.0
+        ),
         
+        'StrategyATRMomentumBreakout': StrategyRiskProfile(
+            strategy_name='StrategyATRMomentumBreakout',
+            description='ATR Momentum Breakout for high-volatility momentum trading',
+            market_type_tags=['HIGH_VOLATILITY'],
+            execution_timeframe='1m',
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=1.5, max_loss_pct=0.04),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.02, 0.035, 0.05]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.0, activation_pct=0.015),
+            position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.012, max_position_pct=3.0),
+            leverage_by_regime=LeverageByRegimeConfig(low=1.0, normal=0.9, high=0.6),
+            portfolio_tags=PortfolioTagsConfig(factor='momentum', correlation_group='high_vol_breakout'),
+            trading_limits=TradingLimitsConfig(max_concurrent_trades=4, min_time_between_trades=180),
+            min_volatility_pct=1.5, max_volatility_pct=15.0
+        ),
+        
+        'StrategyBreakoutAndRetest': StrategyRiskProfile(
+            strategy_name='StrategyBreakoutAndRetest',
+            description='Breakout and Retest for trend continuation trades',
+            market_type_tags=['TRENDING', 'TRANSITIONAL'],
+            execution_timeframe='1m',
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=2.0, fixed_pct=0.02),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.025, 0.04, 0.06]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='price_pct', offset_pct=0.018),
+            position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.01, max_position_pct=3.5),
+            leverage_by_regime=LeverageByRegimeConfig(low=1.2, normal=1.0, high=0.8),
+            portfolio_tags=PortfolioTagsConfig(factor='momentum', correlation_group='breakout_momentum'),
+            trading_limits=TradingLimitsConfig(max_concurrent_trades=3, min_time_between_trades=300),
+            min_volatility_pct=0.8, max_volatility_pct=8.0
+        ),
+        
+        'StrategyRSIRangeScalping': StrategyRiskProfile(
+            strategy_name='StrategyRSIRangeScalping',
+            description='RSI Range Scalping with candlestick confirmation for ranging markets',
+            market_type_tags=['RANGING'],
+            execution_timeframe='1m',
+            stop_loss=StopLossConfig(mode='fixed_pct', fixed_pct=0.015, max_loss_pct=0.025),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.01, 0.02, 0.03]),
+            trailing_stop=TrailingStopConfig(enabled=False),
+            position_sizing=PositionSizingConfig(mode='fixed_notional', fixed_notional=800.0, max_position_pct=2.5),
+            leverage_by_regime=LeverageByRegimeConfig(low=1.4, normal=1.2, high=0.8),
+            portfolio_tags=PortfolioTagsConfig(factor='mean_reversion', correlation_group='range_scalping'),
+            trading_limits=TradingLimitsConfig(max_concurrent_trades=5, min_time_between_trades=120, daily_trade_limit=30),
+            min_volatility_pct=0.2, max_volatility_pct=2.5
+        ),
+        
+        'StrategyVolatilityReversalScalping': StrategyRiskProfile(
+            strategy_name='StrategyVolatilityReversalScalping',
+            description='Volatility Reversal Scalping for high-vol mean reversion',
+            market_type_tags=['HIGH_VOLATILITY', 'RANGING'],
+            execution_timeframe='1m',
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=1.2, max_loss_pct=0.03),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.015, 0.025, 0.04]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=0.8, activation_pct=0.01),
+            position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.015, max_position_pct=3.0),
+            leverage_by_regime=LeverageByRegimeConfig(low=1.1, normal=0.9, high=0.6),
+            portfolio_tags=PortfolioTagsConfig(factor='mean_reversion', correlation_group='vol_reversal'),
+            trading_limits=TradingLimitsConfig(max_concurrent_trades=4, min_time_between_trades=150),
+            min_volatility_pct=1.0, max_volatility_pct=12.0
+        ),
+        
+        'StrategyMicroRangeScalping': StrategyRiskProfile(
+            strategy_name='StrategyMicroRangeScalping',
+            description='Micro Range Scalping for low-volatility tight ranges',
+            market_type_tags=['LOW_VOLATILITY', 'RANGING'],
+            execution_timeframe='1m',
+            stop_loss=StopLossConfig(mode='fixed_pct', fixed_pct=0.008, max_loss_pct=0.015),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.005, 0.01, 0.015]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='price_pct', offset_pct=0.008),
+            position_sizing=PositionSizingConfig(mode='fixed_notional', fixed_notional=1200.0, max_position_pct=4.0),
+            leverage_by_regime=LeverageByRegimeConfig(low=1.5, normal=1.3, high=1.0),
+            portfolio_tags=PortfolioTagsConfig(factor='mean_reversion', correlation_group='micro_scalping'),
+            trading_limits=TradingLimitsConfig(max_concurrent_trades=6, min_time_between_trades=60, daily_trade_limit=40),
+            min_volatility_pct=0.1, max_volatility_pct=1.0
+        ),
+        
+        'StrategyAdaptiveTransitionalMomentum': StrategyRiskProfile(
+            strategy_name='StrategyAdaptiveTransitionalMomentum',
+            description='Adaptive Transitional Momentum for regime change detection',
+            market_type_tags=['TRANSITIONAL'],
+            execution_timeframe='1m',
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=1.8, fixed_pct=0.025),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.02, 0.035, 0.055]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.3, activation_pct=0.015),
+            position_sizing=PositionSizingConfig(mode='kelly_capped', kelly_cap=0.08, risk_per_trade=0.012),
+            leverage_by_regime=LeverageByRegimeConfig(low=1.1, normal=1.0, high=0.7),
+            portfolio_tags=PortfolioTagsConfig(factor='adaptive', correlation_group='transitional_momentum'),
+            trading_limits=TradingLimitsConfig(max_concurrent_trades=3, min_time_between_trades=240),
+            min_volatility_pct=0.5, max_volatility_pct=8.0
+        ),
+        
+        'StrategyHighVolatilityTrendRider': StrategyRiskProfile(
+            strategy_name='StrategyHighVolatilityTrendRider',
+            description='High-Volatility Trend Rider for volatile trending markets',
+            market_type_tags=['HIGH_VOLATILITY', 'TRENDING'],
+            execution_timeframe='1m',
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=2.2, max_loss_pct=0.045),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.03, 0.05, 0.08]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.5),
+            position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.01, max_position_pct=3.0),
+            leverage_by_regime=LeverageByRegimeConfig(low=1.0, normal=0.8, high=0.5),
+            portfolio_tags=PortfolioTagsConfig(factor='trend_following', correlation_group='high_vol_trend'),
+            trading_limits=TradingLimitsConfig(max_concurrent_trades=2, min_time_between_trades=600),
+            min_volatility_pct=2.0, max_volatility_pct=20.0
+        ),
+        
+        'StrategyLowVolatilityTrendPullback': StrategyRiskProfile(
+            strategy_name='StrategyLowVolatilityTrendPullback',
+            description='Low-Volatility Trend Pullback for quiet trending markets',
+            market_type_tags=['LOW_VOLATILITY', 'TRENDING'],
+            execution_timeframe='1m',
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=1.5, fixed_pct=0.012),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.012, 0.025, 0.04]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='price_pct', offset_pct=0.012),
+            position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.008, max_position_pct=3.5),
+            leverage_by_regime=LeverageByRegimeConfig(low=1.4, normal=1.2, high=0.9),
+            portfolio_tags=PortfolioTagsConfig(factor='trend_following', correlation_group='low_vol_trend'),
+            trading_limits=TradingLimitsConfig(max_concurrent_trades=4, min_time_between_trades=180),
+            min_volatility_pct=0.2, max_volatility_pct=1.5
+        ),
+        
+        'StrategyRangeBreakoutMomentum': StrategyRiskProfile(
+            strategy_name='StrategyRangeBreakoutMomentum',
+            description='Range Breakout Momentum for range-to-trend transitions',
+            market_type_tags=['RANGING', 'TRANSITIONAL'],
+            execution_timeframe='1m',
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=1.8, fixed_pct=0.022),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.025, 0.045, 0.07]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.2),
+            position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.011, max_position_pct=3.5),
+            leverage_by_regime=LeverageByRegimeConfig(low=1.2, normal=1.0, high=0.8),
+            portfolio_tags=PortfolioTagsConfig(factor='momentum', correlation_group='range_breakout'),
+            trading_limits=TradingLimitsConfig(max_concurrent_trades=3, min_time_between_trades=300),
+            min_volatility_pct=0.6, max_volatility_pct=6.0
+        ),
+        
+        'StrategyVolatilitySqueezeBreakout': StrategyRiskProfile(
+            strategy_name='StrategyVolatilitySqueezeBreakout',
+            description='Volatility Squeeze Breakout for low-to-high vol transitions',
+            market_type_tags=['LOW_VOLATILITY', 'TRANSITIONAL'],
+            execution_timeframe='1m',
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=1.6, fixed_pct=0.018),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.02, 0.04, 0.065]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.1, activation_pct=0.015),
+            position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.01, max_position_pct=3.5),
+            leverage_by_regime=LeverageByRegimeConfig(low=1.3, normal=1.1, high=0.8),
+            portfolio_tags=PortfolioTagsConfig(factor='volatility', correlation_group='squeeze_breakout'),
+            trading_limits=TradingLimitsConfig(max_concurrent_trades=3, min_time_between_trades=420),
+            min_volatility_pct=0.3, max_volatility_pct=4.0
+        )
+    }
+    
+    # Strategy Matrix mapping (5min_condition, 1min_condition) -> strategy_name
+    STRATEGY_MATRIX = {
         # TRENDING row (5-min trending)
-        ('TRENDING', 'TRENDING'): ('StrategyEMATrendRider', '5m'),  # Only combination using 5-min execution
-        ('TRENDING', 'RANGING'): ('StrategyBreakoutAndRetest', '1m'),
-        ('TRENDING', 'HIGH_VOLATILITY'): ('StrategyHighVolatilityTrendRider', '1m'),
-        ('TRENDING', 'LOW_VOLATILITY'): ('StrategyLowVolatilityTrendPullback', '1m'),
-        ('TRENDING', 'TRANSITIONAL'): ('StrategyBreakoutAndRetest', '1m'),
+        ('TRENDING', 'TRENDING'): 'StrategyEMATrendRider',
+        ('TRENDING', 'RANGING'): 'StrategyBreakoutAndRetest',
+        ('TRENDING', 'HIGH_VOLATILITY'): 'StrategyHighVolatilityTrendRider',
+        ('TRENDING', 'LOW_VOLATILITY'): 'StrategyLowVolatilityTrendPullback',
+        ('TRENDING', 'TRANSITIONAL'): 'StrategyBreakoutAndRetest',
         
         # RANGING row (5-min ranging)
-        ('RANGING', 'TRENDING'): ('StrategyRangeBreakoutMomentum', '1m'),
-        ('RANGING', 'RANGING'): ('StrategyRSIRangeScalping', '1m'),  # Best fit for ranging conditions
-        ('RANGING', 'HIGH_VOLATILITY'): ('StrategyVolatilityReversalScalping', '1m'),
-        ('RANGING', 'LOW_VOLATILITY'): ('StrategyMicroRangeScalping', '1m'),
-        ('RANGING', 'TRANSITIONAL'): ('StrategyRangeBreakoutMomentum', '1m'),
+        ('RANGING', 'TRENDING'): 'StrategyRangeBreakoutMomentum',
+        ('RANGING', 'RANGING'): 'StrategyRSIRangeScalping',
+        ('RANGING', 'HIGH_VOLATILITY'): 'StrategyVolatilityReversalScalping',
+        ('RANGING', 'LOW_VOLATILITY'): 'StrategyMicroRangeScalping',
+        ('RANGING', 'TRANSITIONAL'): 'StrategyRangeBreakoutMomentum',
         
         # HIGH_VOLATILITY row (5-min high volatility)
-        ('HIGH_VOLATILITY', 'TRENDING'): ('StrategyHighVolatilityTrendRider', '1m'),
-        ('HIGH_VOLATILITY', 'RANGING'): ('StrategyVolatilityReversalScalping', '1m'),
-        ('HIGH_VOLATILITY', 'HIGH_VOLATILITY'): ('StrategyATRMomentumBreakout', '1m'),
-        ('HIGH_VOLATILITY', 'LOW_VOLATILITY'): ('StrategyVolatilityReversalScalping', '1m'),
-        ('HIGH_VOLATILITY', 'TRANSITIONAL'): ('StrategyVolatilityReversalScalping', '1m'),
+        ('HIGH_VOLATILITY', 'TRENDING'): 'StrategyHighVolatilityTrendRider',
+        ('HIGH_VOLATILITY', 'RANGING'): 'StrategyVolatilityReversalScalping',
+        ('HIGH_VOLATILITY', 'HIGH_VOLATILITY'): 'StrategyATRMomentumBreakout',
+        ('HIGH_VOLATILITY', 'LOW_VOLATILITY'): 'StrategyVolatilityReversalScalping',
+        ('HIGH_VOLATILITY', 'TRANSITIONAL'): 'StrategyVolatilityReversalScalping',
         
         # LOW_VOLATILITY row (5-min low volatility)
-        ('LOW_VOLATILITY', 'TRENDING'): ('StrategyVolatilitySqueezeBreakout', '1m'),
-        ('LOW_VOLATILITY', 'RANGING'): ('StrategyMicroRangeScalping', '1m'),
-        ('LOW_VOLATILITY', 'HIGH_VOLATILITY'): ('StrategyVolatilityReversalScalping', '1m'),
-        ('LOW_VOLATILITY', 'LOW_VOLATILITY'): ('StrategyMicroRangeScalping', '1m'),
-        ('LOW_VOLATILITY', 'TRANSITIONAL'): ('StrategyVolatilitySqueezeBreakout', '1m'),
+        ('LOW_VOLATILITY', 'TRENDING'): 'StrategyVolatilitySqueezeBreakout',
+        ('LOW_VOLATILITY', 'RANGING'): 'StrategyMicroRangeScalping',
+        ('LOW_VOLATILITY', 'HIGH_VOLATILITY'): 'StrategyVolatilityReversalScalping',
+        ('LOW_VOLATILITY', 'LOW_VOLATILITY'): 'StrategyMicroRangeScalping',
+        ('LOW_VOLATILITY', 'TRANSITIONAL'): 'StrategyVolatilitySqueezeBreakout',
         
         # TRANSITIONAL row (5-min transitional)
-        ('TRANSITIONAL', 'TRENDING'): ('StrategyAdaptiveTransitionalMomentum', '1m'),
-        ('TRANSITIONAL', 'RANGING'): ('StrategyVolatilitySqueezeBreakout', '1m'),
-        ('TRANSITIONAL', 'HIGH_VOLATILITY'): ('StrategyAdaptiveTransitionalMomentum', '1m'),
-        ('TRANSITIONAL', 'LOW_VOLATILITY'): ('StrategyVolatilitySqueezeBreakout', '1m'),
-        ('TRANSITIONAL', 'TRANSITIONAL'): ('StrategyAdaptiveTransitionalMomentum', '1m'),
+        ('TRANSITIONAL', 'TRENDING'): 'StrategyAdaptiveTransitionalMomentum',
+        ('TRANSITIONAL', 'RANGING'): 'StrategyVolatilitySqueezeBreakout',
+        ('TRANSITIONAL', 'HIGH_VOLATILITY'): 'StrategyAdaptiveTransitionalMomentum',
+        ('TRANSITIONAL', 'LOW_VOLATILITY'): 'StrategyVolatilitySqueezeBreakout',
+        ('TRANSITIONAL', 'TRANSITIONAL'): 'StrategyAdaptiveTransitionalMomentum',
     }
     
     # Alternative strategies for specific combinations (currently none - all combinations have definitive choices)
@@ -86,12 +345,21 @@ class StrategyMatrix:
         matrix_key = (market_5min, market_1min)
         
         if matrix_key in self.STRATEGY_MATRIX:
-            selected_strategy, execution_timeframe = self.STRATEGY_MATRIX[matrix_key]
+            selected_strategy = self.STRATEGY_MATRIX[matrix_key]
+            
+            # Get execution timeframe from risk profile
+            if selected_strategy in self.STRATEGY_RISK_PROFILES:
+                risk_profile = self.STRATEGY_RISK_PROFILES[selected_strategy]
+                execution_timeframe = risk_profile.execution_timeframe
+                description = risk_profile.description
+            else:
+                execution_timeframe = '1m'  # Default fallback
+                description = "Strategy description not available"
             
             # Build selection reason
             timeframe_reason = "5-min execution for stable trend-following" if execution_timeframe == '5m' else "1-min execution for precision and rapid response"
             
-            reason = f"Selected {selected_strategy} on {execution_timeframe} timeframe for {market_5min}(5m) + {market_1min}(1m). {timeframe_reason}"
+            reason = f"Selected {selected_strategy} on {execution_timeframe} timeframe for {market_5min}(5m) + {market_1min}(1m). {timeframe_reason}. {description}"
             
             self.logger.info(f"Strategy Matrix: {reason}")
             return selected_strategy, execution_timeframe, reason
@@ -102,6 +370,89 @@ class StrategyMatrix:
             reason = f"Unknown market combination {market_5min}(5m) + {market_1min}(1m). Using fallback: {fallback_strategy} on {fallback_timeframe}"
             self.logger.warning(f"Strategy Matrix: {reason}")
             return fallback_strategy, fallback_timeframe, reason
+
+    def get_strategy_risk_profile(self, strategy_name: str) -> Optional[StrategyRiskProfile]:
+        """
+        Get comprehensive risk profile for a strategy.
+        
+        Args:
+            strategy_name: Name of the strategy class
+            
+        Returns:
+            StrategyRiskProfile or None if not found
+        """
+        return self.STRATEGY_RISK_PROFILES.get(strategy_name)
+    
+    def get_all_strategy_profiles(self) -> Dict[str, StrategyRiskProfile]:
+        """
+        Get all strategy risk profiles.
+        
+        Returns:
+            Dictionary of all strategy risk profiles
+        """
+        return self.STRATEGY_RISK_PROFILES.copy()
+    
+    def get_strategies_by_factor(self, factor: str) -> List[str]:
+        """
+        Get strategies by factor exposure.
+        
+        Args:
+            factor: Factor type (momentum, mean_reversion, trend_following, etc.)
+            
+        Returns:
+            List of strategy names with that factor exposure
+        """
+        strategies = []
+        for name, profile in self.STRATEGY_RISK_PROFILES.items():
+            if profile.portfolio_tags.factor == factor:
+                strategies.append(name)
+        return strategies
+    
+    def get_strategies_by_correlation_group(self, correlation_group: str) -> List[str]:
+        """
+        Get strategies by correlation group.
+        
+        Args:
+            correlation_group: Correlation group identifier
+            
+        Returns:
+            List of strategy names in that correlation group
+        """
+        strategies = []
+        for name, profile in self.STRATEGY_RISK_PROFILES.items():
+            if profile.portfolio_tags.correlation_group == correlation_group:
+                strategies.append(name)
+        return strategies
+    
+    def get_max_concurrent_trades_for_strategy(self, strategy_name: str) -> int:
+        """
+        Get maximum concurrent trades allowed for a strategy.
+        
+        Args:
+            strategy_name: Name of the strategy
+            
+        Returns:
+            Maximum concurrent trades (default: 3)
+        """
+        profile = self.get_strategy_risk_profile(strategy_name)
+        return profile.trading_limits.max_concurrent_trades if profile else 3
+    
+    def validate_volatility_regime_for_strategy(self, strategy_name: str, current_volatility_pct: float) -> bool:
+        """
+        Validate if current volatility is suitable for the strategy.
+        
+        Args:
+            strategy_name: Name of the strategy
+            current_volatility_pct: Current market volatility percentage
+            
+        Returns:
+            True if volatility is within strategy's acceptable range
+        """
+        profile = self.get_strategy_risk_profile(strategy_name)
+        if not profile:
+            return True  # Allow if profile not found
+            
+        return profile.min_volatility_pct <= current_volatility_pct <= profile.max_volatility_pct
     
     def select_strategy(self, market_5min: str, market_1min: str) -> Tuple[str, str]:
         """
@@ -174,32 +525,68 @@ class StrategyMatrix:
         Get a summary of the entire strategy matrix for logging/debugging.
         
         Returns:
-            str: Formatted matrix summary with timeframes
+            str: Formatted matrix summary with timeframes and risk info
         """
-        summary = "Strategy Matrix Summary (with Execution Timeframes):\n"
-        summary += "=" * 80 + "\n"
+        summary = "Enhanced Strategy Matrix Summary (with Risk Profiles):\n"
+        summary += "=" * 100 + "\n"
         
         conditions = ['TRENDING', 'RANGING', 'HIGH_VOLATILITY', 'LOW_VOLATILITY', 'TRANSITIONAL']
         
         # Header
         summary += f"{'5min \\ 1min':<15}"
         for condition in conditions:
-            summary += f"{condition[:8]:<12}"
-        summary += "\n" + "-" * 80 + "\n"
+            summary += f"{condition[:8]:<14}"
+        summary += "\n" + "-" * 100 + "\n"
         
         # Matrix rows
         for row_condition in conditions:
             summary += f"{row_condition[:12]:<15}"
             for col_condition in conditions:
-                matrix_entry = self.STRATEGY_MATRIX.get((row_condition, col_condition), ('N/A', 'N/A'))
-                strategy, timeframe = matrix_entry
-                strategy_short = strategy.replace('Strategy', '').replace('VolatilityReversalScalping', 'VolRevScalp')[:8]
-                entry_display = f"{strategy_short}({timeframe})"
-                summary += f"{entry_display:<12}"
+                strategy_name = self.STRATEGY_MATRIX.get((row_condition, col_condition), 'N/A')
+                if strategy_name != 'N/A' and strategy_name in self.STRATEGY_RISK_PROFILES:
+                    profile = self.STRATEGY_RISK_PROFILES[strategy_name]
+                    strategy_short = strategy_name.replace('Strategy', '')[:8]
+                    timeframe = profile.execution_timeframe
+                    entry_display = f"{strategy_short}({timeframe})"
+                else:
+                    entry_display = "N/A"
+                summary += f"{entry_display:<14}"
             summary += "\n"
+        
+        summary += "\n" + "=" * 100 + "\n"
+        summary += "STRATEGY RISK PROFILE SUMMARY:\n"
+        summary += "=" * 100 + "\n"
+        
+        for strategy_name, profile in self.STRATEGY_RISK_PROFILES.items():
+            summary += f"\n{strategy_name}:\n"
+            summary += f"  Description: {profile.description}\n"
+            summary += f"  Timeframe: {profile.execution_timeframe}\n"
+            summary += f"  Stop Loss: {profile.stop_loss.mode} ({profile.stop_loss.atr_multiplier}x ATR | {profile.stop_loss.fixed_pct:.1%})\n"
+            summary += f"  Take Profit: {profile.take_profit.mode} {profile.take_profit.progressive_levels if profile.take_profit.mode == 'progressive_levels' else f'{profile.take_profit.fixed_pct:.1%}'}\n"
+            summary += f"  Position Sizing: {profile.position_sizing.mode} (Risk: {profile.position_sizing.risk_per_trade:.1%})\n"
+            summary += f"  Leverage Regime: Low={profile.leverage_by_regime.low}x, Normal={profile.leverage_by_regime.normal}x, High={profile.leverage_by_regime.high}x\n"
+            summary += f"  Max Trades: {profile.trading_limits.max_concurrent_trades} concurrent, {profile.trading_limits.max_per_symbol} per symbol\n"
+            summary += f"  Factor: {profile.portfolio_tags.factor}, Correlation Group: {profile.portfolio_tags.correlation_group}\n"
+            summary += f"  Volatility Range: {profile.min_volatility_pct:.1f}% - {profile.max_volatility_pct:.1f}%\n"
         
         summary += "\nTimeframe Legend:\n"
         summary += "5m = 5-minute execution (stable trend-following)\n"
         summary += "1m = 1-minute execution (precision scalping/breakouts)\n"
         
-        return summary 
+        return summary
+        
+    def get_portfolio_correlation_matrix(self) -> Dict[str, List[str]]:
+        """
+        Get correlation groups for portfolio risk management.
+        
+        Returns:
+            Dictionary mapping correlation groups to strategy lists
+        """
+        correlation_groups = {}
+        for strategy_name, profile in self.STRATEGY_RISK_PROFILES.items():
+            group = profile.portfolio_tags.correlation_group
+            if group not in correlation_groups:
+                correlation_groups[group] = []
+            correlation_groups[group].append(strategy_name)
+        
+        return correlation_groups 

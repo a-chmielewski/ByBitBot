@@ -13,3 +13,8 @@
 /strategies/Trending Market Strategies - BACKTEST/
 /strategies/Missing Strategies - BACKTEST/
 *.json
+/__pycache__
+/modules/__pycache__
+*.pyc
+implementation_plan.md
+MODULE_IMPLEMENTATION_PLAN.md

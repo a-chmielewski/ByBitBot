@@ -2,7 +2,7 @@ import os
 import importlib
 import json
 import logging # Import logging for the helper function
-from modules.logger import get_logger
+from modules.logger import get_logger, configure_logging_session, close_all_loggers
 from modules.exchange import ExchangeConnector
 from modules.data_fetcher import LiveDataFetcher
 from modules.order_manager import OrderManager, OrderExecutionError
@@ -11,7 +11,9 @@ from modules.market_analyzer import MarketAnalyzer, MarketAnalysisError
 from modules.strategy_matrix import StrategyMatrix
 from modules.session_manager import SessionManager
 from modules.real_time_monitor import RealTimeMonitor
-from modules.advanced_risk_manager import AdvancedRiskManager
+from modules.advanced_risk_manager import AdvancedRiskManager, EnforceResult, EnforceAction
+from modules.config_loader import StrategyConfigLoader, ConfigValidationError
+from modules.trailing_tp_handler import TrailingTPHandler, PositionState, OrderType
 from datetime import datetime, timezone
 import time
 import warnings
@@ -20,10 +22,17 @@ import pandas as pd
 from datetime import datetime, timedelta
 import re
 import atexit
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 # Import StrategyTemplate for type checking in dynamic_import_strategy
 from strategies.strategy_template import StrategyTemplate
+
+# Import risk utilities with fallback
+try:
+    from modules import risk_utilities
+    RISK_UTILITIES_AVAILABLE = True
+except ImportError:
+    RISK_UTILITIES_AVAILABLE = False
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
@@ -33,15 +42,22 @@ STRATEGY_DIR = 'strategies'
 # Global variables for cleanup
 session_manager = None
 real_time_monitor = None
+trailing_tp_handler = None
 
 
 def cleanup_on_exit():
     """Cleanup function to ensure proper shutdown of all components"""
-    global session_manager, real_time_monitor
+    global session_manager, real_time_monitor, trailing_tp_handler
     
     try:
+        if trailing_tp_handler:
+            trailing_tp_handler.stop_monitoring()
+            
         if real_time_monitor:
             real_time_monitor.stop_monitoring()
+            
+        # Close all logging handlers
+        close_all_loggers()
             
         if session_manager:
             # Export session data before ending sessions
@@ -82,6 +98,757 @@ def cleanup_on_exit():
 
 # Register cleanup function
 atexit.register(cleanup_on_exit)
+
+
+def enhanced_order_validation(
+    strategy_name: str,
+    symbol: str,
+    side: str,
+    entry_price: float,
+    base_size: float,
+    strategy_matrix: StrategyMatrix,
+    config_loader: StrategyConfigLoader,
+    market_analyzer: MarketAnalyzer,
+    risk_manager: AdvancedRiskManager,
+    exchange: ExchangeConnector,
+    account_equity: float,
+    open_positions: List[Dict[str, Any]],
+    logger: logging.Logger
+) -> Tuple[bool, Dict[str, Any], str]:
+    """
+    Enhanced order validation with comprehensive risk management integration.
+    
+    This function integrates all risk management components to validate and size orders:
+    1. Pull strategy config from strategy_matrix
+    2. Query MarketAnalyzer for volatility/market regime  
+    3. Compute SL/TP using RiskUtilities based on configured mode
+    4. Compute position size via vol_normalized or kelly_capped
+    5. Call AdvancedRiskManager.enforce_portfolio_limits to approve/scale/deny
+    6. Add trailing stop logic if enabled
+    7. Add defensive slippage guard
+    
+    Args:
+        strategy_name: Name of the strategy (e.g., 'StrategyATRMomentumBreakout')
+        symbol: Trading symbol (e.g., 'BTCUSDT')
+        side: Order side ('buy' or 'sell')
+        entry_price: Intended entry price
+        base_size: Base position size before risk adjustments
+        strategy_matrix: StrategyMatrix instance
+        config_loader: StrategyConfigLoader instance
+        market_analyzer: MarketAnalyzer instance  
+        risk_manager: AdvancedRiskManager instance
+        exchange: ExchangeConnector instance
+        account_equity: Current account equity
+        open_positions: List of currently open positions
+        logger: Logger instance
+        
+    Returns:
+        Tuple[bool, Dict[str, Any], str]: (approved, order_details, reason)
+        - approved: True if order is approved, False if denied
+        - order_details: Complete order details with computed values
+        - reason: Detailed reason for approval/denial
+    """
+    
+    logger.info(f"🔍 Enhanced Order Validation Starting for {strategy_name} on {symbol}")
+    logger.info(f"   Initial Parameters: side={side}, entry_price={entry_price}, base_size={base_size}")
+    
+    try:
+        # ===== STEP 1: Pull Strategy Configuration =====
+        logger.info("📋 Step 1: Loading strategy configuration...")
+        
+        try:
+            strategy_config = config_loader.get_strategy_config(strategy_name)
+            risk_config = strategy_config['strategy_configs'][strategy_name]['risk_management']
+            portfolio_config = strategy_config['strategy_configs'][strategy_name]['portfolio']
+            trading_limits = strategy_config['strategy_configs'][strategy_name]['trading_limits']
+            
+            logger.info(f"✅ Strategy config loaded:")
+            logger.info(f"   Stop Loss Mode: {risk_config['stop_loss_mode']}")
+            logger.info(f"   Take Profit Mode: {risk_config['take_profit_mode']}")
+            logger.info(f"   Position Sizing Mode: {risk_config['position_sizing_mode']}")
+            logger.info(f"   Factor: {portfolio_config['factor']}")
+            logger.info(f"   Max Concurrent: {trading_limits['max_concurrent_trades']}")
+            
+        except ConfigValidationError as e:
+            return False, {}, f"Strategy configuration loading failed: {str(e)}"
+        
+        # ===== STEP 2: Query Market Conditions =====
+        logger.info("📊 Step 2: Analyzing market conditions...")
+        
+        try:
+            # Get volatility regime and market conditions
+            current_volatility_pct = market_analyzer.get_atr_pct(symbol)
+            volatility_regime = market_analyzer.get_vol_regime(symbol)
+            market_regime = market_analyzer.get_market_regime(symbol)
+            
+            logger.info(f"✅ Market conditions analyzed:")
+            logger.info(f"   Current Volatility: {current_volatility_pct:.2f}%")
+            logger.info(f"   Volatility Regime: {volatility_regime}")
+            logger.info(f"   Market Regime: {market_regime}")
+            
+            # Validate strategy is suitable for current conditions
+            market_conditions = {
+                'volatility_pct': current_volatility_pct,
+                'volatility_regime': volatility_regime,
+                'market_regime': market_regime
+            }
+            
+            # Check if strategy is suitable for current volatility
+            risk_profile = strategy_matrix.get_strategy_risk_profile(strategy_name)
+            if risk_profile:
+                min_vol = risk_profile.min_volatility_pct
+                max_vol = risk_profile.max_volatility_pct
+                if not (min_vol <= current_volatility_pct <= max_vol):
+                    return False, {}, f"Current volatility {current_volatility_pct:.2f}% outside strategy range [{min_vol:.1f}%, {max_vol:.1f}%]"
+            
+        except Exception as e:
+            logger.warning(f"⚠️  Market analysis failed, using defaults: {e}")
+            current_volatility_pct = 1.0
+            volatility_regime = 'normal'
+            market_regime = 'unknown'
+        
+        # ===== STEP 3: Compute Stop Loss and Take Profit =====
+        logger.info("🛡️  Step 3: Computing stop loss and take profit levels...")
+        
+        sl_price = None
+        tp_prices = []
+        
+        if RISK_UTILITIES_AVAILABLE:
+            try:
+                # Get current market data for ATR calculation
+                current_data = market_analyzer._get_cached_data(symbol, '1m', min_periods=50)
+                
+                if current_data is not None and len(current_data) > 20:
+                    # Calculate ATR for dynamic stop loss
+                    atr_period = risk_config.get('atr_period', 14)
+                    atr_series = risk_utilities.compute_atr(current_data, period=atr_period)
+                    current_atr = atr_series.iloc[-1] if not atr_series.empty else entry_price * 0.02
+                    
+                    # Compute stop loss based on mode
+                    if risk_config['stop_loss_mode'] == 'atr_mult':
+                        atr_mult = risk_config['stop_loss_atr_multiplier']
+                        stop_levels = risk_utilities.atr_stop_levels(
+                            entry_price=entry_price,
+                            side=side,
+                            atr=current_atr,
+                            atr_mult_sl=atr_mult,
+                            atr_mult_tp=risk_config.get('take_profit_atr_multiplier', 2.0)
+                        )
+                        sl_price = stop_levels['stop_loss']
+                        
+                        logger.info(f"   ATR-based SL: {sl_price:.6f} (ATR: {current_atr:.6f}, Mult: {atr_mult}x)")
+                        
+                    else:  # fixed_pct mode
+                        sl_pct = risk_config['stop_loss_fixed_pct']
+                        if side.lower() == 'buy':
+                            sl_price = entry_price * (1 - sl_pct)
+                        else:
+                            sl_price = entry_price * (1 + sl_pct)
+                            
+                        logger.info(f"   Fixed % SL: {sl_price:.6f} ({sl_pct:.1%})")
+                    
+                    # Compute take profit based on mode
+                    if risk_config['take_profit_mode'] == 'progressive_levels':
+                        tp_levels = risk_config['take_profit_progressive_levels']
+                        tp_prices = risk_utilities.progressive_take_profit_levels(
+                            entry_price=entry_price,
+                            side=side,
+                            levels=tp_levels
+                        )
+                        
+                        logger.info(f"   Progressive TP levels: {[f'{p:.6f}' for p in tp_prices]}")
+                        
+                    else:  # fixed_pct mode
+                        tp_pct = risk_config['take_profit_fixed_pct']
+                        if side.lower() == 'buy':
+                            tp_price = entry_price * (1 + tp_pct)
+                        else:
+                            tp_price = entry_price * (1 - tp_pct)
+                        tp_prices = [tp_price]
+                        
+                        logger.info(f"   Fixed % TP: {tp_price:.6f} ({tp_pct:.1%})")
+                
+                else:
+                    raise ValueError("Insufficient market data for ATR calculation")
+                    
+            except Exception as e:
+                logger.warning(f"⚠️  RiskUtilities calculation failed, using fallback: {e}")
+                # Fallback to simple percentage-based calculation
+                sl_pct = risk_config.get('stop_loss_fixed_pct', 0.02)
+                tp_pct = risk_config.get('take_profit_fixed_pct', 0.04)
+                
+                if side.lower() == 'buy':
+                    sl_price = entry_price * (1 - sl_pct)
+                    tp_prices = [entry_price * (1 + tp_pct)]
+                else:
+                    sl_price = entry_price * (1 + sl_pct)
+                    tp_prices = [entry_price * (1 - tp_pct)]
+                    
+                logger.info(f"   Fallback SL: {sl_price:.6f}, TP: {tp_prices[0]:.6f}")
+        
+        else:
+            # No risk utilities available, use simple percentage-based approach
+            logger.warning("⚠️  RiskUtilities not available, using simple percentage calculation")
+            sl_pct = risk_config.get('stop_loss_fixed_pct', 0.02)
+            tp_pct = risk_config.get('take_profit_fixed_pct', 0.04)
+            
+            if side.lower() == 'buy':
+                sl_price = entry_price * (1 - sl_pct)
+                tp_prices = [entry_price * (1 + tp_pct)]
+            else:
+                sl_price = entry_price * (1 + sl_pct)
+                tp_prices = [entry_price * (1 - tp_pct)]
+        
+        # ===== STEP 4: Compute Dynamic Position Size =====
+        logger.info("📏 Step 4: Computing dynamic position size...")
+        
+        adjusted_size = base_size
+        sizing_mode = risk_config['position_sizing_mode']
+        
+        if RISK_UTILITIES_AVAILABLE and sl_price:
+            try:
+                if sizing_mode == 'vol_normalized':
+                    # Volatility-normalized sizing
+                    risk_per_trade = risk_config['position_risk_per_trade']
+                    
+                    # Calculate ATR if not already done
+                    if 'current_atr' not in locals():
+                        current_data = market_analyzer._get_cached_data(symbol, '1m', min_periods=50)
+                        if current_data is not None:
+                            atr_series = risk_utilities.compute_atr(current_data, period=14)
+                            current_atr = atr_series.iloc[-1] if not atr_series.empty else entry_price * 0.02
+                        else:
+                            current_atr = entry_price * 0.02
+                    
+                    tick_value = risk_config.get('tick_value', 0.01)
+                    
+                    adjusted_size = risk_utilities.position_size_vol_normalized(
+                        account_equity=account_equity,
+                        risk_per_trade=risk_per_trade,
+                        atr=current_atr,
+                        tick_value=tick_value
+                    )
+                    
+                    logger.info(f"   Vol-normalized size: {adjusted_size:.6f} (Risk: {risk_per_trade:.1%}, ATR: {current_atr:.6f})")
+                    
+                elif sizing_mode == 'kelly_capped':
+                    # Kelly criterion with cap
+                    kelly_cap = risk_config['kelly_cap']
+                    
+                    # Estimate edge and win probability (simplified)
+                    # In production, this should use historical strategy performance
+                    estimated_edge = 0.05  # 5% edge assumption
+                    estimated_win_prob = 0.55  # 55% win rate assumption
+                    
+                    kelly_fraction = risk_utilities.kelly_fraction_capped(
+                        edge=estimated_edge,
+                        win_prob=estimated_win_prob,
+                        cap=kelly_cap
+                    )
+                    
+                    # Calculate position size based on Kelly fraction
+                    risk_amount = account_equity * kelly_fraction
+                    stop_distance = abs(entry_price - sl_price) / entry_price
+                    adjusted_size = risk_amount / (stop_distance * entry_price) if stop_distance > 0 else base_size
+                    
+                    logger.info(f"   Kelly-capped size: {adjusted_size:.6f} (Kelly: {kelly_fraction:.1%}, Edge: {estimated_edge:.1%})")
+                    
+                else:  # fixed_notional
+                    fixed_notional = risk_config['position_fixed_notional']
+                    adjusted_size = fixed_notional / entry_price
+                    
+                    logger.info(f"   Fixed notional size: {adjusted_size:.6f} (${fixed_notional})")
+                    
+            except Exception as e:
+                logger.warning(f"⚠️  Dynamic sizing failed, using base size: {e}")
+                adjusted_size = base_size
+        
+        # Apply leverage adjustment based on volatility regime
+        leverage_config = risk_config['leverage_by_regime']
+        regime_multiplier = leverage_config.get(volatility_regime, 1.0)
+        adjusted_size *= regime_multiplier
+        
+        logger.info(f"   Size after regime adjustment ({volatility_regime}): {adjusted_size:.6f} (×{regime_multiplier})")
+        
+        # Apply max position size cap
+        max_position_pct = risk_config['max_position_pct']
+        max_size = (account_equity * max_position_pct / 100) / entry_price
+        if adjusted_size > max_size:
+            adjusted_size = max_size
+            logger.info(f"   Size capped at max position limit: {adjusted_size:.6f} ({max_position_pct}% of equity)")
+        
+        # ===== STEP 5: Portfolio Risk Manager Validation =====
+        logger.info("🏛️  Step 5: Portfolio risk manager validation...")
+        
+        try:
+            # Prepare candidate order for risk manager
+            # Convert buy/sell to long/short for risk manager
+            position_side = 'long' if side.lower() == 'buy' else 'short'
+            
+            candidate_order = {
+                'symbol': symbol,
+                'side': position_side,
+                'size': adjusted_size,
+                'entry_price': entry_price,  # Use entry_price key name expected by risk manager
+                'strategy': strategy_name,
+                'factor': portfolio_config['factor'],
+                'correlation_group': portfolio_config['correlation_group']
+            }
+            
+            # Get current account state
+            account_state = {
+                'equity': account_equity,
+                'available_balance': account_equity * 0.8,  # Simplified assumption
+                'timestamp': datetime.now(timezone.utc)
+            }
+            
+            # Call portfolio risk manager
+            enforce_result = risk_manager.enforce_portfolio_limits(
+                account_state=account_state,
+                open_positions=open_positions,
+                candidate_order=candidate_order
+            )
+            
+            logger.info(f"   Portfolio risk result: {enforce_result.action}")
+            logger.info(f"   Reason: {enforce_result.reason}")
+            
+            if enforce_result.action == EnforceAction.DENY:
+                return False, {}, f"Portfolio risk manager denied: {enforce_result.reason}"
+            
+            elif enforce_result.action == EnforceAction.SCALE_DOWN:
+                if enforce_result.scaled_size:
+                    adjusted_size = enforce_result.scaled_size
+                    logger.info(f"   Size scaled down to: {adjusted_size:.6f}")
+            
+            elif enforce_result.action == EnforceAction.DEFER:
+                return False, {}, f"Portfolio risk manager deferred: {enforce_result.reason}"
+                
+        except Exception as e:
+            logger.warning(f"⚠️  Portfolio risk validation failed, proceeding with caution: {e}")
+        
+        # ===== STEP 6: Slippage and Spread Guards =====
+        logger.info("🛡️  Step 6: Checking slippage and spread guards...")
+        
+        try:
+            # Get current market data for spread analysis
+            ticker = exchange.get_ticker(symbol)
+            if ticker and 'bid' in ticker and 'ask' in ticker:
+                bid = float(ticker['bid'])
+                ask = float(ticker['ask'])
+                spread = (ask - bid) / ((ask + bid) / 2) * 100  # Spread in percentage
+                
+                # Check spread guard
+                spread_config = risk_config.get('spread_slippage_guard', {})
+                if spread_config.get('enabled', True):
+                    max_spread_pct = spread_config.get('max_spread_pct', 0.1)  # 0.1% default
+                    
+                    if spread > max_spread_pct:
+                        return False, {}, f"Spread too wide: {spread:.4f}% > {max_spread_pct:.4f}% limit"
+                    
+                    # Estimate slippage based on order size and current spread
+                    estimated_slippage = min(spread * 0.5, 0.05)  # Simplified slippage estimation
+                    max_slippage_pct = spread_config.get('max_slippage_pct', 0.2)  # 0.2% default
+                    
+                    if estimated_slippage > max_slippage_pct:
+                        return False, {}, f"Estimated slippage too high: {estimated_slippage:.4f}% > {max_slippage_pct:.4f}% limit"
+                
+                logger.info(f"✅ Spread/slippage check passed: spread={spread:.4f}%")
+            
+        except Exception as e:
+            logger.warning(f"⚠️  Spread analysis failed, proceeding with caution: {e}")
+        
+        # ===== STEP 7: Prepare Final Order Details =====
+        logger.info("📋 Step 7: Preparing final order details...")
+        
+        # Calculate percentages for OrderManager compatibility
+        sl_pct = abs(entry_price - sl_price) / entry_price if sl_price else 0.02
+        tp_pct = abs(tp_prices[0] - entry_price) / entry_price if tp_prices else 0.04
+        
+        order_details = {
+            'symbol': symbol,
+            'side': side,
+            'size': adjusted_size,
+            'price': entry_price,
+            'order_type': 'market',  # Can be overridden by caller
+            'sl_pct': sl_pct,
+            'tp_pct': tp_pct,
+            'sl_price': sl_price,
+            'tp_prices': tp_prices,
+            'strategy_name': strategy_name,
+            'volatility_regime': volatility_regime,
+            'market_regime': market_regime,
+            'sizing_mode': sizing_mode,
+            'original_size': base_size,
+            'size_adjustment_reason': f"Risk-adjusted from {base_size:.6f} to {adjusted_size:.6f}",
+            
+            # Trailing stop configuration
+            'trailing_stop_enabled': risk_config.get('trailing_stop_enabled', False),
+            'trailing_stop_mode': risk_config.get('trailing_stop_mode', 'price_pct'),
+            'trailing_stop_offset_pct': risk_config.get('trailing_stop_offset_pct', 0.015),
+            'trailing_stop_atr_multiplier': risk_config.get('trailing_stop_atr_multiplier', 1.5),
+            
+            # Risk parameters for logging/monitoring
+            'risk_metadata': {
+                'strategy_factor': portfolio_config['factor'],
+                'correlation_group': portfolio_config['correlation_group'],
+                'volatility_pct': current_volatility_pct,
+                'atr_used': locals().get('current_atr', 0),
+                'regime_multiplier': regime_multiplier,
+                'portfolio_approved': True
+            }
+        }
+        
+        success_reason = (
+            f"Order validated successfully: "
+            f"Size {base_size:.6f}→{adjusted_size:.6f} ({sizing_mode}), "
+            f"SL {sl_pct:.1%}, TP {tp_pct:.1%}, "
+            f"Regime: {volatility_regime}, "
+            f"Factor: {portfolio_config['factor']}"
+        )
+        
+        logger.info("✅ Enhanced order validation completed successfully")
+        logger.info(f"   Final size: {adjusted_size:.6f}")
+        logger.info(f"   Stop loss: {sl_price:.6f} ({sl_pct:.1%})")
+        logger.info(f"   Take profit: {tp_prices[0]:.6f} ({tp_pct:.1%})" if tp_prices else "   Take profit: Not set")
+        logger.info(f"   Risk metadata: {order_details['risk_metadata']}")
+        
+        return True, order_details, success_reason
+        
+    except Exception as e:
+        error_msg = f"Enhanced order validation failed with error: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return False, {}, error_msg
+
+
+def enhanced_order_placement_with_validation(
+    strategy_name: str,
+    entry_signal: Dict[str, Any],
+    symbol: str,
+    strategy_matrix: StrategyMatrix,
+    config_loader: StrategyConfigLoader,
+    market_analyzer: MarketAnalyzer,
+    risk_manager: AdvancedRiskManager,
+    order_manager: OrderManager,
+    exchange: ExchangeConnector,
+    account_equity: float,
+    open_positions: List[Dict[str, Any]],
+    logger: logging.Logger,
+    trailing_handler: Optional[TrailingTPHandler] = None
+) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+    """
+    Enhanced order placement that uses comprehensive risk validation before submitting orders.
+    
+    This function wraps the enhanced_order_validation and integrates with OrderManager
+    to provide a complete order placement pipeline with all risk checks.
+    
+    Args:
+        strategy_name: Name of the strategy
+        entry_signal: Entry signal from strategy (contains side, price, size, etc.)
+        symbol: Trading symbol
+        strategy_matrix: StrategyMatrix instance
+        config_loader: StrategyConfigLoader instance
+        market_analyzer: MarketAnalyzer instance
+        risk_manager: AdvancedRiskManager instance
+        order_manager: OrderManager instance
+        exchange: ExchangeConnector instance
+        account_equity: Current account equity
+        open_positions: List of open positions
+        logger: Logger instance
+        
+    Returns:
+        Tuple[bool, Optional[Dict[str, Any]], str]: (success, order_responses, reason)
+    """
+    
+    logger.info(f"🚀 Enhanced Order Placement Starting for {strategy_name}")
+    logger.info(f"   Entry Signal: {entry_signal}")
+    
+    try:
+        # Extract basic parameters from entry signal
+        side = entry_signal.get('side')
+        entry_price = entry_signal.get('price')
+        base_size = entry_signal.get('size')
+        order_type = entry_signal.get('order_type', 'market')
+        
+        if not all([side, base_size]):
+            return False, None, "Missing required parameters in entry signal (side, size)"
+        
+        # Use current market price if no price specified (for market orders)
+        if not entry_price:
+            try:
+                ticker = exchange.get_ticker(symbol)
+                if ticker and 'last' in ticker:
+                    entry_price = float(ticker['last'])
+                    logger.info(f"Using current market price: {entry_price}")
+                else:
+                    return False, None, "Could not determine entry price and none provided"
+            except Exception as e:
+                return False, None, f"Failed to get market price: {str(e)}"
+        
+        # ===== STEP 1: Enhanced Order Validation =====
+        logger.info("🔍 Running enhanced order validation...")
+        
+        approved, validated_order_details, validation_reason = enhanced_order_validation(
+            strategy_name=strategy_name,
+            symbol=symbol,
+            side=side,
+            entry_price=entry_price,
+            base_size=base_size,
+            strategy_matrix=strategy_matrix,
+            config_loader=config_loader,
+            market_analyzer=market_analyzer,
+            risk_manager=risk_manager,
+            exchange=exchange,
+            account_equity=account_equity,
+            open_positions=open_positions,
+            logger=logger
+        )
+        
+        if not approved:
+            logger.warning(f"❌ Order validation failed: {validation_reason}")
+            return False, None, f"Order validation failed: {validation_reason}"
+        
+        logger.info(f"✅ Order validation passed: {validation_reason}")
+        
+        # ===== STEP 2: Create Final Order Parameters =====
+        logger.info("📋 Preparing final order parameters...")
+        
+        # Merge original entry signal with validated parameters
+        final_order_params = entry_signal.copy()
+        
+        # Override with validated values
+        final_order_params.update({
+            'size': validated_order_details['size'],
+            'sl_pct': validated_order_details['sl_pct'],
+            'tp_pct': validated_order_details['tp_pct'],
+            'order_type': order_type,  # Preserve original order type
+            'price': entry_price if order_type != 'market' else None
+        })
+        
+        # Add enhanced risk metadata for monitoring
+        final_order_params['risk_metadata'] = validated_order_details['risk_metadata']
+        final_order_params['validation_details'] = {
+            'strategy_name': strategy_name,
+            'original_size': base_size,
+            'final_size': validated_order_details['size'],
+            'sizing_mode': validated_order_details['sizing_mode'],
+            'volatility_regime': validated_order_details['volatility_regime'],
+            'market_regime': validated_order_details['market_regime']
+        }
+        
+        logger.info(f"Final order parameters prepared:")
+        logger.info(f"   Size: {base_size:.6f} → {validated_order_details['size']:.6f}")
+        logger.info(f"   Stop Loss: {validated_order_details['sl_pct']:.1%}")
+        logger.info(f"   Take Profit: {validated_order_details['tp_pct']:.1%}")
+        logger.info(f"   Sizing Mode: {validated_order_details['sizing_mode']}")
+        logger.info(f"   Market Regime: {validated_order_details['market_regime']}")
+        
+        # ===== STEP 3: Execute Order via OrderManager =====
+        logger.info("📤 Executing order via OrderManager...")
+        
+        try:
+            order_responses = order_manager.place_order_with_risk(
+                symbol=symbol,
+                side=final_order_params['side'],
+                order_type=final_order_params.get('order_type', 'market'),
+                size=final_order_params['size'],
+                signal_price=final_order_params.get('price'),
+                sl_pct=final_order_params['sl_pct'],
+                tp_pct=final_order_params['tp_pct'],
+                params=final_order_params.get('params'),
+                reduce_only=final_order_params.get('reduce_only', False),
+                time_in_force=final_order_params.get('time_in_force', 'GoodTillCancel')
+            )
+            
+            logger.info("✅ Order executed successfully via OrderManager")
+            logger.info(f"   Order responses: {order_responses}")
+            
+            # ===== STEP 4: Initialize Trailing TP Tracking =====
+            if trailing_handler and order_responses and 'main_order' in order_responses:
+                try:
+                    main_order = order_responses['main_order']['result']
+                    entry_order_id = main_order.get('orderId')
+                    
+                    if entry_order_id:
+                        # Prepare TP levels for trailing handler
+                        tp_levels_config = []
+                        if validated_order_details['tp_prices']:
+                            for i, tp_price in enumerate(validated_order_details['tp_prices']):
+                                tp_levels_config.append({
+                                    'level': i + 1,
+                                    'price': tp_price,
+                                    'size_pct': 0.4 if i == 0 else (0.4 if i == 1 else 0.2)  # 40/40/20 split
+                                })
+                        
+                        # Prepare trailing config
+                        trailing_config = {
+                            'enabled': validated_order_details.get('trailing_stop_enabled', False),
+                            'initial_offset_pct': validated_order_details.get('trailing_stop_offset_pct', 0.02),
+                            'tightened_offset_pct': validated_order_details.get('trailing_stop_offset_pct', 0.015)
+                        }
+                        
+                        # Create position tracking
+                        position_id = trailing_handler.create_position(
+                            symbol=symbol,
+                            side=final_order_params['side'],
+                            entry_price=entry_price,
+                            position_size=validated_order_details['size'],
+                            strategy_name=strategy_name,
+                            tp_levels=tp_levels_config,
+                            trailing_config=trailing_config,
+                            stop_loss_pct=validated_order_details['sl_pct'],
+                            session_id=validated_order_details.get('session_id', '')
+                        )
+                        
+                        # Register entry order for fill monitoring
+                        trailing_handler.order_to_symbol[entry_order_id] = symbol
+                        trailing_handler.order_to_type[entry_order_id] = OrderType.ENTRY
+                        
+                        logger.info(f"✅ Position tracking created for {symbol} with trailing TP handler")
+                        logger.info(f"   TP Levels: {len(tp_levels_config)}, Trailing: {'enabled' if trailing_config['enabled'] else 'disabled'}")
+                        
+                except Exception as tracking_error:
+                    logger.warning(f"Failed to initialize trailing TP tracking: {tracking_error}")
+                    # Continue without tracking - order was still placed successfully
+            
+            # Log the comprehensive trade details for monitoring
+            logger.info("📊 Trade Execution Summary:")
+            logger.info(f"   Strategy: {strategy_name}")
+            logger.info(f"   Symbol: {symbol}")
+            logger.info(f"   Side: {side}")
+            logger.info(f"   Size: {validated_order_details['size']:.6f}")
+            logger.info(f"   Entry Price: {entry_price}")
+            logger.info(f"   Stop Loss: {validated_order_details['sl_price']:.6f} ({validated_order_details['sl_pct']:.1%})")
+            logger.info(f"   Take Profit: {validated_order_details['tp_prices'][0]:.6f} ({validated_order_details['tp_pct']:.1%})" if validated_order_details['tp_prices'] else "   Take Profit: Not set")
+            logger.info(f"   Volatility Regime: {validated_order_details['volatility_regime']}")
+            logger.info(f"   Portfolio Factor: {validated_order_details['risk_metadata']['strategy_factor']}")
+            logger.info(f"   Correlation Group: {validated_order_details['risk_metadata']['correlation_group']}")
+            
+            success_message = (
+                f"Enhanced order placement successful: "
+                f"{strategy_name} on {symbol}, "
+                f"Size: {validated_order_details['size']:.6f}, "
+                f"SL: {validated_order_details['sl_pct']:.1%}, "
+                f"TP: {validated_order_details['tp_pct']:.1%}, "
+                f"Regime: {validated_order_details['volatility_regime']}"
+            )
+            
+            return True, order_responses, success_message
+            
+        except OrderExecutionError as oe:
+            error_msg = f"OrderManager execution failed: {str(oe)}"
+            logger.error(error_msg)
+            return False, None, error_msg
+            
+        except Exception as e:
+            error_msg = f"Unexpected error during order execution: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            return False, None, error_msg
+    
+    except Exception as e:
+        error_msg = f"Enhanced order placement failed: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return False, None, error_msg
+
+
+def dry_run_enhanced_order_validation_demo(
+    logger: logging.Logger,
+    strategy_matrix: StrategyMatrix,
+    config_loader: StrategyConfigLoader,
+    market_analyzer: MarketAnalyzer,
+    risk_manager: AdvancedRiskManager,
+    exchange: ExchangeConnector
+) -> None:
+    """
+    Dry-run demonstration of enhanced order validation showing all computed values.
+    
+    This function demonstrates the complete enhanced risk management pipeline
+    without placing actual orders, logging all intermediate values and decisions.
+    """
+    
+    logger.info("🧪 ENHANCED ORDER VALIDATION DRY-RUN DEMONSTRATION")
+    logger.info("=" * 80)
+    
+    try:
+        # Demo parameters
+        demo_strategy = 'StrategyATRMomentumBreakout'
+        demo_symbol = 'BTCUSDT'
+        demo_side = 'buy'
+        demo_entry_price = 45000.0
+        demo_base_size = 0.01
+        demo_account_equity = 10000.0
+        demo_open_positions = []
+        
+        logger.info("📋 DEMO PARAMETERS:")
+        logger.info(f"   Strategy: {demo_strategy}")
+        logger.info(f"   Symbol: {demo_symbol}")
+        logger.info(f"   Side: {demo_side}")
+        logger.info(f"   Entry Price: ${demo_entry_price:,.2f}")
+        logger.info(f"   Base Size: {demo_base_size}")
+        logger.info(f"   Account Equity: ${demo_account_equity:,.2f}")
+        logger.info("")
+        
+        # Run enhanced order validation
+        approved, order_details, reason = enhanced_order_validation(
+            strategy_name=demo_strategy,
+            symbol=demo_symbol,
+            side=demo_side,
+            entry_price=demo_entry_price,
+            base_size=demo_base_size,
+            strategy_matrix=strategy_matrix,
+            config_loader=config_loader,
+            market_analyzer=market_analyzer,
+            risk_manager=risk_manager,
+            exchange=exchange,
+            account_equity=demo_account_equity,
+            open_positions=demo_open_positions,
+            logger=logger
+        )
+        
+        logger.info("🏁 DRY-RUN RESULTS:")
+        logger.info("=" * 80)
+        
+        if approved:
+            logger.info("✅ ORDER APPROVED")
+            logger.info(f"   Reason: {reason}")
+            logger.info("")
+            logger.info("📊 FINAL ORDER DETAILS:")
+            logger.info(f"   Symbol: {order_details['symbol']}")
+            logger.info(f"   Side: {order_details['side']}")
+            logger.info(f"   Original Size: {order_details['original_size']:.6f}")
+            logger.info(f"   Final Size: {order_details['size']:.6f}")
+            logger.info(f"   Size Adjustment: {order_details['size_adjustment_reason']}")
+            logger.info(f"   Entry Price: ${demo_entry_price:,.2f}")
+            logger.info(f"   Stop Loss: ${order_details['sl_price']:.2f} ({order_details['sl_pct']:.1%})")
+            logger.info(f"   Take Profit: ${order_details['tp_prices'][0]:.2f} ({order_details['tp_pct']:.1%})" if order_details['tp_prices'] else "   Take Profit: Not set")
+            logger.info("")
+            logger.info("🎯 RISK METADATA:")
+            metadata = order_details['risk_metadata']
+            logger.info(f"   Strategy Factor: {metadata['strategy_factor']}")
+            logger.info(f"   Correlation Group: {metadata['correlation_group']}")
+            logger.info(f"   Volatility: {metadata['volatility_pct']:.2f}%")
+            logger.info(f"   ATR Used: {metadata['atr_used']:.6f}")
+            logger.info(f"   Regime Multiplier: {metadata['regime_multiplier']:.2f}x")
+            logger.info(f"   Portfolio Approved: {metadata['portfolio_approved']}")
+            logger.info("")
+            logger.info("⚙️  VALIDATION DETAILS:")
+            validation = order_details.get('validation_details', {})
+            logger.info(f"   Sizing Mode: {order_details['sizing_mode']}")
+            logger.info(f"   Volatility Regime: {order_details['volatility_regime']}")
+            logger.info(f"   Market Regime: {order_details['market_regime']}")
+            logger.info(f"   Trailing Stop Enabled: {order_details['trailing_stop_enabled']}")
+            
+        else:
+            logger.warning("❌ ORDER DENIED")
+            logger.warning(f"   Reason: {reason}")
+        
+        logger.info("")
+        logger.info("🧪 DRY-RUN DEMONSTRATION COMPLETED")
+        logger.info("   No actual orders were placed - this was a validation test only")
+        logger.info("=" * 80)
+        
+    except Exception as e:
+        logger.error(f"❌ DRY-RUN DEMONSTRATION FAILED: {str(e)}", exc_info=True)
+        logger.info("=" * 80)
 
 
 def convert_strategy_class_to_module_name(strategy_class_name: str) -> str:
@@ -577,6 +1344,11 @@ def restart_configuration_with_new_strategy(new_strategy_name, available_strateg
         selected_timeframe = select_timeframe(analysis_results, selected_symbol, bot_logger)
         selected_leverage = select_leverage(bot_logger)
         
+        # RECONFIGURE LOGGING FOR NEW SYMBOL
+        bot_logger.info("🔄 Reconfiguring logging for strategy change...")
+        configure_logging_session(selected_symbol)
+        bot_logger.info(f"✅ Logging reconfigured for new symbol: {selected_symbol}")
+        
         # Get strategy parameters
         strategy_params = get_strategy_parameters(StratClass.__name__)
         
@@ -636,11 +1408,20 @@ def restart_configuration_with_new_strategy(new_strategy_name, available_strateg
         bot_logger.error(f"Error during strategy reconfiguration: {e}", exc_info=True)
         bot_logger.error("Strategy change failed - bot will shut down")
 
-def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, data_fetcher, order_manager, perf_tracker, exchange, config, bot_logger):
+def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, data_fetcher, order_manager, perf_tracker, exchange, config, bot_logger, strategy_matrix=None, config_loader=None, market_analyzer=None, risk_manager=None):
     """
     Main trading loop that can be reused for strategy changes.
+    Enhanced with comprehensive risk management integration.
     """
-    bot_logger.info("Entering main trading loop.")
+    bot_logger.info("Entering enhanced main trading loop.")
+    
+    # Check if enhanced risk management components are available
+    enhanced_risk_available = all([strategy_matrix, config_loader, market_analyzer, risk_manager])
+    if enhanced_risk_available:
+        bot_logger.info("✅ Enhanced risk management components available")
+    else:
+        bot_logger.warning("⚠️  Some enhanced risk management components missing - enhanced order validation will be limited")
+        bot_logger.warning(f"   Available: strategy_matrix={strategy_matrix is not None}, config_loader={config_loader is not None}, market_analyzer={market_analyzer is not None}, risk_manager={risk_manager is not None}")
     
     # Get available strategies for potential reselection
     available_strategies = list_strategies()
@@ -748,57 +1529,123 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                 # The OrderManager will calculate absolute SL/TP prices based on actual fill price.
                 # The old block for recalculating SL/TP if not in order_details is removed.
 
-                bot_logger.info(f"Order signal: {order_details}") # Log details before sending to OrderManager
+                bot_logger.info(f"Order signal: {order_details}") # Log details before sending to Enhanced Order Placement
 
+                # ===== ENHANCED ORDER PLACEMENT WITH COMPREHENSIVE RISK MANAGEMENT =====
                 try:
-                    order_responses = order_manager.place_order_with_risk(
-                     symbol=symbol,
-                     side=order_details['side'],
-                     order_type=order_details.get('order_type', 'market'),
-                     size=order_details['size'],
-                     signal_price=order_details.get('price'), # Price at the time of signal generation
-                     sl_pct=order_details['sl_pct'],
-                     tp_pct=order_details['tp_pct'],
-                     params=order_details.get('params'), # Pass any extra params from strategy
-                     reduce_only=order_details.get('reduce_only', False),
-                     time_in_force=order_details.get('time_in_force', 'GoodTillCancel')
+                    # Get current account equity for risk calculations
+                    try:
+                        balance_info = exchange.get_balance()
+                        account_equity = float(balance_info.get('totalEquity', 10000))  # Default fallback
+                    except Exception as balance_error:
+                        bot_logger.warning(f"Could not get account equity: {balance_error}, using default 10000")
+                        account_equity = 10000.0
+                    
+                    # Get current open positions
+                    try:
+                        positions = exchange.get_positions()
+                        open_positions = [pos for pos in positions if float(pos.get('size', 0)) != 0]
+                    except Exception as pos_error:
+                        bot_logger.warning(f"Could not get positions: {pos_error}, using empty list")
+                        open_positions = []
+                    
+                    # Use enhanced order placement with validation
+                    success, order_responses, placement_reason = enhanced_order_placement_with_validation(
+                        strategy_name=type(strat).__name__,
+                        entry_signal=order_details,
+                        symbol=symbol,
+                        strategy_matrix=strategy_matrix,
+                        config_loader=config_loader,
+                        market_analyzer=market_analyzer,
+                        risk_manager=risk_manager,
+                        order_manager=order_manager,
+                        exchange=exchange,
+                        account_equity=account_equity,
+                        open_positions=open_positions,
+                        logger=bot_logger,
+                        trailing_handler=trailing_tp_handler
                     )
-                except OrderExecutionError as oe:
-                    bot_logger.error(f"Order placement failed for {type(strat).__name__}: {oe}")
-                    # Notify strategy of order failure with error response
-                    error_response = {
-                        'main_order': {
-                            'result': {
-                                'orderId': None,
-                                'orderStatus': 'rejected',
-                                'error': str(oe)
+                    
+                    if not success:
+                        # Enhanced validation failed - create error response for strategy
+                        bot_logger.error(f"Enhanced order placement failed for {type(strat).__name__}: {placement_reason}")
+                        error_response = {
+                            'main_order': {
+                                'result': {
+                                    'orderId': None,
+                                    'orderStatus': 'rejected',
+                                    'error': placement_reason,
+                                    'validation_type': 'enhanced_risk_management'
+                                }
                             }
                         }
-                    }
-                    try:
-                        strat.on_order_update(error_response, symbol=symbol)
-                    except Exception as callback_error:
-                        bot_logger.error(f"Failed to notify strategy of error: {callback_error}", exc_info=True)
-                        continue  # move on to next strategy without crashing the bot
+                        try:
+                            strat.on_order_update(error_response, symbol=symbol)
+                        except Exception as callback_error:
+                            bot_logger.error(f"Failed to notify strategy of enhanced validation error: {callback_error}", exc_info=True)
+                        continue  # Skip to next strategy
+                    
+                    else:
+                        # Enhanced placement succeeded
+                        bot_logger.info(f"✅ Enhanced order placement successful for {type(strat).__name__}: {placement_reason}")
+                        
                 except Exception as e:
-                    bot_logger.error(f"Unexpected error during order placement for {type(strat).__name__}: {e}", exc_info=True)
-                    error_response = {
-                        'main_order': {
-                            'result': {
-                                'orderId': None,
-                                'orderStatus': 'rejected',
-                                'error': f"Unexpected error: {str(e)}",
-                                'category': 'linear',
-                                'symbol': symbol,
-                                'side': order_details.get('side', 'N/A'),
+                    # Fallback to original order placement if enhanced placement fails completely
+                    bot_logger.error(f"Enhanced order placement system failed for {type(strat).__name__}: {e}", exc_info=True)
+                    bot_logger.warning("Falling back to original order placement system...")
+                    
+                    try:
+                        order_responses = order_manager.place_order_with_risk(
+                         symbol=symbol,
+                         side=order_details['side'],
+                         order_type=order_details.get('order_type', 'market'),
+                         size=order_details['size'],
+                         signal_price=order_details.get('price'), # Price at the time of signal generation
+                         sl_pct=order_details['sl_pct'],
+                         tp_pct=order_details['tp_pct'],
+                         params=order_details.get('params'), # Pass any extra params from strategy
+                         reduce_only=order_details.get('reduce_only', False),
+                         time_in_force=order_details.get('time_in_force', 'GoodTillCancel')
+                        )
+                        bot_logger.info("✅ Fallback order placement successful")
+                        
+                    except OrderExecutionError as oe:
+                        bot_logger.error(f"Fallback order placement failed for {type(strat).__name__}: {oe}")
+                        error_response = {
+                            'main_order': {
+                                'result': {
+                                    'orderId': None,
+                                    'orderStatus': 'rejected',
+                                    'error': str(oe)
+                                }
                             }
                         }
-                    }
-                    try:
-                        strat.on_order_update(error_response, symbol=symbol)
-                    except Exception as callback_error:
-                        bot_logger.error(f"Failed to notify strategy of error: {callback_error}", exc_info=True)
+                        try:
+                            strat.on_order_update(error_response, symbol=symbol)
+                        except Exception as callback_error:
+                            bot_logger.error(f"Failed to notify strategy of fallback error: {callback_error}", exc_info=True)
                         continue
+                    
+                    except Exception as fallback_error:
+                        bot_logger.error(f"Unexpected error during fallback order placement for {type(strat).__name__}: {fallback_error}", exc_info=True)
+                        error_response = {
+                            'main_order': {
+                                'result': {
+                                    'orderId': None,
+                                    'orderStatus': 'rejected',
+                                    'error': f"Fallback placement failed: {str(fallback_error)}",
+                                    'category': 'linear',
+                                    'symbol': symbol,
+                                    'side': order_details.get('side', 'N/A'),
+                                }
+                            }
+                        }
+                        try:
+                            strat.on_order_update(error_response, symbol=symbol)
+                        except Exception as callback_error:
+                            bot_logger.error(f"Failed to notify strategy of fallback error: {callback_error}", exc_info=True)
+                        continue
+                
                 # Now call on_order_update with the actual responses from OrderManager.
                 try:
                     strat.on_order_update(order_responses, symbol=symbol)
@@ -844,11 +1691,17 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                         # Pass category to execute_strategy_exit
                         exit_order_response = order_manager.execute_strategy_exit(symbol, current_position_details, category=category)
                         bot_logger.info(f"Exit order response for {type(strat).__name__}: {exit_order_response}")
-                        # Notify strategy of exit order update
-                        try:
-                            strat.on_order_update(exit_order_response, symbol=symbol)
-                        except Exception as callback_error:
-                            bot_logger.error(f"Strategy callback error in {type(strat).__name__}.on_order_update (exit): {callback_error}", exc_info=True)
+                        
+                        # Check if position was already closed on exchange
+                        if exit_order_response.get('position_already_closed'):
+                            bot_logger.info(f"✅ Position for {symbol} was already closed on exchange. Clearing strategy position.")
+                            strat.clear_position(symbol)
+                        else:
+                            # Notify strategy of exit order update for normal exits
+                            try:
+                                strat.on_order_update(exit_order_response, symbol=symbol)
+                            except Exception as callback_error:
+                                bot_logger.error(f"Strategy callback error in {type(strat).__name__}.on_order_update (exit): {callback_error}", exc_info=True)
                         
                         # Update performance tracker after successful exit
                         if exit_order_response and exit_order_response.get('exit_order', {}).get('result', {}).get('orderStatus', '').lower() == 'filled':
@@ -1068,6 +1921,31 @@ def safe_float_convert(value, default=0.0):
     except (ValueError, TypeError):
         return default
 
+def calculate_pnl_from_prices(entry_price: float, exit_price: float, size: float, side: str) -> float:
+    """
+    Calculate PnL from entry/exit prices and position details.
+    
+    Args:
+        entry_price: Entry price per unit
+        exit_price: Exit price per unit  
+        size: Position size
+        side: Position side ('buy'/'long' or 'sell'/'short')
+        
+    Returns:
+        PnL amount (positive for profit, negative for loss)
+    """
+    try:
+        if side.lower() in ['buy', 'long']:
+            # Long position: profit when exit > entry
+            pnl = (exit_price - entry_price) * size
+        else:  # short position
+            # Short position: profit when entry > exit
+            pnl = (entry_price - exit_price) * size
+        
+        return pnl
+    except Exception:
+        return 0.0
+
 def sync_strategy_position_with_exchange(strategy, symbol, exchange, category, logger):
     """
     Enhanced position synchronization between strategy and exchange.
@@ -1216,9 +2094,10 @@ def sync_strategy_position_with_exchange(strategy, symbol, exchange, category, l
         logger.error(f"Error during position sync for {symbol}: {e}")
         return sync_result
 
-def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_class, symbol, timeframe, leverage, category, data_fetcher, order_manager, perf_tracker, exchange, config, analysis_results, bot_logger, session_manager, risk_manager, real_time_monitor):
+def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_class, symbol, timeframe, leverage, category, data_fetcher, order_manager, perf_tracker, exchange, config, analysis_results, bot_logger, session_manager, risk_manager, real_time_monitor, strategy_matrix=None, config_loader=None, market_analyzer_enhanced=None):
     """
     Main trading loop with automatic strategy switching based on market conditions.
+    Enhanced with comprehensive risk management integration.
     
     Args:
         strategy_instance: Current strategy instance
@@ -1654,6 +2533,54 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                         position_to_close = current_strategy.position.get(symbol)
                         if position_to_close:
                             exit_order_responses = order_manager.execute_strategy_exit(symbol, position_to_close, category=category)
+                            
+                            # Check if position was already closed on exchange
+                            if exit_order_responses.get('position_already_closed'):
+                                bot_logger.info(f"✅ Position for {symbol} was already closed on exchange (likely SL/TP). Clearing strategy position.")
+                                current_strategy.clear_position(symbol)
+                                
+                                # Record the trade closure for already-closed positions
+                                try:
+                                    entry_price = position_to_close.get('entry_price', 0)
+                                    size = position_to_close.get('size', 0)
+                                    side = position_to_close.get('side', 'unknown')
+                                    
+                                    # Since position was closed by SL/TP, we don't know exact exit price
+                                    # Use entry price as conservative estimate or try to get current price
+                                    try:
+                                        current_price = exchange.get_current_price(symbol.replace('/', ''))
+                                        exit_price = current_price if current_price else entry_price
+                                    except:
+                                        exit_price = entry_price
+                                    
+                                    # Calculate PnL based on estimated exit price
+                                    calculated_pnl = calculate_pnl_from_prices(entry_price, exit_price, size, side)
+                                    
+                                    bot_logger.info(f"Recording trade for already-closed position: {symbol} {side} {size} @ entry=${entry_price:.2f}, est_exit=${exit_price:.2f}, PnL=${calculated_pnl:.2f}")
+                                    
+                                    # Create trade record
+                                    trade_record = create_enhanced_trade_record(
+                                        strategy_name=current_strategy_name,
+                                        symbol=symbol,
+                                        side=side,
+                                        entry_price=entry_price,
+                                        exit_price=exit_price,
+                                        size=size,
+                                        pnl=calculated_pnl,
+                                        entry_timestamp=position_to_close.get('timestamp', datetime.now(timezone.utc).isoformat()),
+                                        exit_timestamp=datetime.now(timezone.utc).isoformat(),
+                                        exit_reason="Position already closed by SL/TP",
+                                        leverage=leverage,
+                                        session_id=session_manager.get_current_session_id() if session_manager else None
+                                    )
+                                    
+                                    perf_tracker.record_trade(trade_record)
+                                    bot_logger.info(f"✅ Trade recorded for already-closed position: PnL=${calculated_pnl:.2f}")
+                                    
+                                except Exception as record_error:
+                                    bot_logger.error(f"Failed to record trade for already-closed position: {record_error}")
+                                
+                                continue  # Skip normal exit processing
                             
                             # Record trade to performance tracker after successful exit
                             # Note: execute_strategy_exit returns {'exit_market_order': response}
@@ -2358,7 +3285,7 @@ def handle_recovery_action(recovery_info, exchange, config, logger):
     return True
 
 def main():
-    global session_manager, real_time_monitor
+    global session_manager, real_time_monitor, trailing_tp_handler
     
     config = load_config()
     # Initialize the main bot logger
@@ -2395,6 +3322,49 @@ def main():
     )
     bot_logger.info("✅ AdvancedRiskManager initialized")
     
+    # Initialize Strategy Matrix and Config Loader
+    strategy_matrix = StrategyMatrix(logger=bot_logger)
+    config_loader = StrategyConfigLoader(strategy_matrix=strategy_matrix, logger=bot_logger)
+    bot_logger.info("✅ Strategy Matrix and Config Loader initialized")
+    
+    # Initialize MarketAnalyzer for enhanced risk management
+    market_analyzer = MarketAnalyzer(exchange, config, bot_logger)
+    bot_logger.info("✅ MarketAnalyzer initialized for enhanced risk management")
+    
+    # Run dry-run demonstration of enhanced order validation
+    bot_logger.info("="*60)
+    bot_logger.info("RUNNING ENHANCED RISK MANAGEMENT DRY-RUN DEMONSTRATION")
+    bot_logger.info("="*60)
+    
+    try:
+        dry_run_enhanced_order_validation_demo(
+            logger=bot_logger,
+            strategy_matrix=strategy_matrix,
+            config_loader=config_loader,
+            market_analyzer=market_analyzer,
+            risk_manager=risk_manager,
+            exchange=exchange
+        )
+    except Exception as demo_error:
+        bot_logger.warning(f"Dry-run demonstration failed: {demo_error}")
+        bot_logger.info("Continuing with normal bot startup...")
+    
+    bot_logger.info("="*60)
+    
+    # Initialize Trailing TP Handler
+    # Ensure state directory exists
+    import os
+    os.makedirs("state", exist_ok=True)
+    
+    trailing_tp_handler = TrailingTPHandler(
+        exchange_connector=exchange,
+        order_manager=None,  # Will be set later when OrderManager is created
+        logger=bot_logger,
+        state_file="state/trailing_tp_state.json",
+        monitoring_interval=5.0
+    )
+    bot_logger.info("✅ TrailingTPHandler initialized")
+    
     # Initialize RealTimeMonitor (but don't start yet - will start after user selections)
     real_time_monitor = RealTimeMonitor(
         performance_tracker=perf_tracker,
@@ -2430,6 +3400,20 @@ def main():
     
     # Let user select symbol from analyzed markets
     selected_symbol = select_symbol(analysis_results, bot_logger)
+    
+    # CONFIGURE LOGGING FOR THIS TRADING SESSION
+    bot_logger.info("="*60)
+    bot_logger.info("CONFIGURING SESSION LOGGING")
+    bot_logger.info("="*60)
+    
+    # Configure logging with symbol and current date
+    configure_logging_session(selected_symbol)
+    
+    # Log session information
+    bot_logger.info(f"✅ Logging configured for trading session")
+    bot_logger.info(f"   Symbol: {selected_symbol}")
+    bot_logger.info(f"   Date: {datetime.now().strftime('%Y-%m-%d')}")
+    bot_logger.info(f"   Session ID: {selected_symbol}_{datetime.now().strftime('%Y%m%d')}")
     
     # CHECK FOR EXISTING ORDERS/POSITIONS FOR THE SELECTED SYMBOL
     recovery_info = check_existing_orders_and_positions(exchange, config, bot_logger, selected_symbol)
@@ -2519,6 +3503,12 @@ def main():
     order_manager = OrderManager(exchange, logger=bot_logger)
     # Inject risk manager into order manager
     order_manager.risk_manager = risk_manager
+    
+    # Wire TrailingTPHandler to OrderManager and start monitoring
+    if trailing_tp_handler:
+        trailing_tp_handler.order_manager = order_manager
+        trailing_tp_handler.start_monitoring()
+        bot_logger.info("✅ TrailingTPHandler wired to OrderManager and monitoring started")
 
     # Initialize the selected strategy instance
     try:
@@ -2675,7 +3665,7 @@ def main():
         run_trading_loop_with_auto_strategy(
             strategy_instance, selected_strategy_class, symbol, timeframe, leverage, category,
             data_fetcher, order_manager, perf_tracker, exchange, config, analysis_results, bot_logger,
-            session_manager, risk_manager, real_time_monitor
+            session_manager, risk_manager, real_time_monitor, strategy_matrix, config_loader, market_analyzer
         )
     except KeyboardInterrupt:
         bot_logger.info('Bot shutting down (KeyboardInterrupt).')
@@ -2713,6 +3703,10 @@ def main():
                 session_manager.end_active_sessions("Bot shutdown")
                 bot_logger.info("✅ Active sessions ended")
                 
+            if 'trailing_tp_handler' in locals() and trailing_tp_handler is not None:
+                trailing_tp_handler.stop_monitoring()
+                bot_logger.info("✅ TrailingTPHandler monitoring stopped")
+                
             if 'data_fetcher' in locals() and data_fetcher is not None:
                 data_fetcher.stop_websocket()
                 bot_logger.info("✅ WebSocket data feed stopped")
@@ -2720,6 +3714,11 @@ def main():
             if 'perf_tracker' in locals() and perf_tracker is not None:
                 perf_tracker.close_session()
                 bot_logger.info("✅ Performance tracker session closed")
+            
+            # Close all logging handlers gracefully
+            bot_logger.info("🔚 Closing all logging handlers...")
+            close_all_loggers()
+            print("✅ All logging handlers closed")  # Use print since loggers are closed
                 
         except Exception as cleanup_error:
             bot_logger.error(f"Error during cleanup: {cleanup_error}")

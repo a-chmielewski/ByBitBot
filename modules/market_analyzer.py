@@ -3,7 +3,30 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 import time
+import threading
+from datetime import datetime, timezone, timedelta
 from .data_fetcher import LiveDataFetcher, DataFetchError
+
+# Import risk utilities for advanced calculations
+try:
+    from .risk_utilities import compute_atr, volatility_regime
+except ImportError:
+    # Fallback if risk_utilities not available
+    def compute_atr(df, period=14):
+        # Simple ATR fallback calculation
+        high_low = df['high'] - df['low']
+        high_close_prev = abs(df['high'] - df['close'].shift(1))
+        low_close_prev = abs(df['low'] - df['close'].shift(1))
+        tr = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
+        return tr.rolling(window=period, min_periods=period).mean()
+    
+    def volatility_regime(atr_pct, thresholds=(0.5, 1.5)):
+        if atr_pct < thresholds[0]:
+            return "low"
+        elif atr_pct > thresholds[1]:
+            return "high"
+        else:
+            return "normal"
 
 class MarketAnalysisError(Exception):
     """Custom exception for market analysis errors."""
@@ -37,6 +60,19 @@ class MarketAnalyzer:
         self.top_volume_count = market_config.get('top_volume_count', 10)
         self.min_volume_usdt = market_config.get('min_volume_usdt', 1000000)  # 1M USDT minimum
         
+        # Enhanced caching and performance settings
+        self.cache_validity_seconds = market_config.get('analysis_cache_seconds', 300)  # 5 minutes default
+        self.max_computation_time_seconds = market_config.get('max_computation_time_seconds', 30)  # 30 seconds max
+        self.atr_period = market_config.get('atr_period', 14)  # ATR calculation period
+        self.vol_regime_thresholds = market_config.get('volatility_thresholds', (0.5, 1.5))  # Low/high volatility thresholds
+        
+        # Initialize caching system
+        self._cache_lock = threading.Lock()
+        self._atr_cache: Dict[str, Dict] = {}  # symbol -> {value, timestamp, timeframe}
+        self._vol_regime_cache: Dict[str, Dict] = {}  # symbol -> {regime, timestamp, atr_pct}
+        self._market_regime_cache: Dict[str, Dict] = {}  # symbol -> {regime, timestamp, components}
+        self._data_cache: Dict[str, Dict] = {}  # symbol -> {data, timestamp, timeframe}
+        
         if self.use_dynamic_symbols:
             self.logger.info(f"Using dynamic symbol selection: top {self.top_volume_count} by volume")
             self.symbols = self._fetch_top_volume_symbols()
@@ -48,6 +84,7 @@ class MarketAnalyzer:
             raise MarketAnalysisError("No symbols available for market analysis")
             
         self.logger.info(f"Initialized MarketAnalyzer for {len(self.symbols)} symbols and {len(self.timeframes)} timeframes")
+        self.logger.info(f"Enhanced features: ATR period={self.atr_period}, Cache validity={self.cache_validity_seconds}s, Max computation time={self.max_computation_time_seconds}s")
 
     def _fetch_top_volume_symbols(self) -> List[str]:
         """
@@ -586,4 +623,455 @@ class MarketAnalyzer:
                 market_type = results[symbol][timeframe].get('market_type', 'UNKNOWN')
                 market_type_counts[market_type] = market_type_counts.get(market_type, 0) + 1
         
-        return market_type_counts 
+        return market_type_counts
+
+    # ==================== ENHANCED VOLATILITY & REGIME DETECTION ====================
+    
+    def get_atr_pct(self, symbol: str, timeframe: str = '1m') -> float:
+        """
+        Calculate ATR as percentage of current price.
+        
+        This provides a normalized volatility measure that can be compared across 
+        different price levels and assets.
+        
+        Args:
+            symbol: Trading symbol (e.g., 'BTCUSDT')
+            timeframe: Timeframe for analysis (default: '1m')
+            
+        Returns:
+            ATR as percentage of current price (e.g., 2.5 = 2.5%)
+            
+        Raises:
+            MarketAnalysisError: If calculation fails or insufficient data
+        """
+        try:
+            cache_key = f"{symbol}_{timeframe}"
+            current_time = datetime.now(timezone.utc)
+            
+            # Check cache first
+            with self._cache_lock:
+                if cache_key in self._atr_cache:
+                    cache_entry = self._atr_cache[cache_key]
+                    cache_age = (current_time - cache_entry['timestamp']).total_seconds()
+                    
+                    if cache_age < self.cache_validity_seconds:
+                        self.logger.debug(f"ATR cache hit for {symbol} {timeframe} (age: {cache_age:.1f}s)")
+                        return cache_entry['value']
+            
+            # Start computation timer
+            computation_start = time.time()
+            
+            # Get market data with timeout protection
+            data = self._get_cached_data(symbol, timeframe)
+            if data is None or len(data) < self.atr_period + 5:
+                raise MarketAnalysisError(f"Insufficient data for ATR calculation: {len(data) if data is not None else 0} bars")
+            
+            # Check computation time
+            if time.time() - computation_start > self.max_computation_time_seconds:
+                raise MarketAnalysisError(f"ATR computation timeout for {symbol}")
+            
+            # Calculate ATR using risk utilities
+            try:
+                atr_series = compute_atr(data, period=self.atr_period)
+                if atr_series is None or atr_series.empty or atr_series.iloc[-1] is None:
+                    raise ValueError("ATR calculation returned invalid result")
+                
+                current_atr = float(atr_series.iloc[-1])
+                current_price = float(data['close'].iloc[-1])
+                
+                if current_price <= 0:
+                    raise ValueError(f"Invalid current price: {current_price}")
+                
+                atr_pct = (current_atr / current_price) * 100
+                
+            except Exception as e:
+                # Fallback to simple ATR calculation
+                self.logger.warning(f"Risk utilities ATR failed for {symbol}, using fallback: {e}")
+                tr = self._calculate_true_range(data)
+                atr_simple = tr.rolling(window=self.atr_period, min_periods=self.atr_period).mean()
+                current_atr = float(atr_simple.iloc[-1])
+                current_price = float(data['close'].iloc[-1])
+                atr_pct = (current_atr / current_price) * 100
+            
+            # Validate result
+            if not (0 <= atr_pct <= 50):  # Sanity check: ATR should be 0-50% of price
+                self.logger.warning(f"ATR percentage seems unusual for {symbol}: {atr_pct:.2f}%")
+            
+            # Cache the result
+            with self._cache_lock:
+                self._atr_cache[cache_key] = {
+                    'value': atr_pct,
+                    'timestamp': current_time,
+                    'timeframe': timeframe,
+                    'computation_time_ms': (time.time() - computation_start) * 1000
+                }
+            
+            self.logger.debug(f"Calculated ATR for {symbol} {timeframe}: {atr_pct:.3f}%")
+            return atr_pct
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating ATR percentage for {symbol} {timeframe}: {e}")
+            raise MarketAnalysisError(f"ATR calculation failed for {symbol}: {str(e)}")
+
+    def get_vol_regime(self, symbol: str, timeframe: str = '1m') -> str:
+        """
+        Determine volatility regime using ATR percentage analysis.
+        
+        Uses RiskUtilities.volatility_regime to classify current market volatility
+        into low, normal, or high regimes based on ATR percentage thresholds.
+        
+        Args:
+            symbol: Trading symbol (e.g., 'BTCUSDT')
+            timeframe: Timeframe for analysis (default: '1m')
+            
+        Returns:
+            Volatility regime: 'low', 'normal', or 'high'
+            
+        Raises:
+            MarketAnalysisError: If analysis fails
+        """
+        try:
+            cache_key = f"{symbol}_{timeframe}"
+            current_time = datetime.now(timezone.utc)
+            
+            # Check cache first
+            with self._cache_lock:
+                if cache_key in self._vol_regime_cache:
+                    cache_entry = self._vol_regime_cache[cache_key]
+                    cache_age = (current_time - cache_entry['timestamp']).total_seconds()
+                    
+                    if cache_age < self.cache_validity_seconds:
+                        self.logger.debug(f"Volatility regime cache hit for {symbol} {timeframe} (age: {cache_age:.1f}s)")
+                        return cache_entry['regime']
+            
+            # Start computation timer
+            computation_start = time.time()
+            
+            # Get ATR percentage
+            atr_pct = self.get_atr_pct(symbol, timeframe)
+            
+            # Check computation time
+            if time.time() - computation_start > self.max_computation_time_seconds:
+                raise MarketAnalysisError(f"Volatility regime computation timeout for {symbol}")
+            
+            # Determine regime using risk utilities
+            try:
+                regime = volatility_regime(atr_pct, thresholds=self.vol_regime_thresholds)
+            except Exception as e:
+                # Fallback regime determination
+                self.logger.warning(f"Risk utilities volatility_regime failed for {symbol}, using fallback: {e}")
+                if atr_pct < self.vol_regime_thresholds[0]:
+                    regime = "low"
+                elif atr_pct > self.vol_regime_thresholds[1]:
+                    regime = "high"
+                else:
+                    regime = "normal"
+            
+            # Validate regime
+            if regime not in ['low', 'normal', 'high']:
+                self.logger.warning(f"Invalid volatility regime '{regime}' for {symbol}, defaulting to 'normal'")
+                regime = "normal"
+            
+            # Cache the result
+            with self._cache_lock:
+                self._vol_regime_cache[cache_key] = {
+                    'regime': regime,
+                    'timestamp': current_time,
+                    'atr_pct': atr_pct,
+                    'thresholds': self.vol_regime_thresholds,
+                    'computation_time_ms': (time.time() - computation_start) * 1000
+                }
+            
+            self.logger.debug(f"Volatility regime for {symbol} {timeframe}: {regime} (ATR: {atr_pct:.3f}%)")
+            return regime
+            
+        except Exception as e:
+            self.logger.error(f"Error determining volatility regime for {symbol} {timeframe}: {e}")
+            raise MarketAnalysisError(f"Volatility regime analysis failed for {symbol}: {str(e)}")
+
+    def get_market_regime(self, symbol: str, timeframe: str = '1m') -> str:
+        """
+        Determine comprehensive market regime using composite analysis.
+        
+        Combines trend strength (ADX/slope), realized volatility (ATR), and other
+        market structure indicators to classify the overall market regime.
+        
+        Args:
+            symbol: Trading symbol (e.g., 'BTCUSDT')
+            timeframe: Timeframe for analysis (default: '1m')
+            
+        Returns:
+            Market regime: 'trending_low_vol', 'trending_high_vol', 'ranging_low_vol', 
+                          'ranging_high_vol', 'transitional', or 'breakout'
+            
+        Raises:
+            MarketAnalysisError: If analysis fails
+        """
+        try:
+            cache_key = f"{symbol}_{timeframe}"
+            current_time = datetime.now(timezone.utc)
+            
+            # Check cache first
+            with self._cache_lock:
+                if cache_key in self._market_regime_cache:
+                    cache_entry = self._market_regime_cache[cache_key]
+                    cache_age = (current_time - cache_entry['timestamp']).total_seconds()
+                    
+                    if cache_age < self.cache_validity_seconds:
+                        self.logger.debug(f"Market regime cache hit for {symbol} {timeframe} (age: {cache_age:.1f}s)")
+                        return cache_entry['regime']
+            
+            # Start computation timer
+            computation_start = time.time()
+            
+            # Get basic components
+            data = self._get_cached_data(symbol, timeframe)
+            if data is None or len(data) < 50:  # Need sufficient data for regime analysis
+                raise MarketAnalysisError(f"Insufficient data for market regime analysis: {len(data) if data is not None else 0} bars")
+            
+            # Check computation time
+            if time.time() - computation_start > self.max_computation_time_seconds:
+                raise MarketAnalysisError(f"Market regime computation timeout for {symbol}")
+            
+            # Calculate indicators with timeout protection
+            try:
+                data_with_indicators = self._calculate_indicators(data)
+            except Exception as e:
+                raise MarketAnalysisError(f"Indicator calculation failed for {symbol}: {e}")
+            
+            # Get volatility regime
+            vol_regime = self.get_vol_regime(symbol, timeframe)
+            
+            # Get trend strength using ADX
+            current_adx = float(data_with_indicators['adx'].iloc[-1]) if not pd.isna(data_with_indicators['adx'].iloc[-1]) else 25.0
+            
+            # Calculate trend slope using EMA
+            ema_20 = data_with_indicators['ema_20'].iloc[-20:] if len(data_with_indicators) >= 20 else data_with_indicators['ema_20']
+            if len(ema_20) >= 10:
+                # Simple slope calculation over last 10 periods
+                x = np.arange(len(ema_20[-10:]))
+                y = ema_20[-10:].values
+                slope = np.polyfit(x, y, 1)[0] if len(y) > 1 else 0
+                slope_pct = (slope / ema_20.iloc[-1]) * 100 if ema_20.iloc[-1] != 0 else 0
+            else:
+                slope_pct = 0
+            
+            # Calculate Bollinger Band position for ranging detection
+            current_price = float(data_with_indicators['close'].iloc[-1])
+            bb_upper = float(data_with_indicators['bb_upper'].iloc[-1]) if not pd.isna(data_with_indicators['bb_upper'].iloc[-1]) else current_price * 1.02
+            bb_lower = float(data_with_indicators['bb_lower'].iloc[-1]) if not pd.isna(data_with_indicators['bb_lower'].iloc[-1]) else current_price * 0.98
+            bb_width = float(data_with_indicators['bb_width'].iloc[-1]) if not pd.isna(data_with_indicators['bb_width'].iloc[-1]) else 0.04
+            
+            # Determine regime based on composite analysis
+            regime_components = {
+                'adx': current_adx,
+                'slope_pct': slope_pct,
+                'vol_regime': vol_regime,
+                'bb_width': bb_width,
+                'bb_position': (current_price - bb_lower) / (bb_upper - bb_lower) if (bb_upper - bb_lower) > 0 else 0.5
+            }
+            
+            # Regime determination logic
+            if current_adx > 30 and abs(slope_pct) > 0.05:  # Strong trend
+                if vol_regime == 'high':
+                    regime = 'trending_high_vol'
+                else:
+                    regime = 'trending_low_vol'
+            elif current_adx < 20 and abs(slope_pct) < 0.02:  # Ranging market
+                if vol_regime == 'high':
+                    regime = 'ranging_high_vol'
+                else:
+                    regime = 'ranging_low_vol'
+            elif vol_regime == 'high' and bb_width > 0.06:  # High volatility breakout conditions
+                regime = 'breakout'
+            else:  # Mixed signals or transitional phase
+                regime = 'transitional'
+            
+            # Check computation time again
+            computation_time = time.time() - computation_start
+            if computation_time > self.max_computation_time_seconds:
+                self.logger.warning(f"Market regime computation exceeded time limit: {computation_time:.2f}s")
+            
+            # Cache the result
+            with self._cache_lock:
+                self._market_regime_cache[cache_key] = {
+                    'regime': regime,
+                    'timestamp': current_time,
+                    'components': regime_components,
+                    'timeframe': timeframe,
+                    'computation_time_ms': computation_time * 1000
+                }
+            
+            self.logger.debug(f"Market regime for {symbol} {timeframe}: {regime} (ADX: {current_adx:.1f}, Slope: {slope_pct:.3f}%, Vol: {vol_regime})")
+            return regime
+            
+        except Exception as e:
+            self.logger.error(f"Error determining market regime for {symbol} {timeframe}: {e}")
+            raise MarketAnalysisError(f"Market regime analysis failed for {symbol}: {str(e)}")
+
+    def _get_cached_data(self, symbol: str, timeframe: str, min_periods: int = 100) -> Optional[pd.DataFrame]:
+        """
+        Get cached OHLCV data or fetch fresh data if cache miss/expired.
+        
+        Args:
+            symbol: Trading symbol
+            timeframe: Timeframe for data
+            min_periods: Minimum number of periods required
+            
+        Returns:
+            DataFrame with OHLCV data or None if unavailable
+        """
+        try:
+            cache_key = f"{symbol}_{timeframe}"
+            current_time = datetime.now(timezone.utc)
+            
+            # Check cache first
+            with self._cache_lock:
+                if cache_key in self._data_cache:
+                    cache_entry = self._data_cache[cache_key]
+                    cache_age = (current_time - cache_entry['timestamp']).total_seconds()
+                    
+                    if cache_age < self.cache_validity_seconds and len(cache_entry['data']) >= min_periods:
+                        return cache_entry['data']
+            
+            # Fetch fresh data
+            try:
+                data_fetcher = LiveDataFetcher(self.exchange, symbol, timeframe, window_size=max(min_periods, 200))
+                # First fetch initial data to populate the data fetcher
+                data = data_fetcher.fetch_initial_data()
+                
+                if data is None or len(data) < min_periods:
+                    self.logger.warning(f"Insufficient data fetched for {symbol} {timeframe}: {len(data) if data is not None else 0} bars")
+                    return None
+                
+                # Cache the fresh data
+                with self._cache_lock:
+                    self._data_cache[cache_key] = {
+                        'data': data.copy(),
+                        'timestamp': current_time,
+                        'timeframe': timeframe
+                    }
+                
+                return data
+                
+            except Exception as e:
+                self.logger.error(f"Failed to fetch data for {symbol} {timeframe}: {e}")
+                return None
+                
+        except Exception as e:
+            self.logger.error(f"Error in data caching for {symbol} {timeframe}: {e}")
+            return None
+
+    def _calculate_true_range(self, data: pd.DataFrame) -> pd.Series:
+        """
+        Calculate True Range for fallback ATR calculation.
+        
+        Args:
+            data: OHLCV DataFrame
+            
+        Returns:
+            True Range series
+        """
+        try:
+            high_low = data['high'] - data['low']
+            high_close_prev = abs(data['high'] - data['close'].shift(1))
+            low_close_prev = abs(data['low'] - data['close'].shift(1))
+            
+            true_range = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
+            return true_range
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating true range: {e}")
+            # Return fallback series
+            return data['high'] - data['low']
+
+    def clear_cache(self, symbol: Optional[str] = None) -> None:
+        """
+        Clear analysis cache for specified symbol or all symbols.
+        
+        Args:
+            symbol: Symbol to clear cache for, or None to clear all
+        """
+        try:
+            with self._cache_lock:
+                if symbol is None:
+                    # Clear all caches
+                    self._atr_cache.clear()
+                    self._vol_regime_cache.clear()
+                    self._market_regime_cache.clear()
+                    self._data_cache.clear()
+                    self.logger.info("Cleared all analysis caches")
+                else:
+                    # Clear caches for specific symbol
+                    symbol_keys = [key for key in self._atr_cache.keys() if key.startswith(f"{symbol}_")]
+                    for key in symbol_keys:
+                        self._atr_cache.pop(key, None)
+                        self._vol_regime_cache.pop(key, None)
+                        self._market_regime_cache.pop(key, None)
+                        self._data_cache.pop(key, None)
+                    self.logger.info(f"Cleared analysis cache for {symbol}")
+                    
+        except Exception as e:
+            self.logger.error(f"Error clearing cache: {e}")
+
+    def get_cache_stats(self) -> Dict[str, Dict]:
+        """
+        Get cache statistics for monitoring and debugging.
+        
+        Returns:
+            Dictionary with cache statistics
+        """
+        try:
+            with self._cache_lock:
+                current_time = datetime.now(timezone.utc)
+                
+                def analyze_cache(cache_dict: Dict, cache_name: str) -> Dict:
+                    stats = {
+                        'total_entries': len(cache_dict),
+                        'symbols': set(),
+                        'timeframes': set(),
+                        'oldest_entry_age_seconds': 0,
+                        'newest_entry_age_seconds': float('inf'),
+                        'avg_computation_time_ms': 0
+                    }
+                    
+                    computation_times = []
+                    for key, entry in cache_dict.items():
+                        if '_' in key:
+                            symbol_part = key.split('_')[0]
+                            stats['symbols'].add(symbol_part)
+                        
+                        if 'timeframe' in entry:
+                            stats['timeframes'].add(entry['timeframe'])
+                        
+                        if 'timestamp' in entry:
+                            age = (current_time - entry['timestamp']).total_seconds()
+                            stats['oldest_entry_age_seconds'] = max(stats['oldest_entry_age_seconds'], age)
+                            stats['newest_entry_age_seconds'] = min(stats['newest_entry_age_seconds'], age)
+                        
+                        if 'computation_time_ms' in entry:
+                            computation_times.append(entry['computation_time_ms'])
+                    
+                    if computation_times:
+                        stats['avg_computation_time_ms'] = sum(computation_times) / len(computation_times)
+                    
+                    stats['symbols'] = list(stats['symbols'])
+                    stats['timeframes'] = list(stats['timeframes'])
+                    
+                    if stats['newest_entry_age_seconds'] == float('inf'):
+                        stats['newest_entry_age_seconds'] = 0
+                    
+                    return stats
+                
+                return {
+                    'atr_cache': analyze_cache(self._atr_cache, 'ATR'),
+                    'vol_regime_cache': analyze_cache(self._vol_regime_cache, 'Volatility Regime'),
+                    'market_regime_cache': analyze_cache(self._market_regime_cache, 'Market Regime'),
+                    'data_cache': analyze_cache(self._data_cache, 'Data Cache'),
+                    'cache_validity_seconds': self.cache_validity_seconds,
+                    'max_computation_time_seconds': self.max_computation_time_seconds
+                }
+                
+        except Exception as e:
+            self.logger.error(f"Error getting cache statistics: {e}")
+            return {'error': str(e)} 
