@@ -414,35 +414,41 @@ class MarketAnalyzer:
             latest = data.iloc[-1]
             analysis_details = {}
             
-            # Determine timeframe-specific parameters
+            # Determine timeframe-specific parameters with hysteresis
             if timeframe == '5m':
-                # 5-minute parameters
-                adx_trend_threshold = 25
-                adx_range_threshold = 20
+                # 5-minute parameters - stricter thresholds with hysteresis
+                adx_trend_threshold = 30  # Increased from 25
+                adx_range_threshold = 15  # Decreased from 20 
+                adx_transition_upper = 25  # Hysteresis zone
+                adx_transition_lower = 20
                 atr_short_col = 'atr_12'  # ~1 hour
                 atr_long_col = 'atr_48'   # ~4 hours
                 bb_width_avg_col = 'bb_width_avg_100'
                 fast_ma_col = 'ema_20'
                 slow_ma_col = 'ema_50'
                 range_lookback = 50
-                volatility_high_atr_ratio = 1.2
-                volatility_high_bb_ratio = 1.5
-                volatility_low_atr_ratio = 0.9
-                volatility_low_bb_ratio = 0.8
+                confirmation_bars = 3  # Require 3 bars confirmation
+                volatility_high_atr_ratio = 1.3  # More strict
+                volatility_high_bb_ratio = 1.6
+                volatility_low_atr_ratio = 0.8
+                volatility_low_bb_ratio = 0.7
             else:  # 1m
-                # 1-minute parameters
-                adx_trend_threshold = 22
-                adx_range_threshold = 18
+                # 1-minute parameters - stricter thresholds with hysteresis
+                adx_trend_threshold = 28  # Increased from 22
+                adx_range_threshold = 12  # Decreased from 18
+                adx_transition_upper = 22  # Hysteresis zone
+                adx_transition_lower = 16
                 atr_short_col = 'atr_60'   # 1 hour
                 atr_long_col = 'atr_240'   # 4 hours
                 bb_width_avg_col = 'bb_width_avg_200'
                 fast_ma_col = 'ema_10'
                 slow_ma_col = 'ema_30'
                 range_lookback = 60
-                volatility_high_atr_ratio = 1.2
-                volatility_high_bb_ratio = 1.5
-                volatility_low_atr_ratio = 0.9
-                volatility_low_bb_ratio = 0.8
+                confirmation_bars = 5  # Require 5 bars confirmation for 1m
+                volatility_high_atr_ratio = 1.3  # More strict
+                volatility_high_bb_ratio = 1.6
+                volatility_low_atr_ratio = 0.8
+                volatility_low_bb_ratio = 0.7
             
             # Extract current values
             adx = latest['adx'] if pd.notna(latest['adx']) else 0
@@ -466,92 +472,199 @@ class MarketAnalyzer:
                 'minus_di': float(minus_di)
             })
             
-            # HIERARCHY: Check conditions in order of priority
+            # HIERARCHY: Check conditions in order of priority - TREND FIRST, then volatility context
             
-            # 1. HIGH-VOLATILITY CHECK (highest priority)
+            # Calculate volatility metrics for regime classification
+            volatility_regime = "normal"  # Default
+            atr_ratio = 0
+            bb_ratio = 0
+            
             if atr_long > 0 and bb_width_avg > 0:
                 atr_ratio = atr_short / atr_long
                 bb_ratio = bb_width / bb_width_avg
                 
+                # Classify volatility regime
                 if atr_ratio > volatility_high_atr_ratio and bb_ratio > volatility_high_bb_ratio:
-                    analysis_details.update({
-                        'atr_ratio': float(atr_ratio),
-                        'bb_ratio': float(bb_ratio),
-                        'reason': 'ATR and BB width significantly elevated'
-                    })
-                    return "HIGH_VOLATILITY", analysis_details
+                    volatility_regime = "high"
+                elif atr_ratio < volatility_low_atr_ratio and bb_ratio < volatility_low_bb_ratio:
+                    volatility_regime = "low"
             
-            # 2. LOW-VOLATILITY CHECK
-            if atr_long > 0 and bb_width_avg > 0:
-                atr_ratio = atr_short / atr_long
-                bb_ratio = bb_width / bb_width_avg
-                
-                if atr_ratio < volatility_low_atr_ratio and bb_ratio < volatility_low_bb_ratio:
-                    analysis_details.update({
-                        'atr_ratio': float(atr_ratio),
-                        'bb_ratio': float(bb_ratio),
-                        'reason': 'ATR and BB width significantly contracted'
-                    })
-                    return "LOW_VOLATILITY", analysis_details
+            # Store volatility regime in analysis_details
+            analysis_details['volatility_regime'] = volatility_regime
+            analysis_details['atr_ratio'] = float(atr_ratio) if atr_ratio else 0
+            analysis_details['bb_ratio'] = float(bb_ratio) if bb_ratio else 0
             
-            # 3. TRENDING CHECK
-            if adx > adx_trend_threshold:
-                # Check directional movement and MA separation
-                ma_diff = abs(fast_ma - slow_ma)
-                atr_threshold = 0.3 * atr_short if atr_short > 0 else 0
+            # Add confirmation window check for sustained conditions
+            confirmation_data = data.tail(confirmation_bars) if len(data) >= confirmation_bars else data
+            adx_values = confirmation_data['adx'].dropna()
+            
+            # 1. TRENDING CHECK - HIGHEST PRIORITY (overrides volatility)
+            if adx > adx_trend_threshold and len(adx_values) >= confirmation_bars:
+                # Require sustained ADX above threshold
+                adx_sustained = (adx_values >= adx_trend_threshold).sum() >= (confirmation_bars - 1)
                 
-                # Confirm direction with +DI/-DI or MA alignment
-                has_direction = (plus_di > minus_di and latest['close'] > slow_ma) or \
-                               (minus_di > plus_di and latest['close'] < slow_ma)
+                if adx_sustained:
+                    # Check directional movement and MA separation
+                    ma_diff = abs(fast_ma - slow_ma)
+                    atr_threshold = 0.4 * atr_short if atr_short > 0 else 0  # Stricter threshold
+                    
+                    # Confirm direction with +DI/-DI or MA alignment
+                    has_direction = (plus_di > minus_di and latest['close'] > slow_ma) or \
+                                   (minus_di > plus_di and latest['close'] < slow_ma)
+                    
+                    # Additional confirmation: check MA slope consistency
+                    ma_slope = abs(slow_ma - confirmation_data[slow_ma_col].iloc[0]) if len(confirmation_data) > 1 else 0
+                    ma_slope_threshold = 0.002 * latest['close']  # 0.2% price movement
+                    
+                    if ma_diff > atr_threshold and has_direction and ma_slope > ma_slope_threshold:
+                        trend_direction = "BULLISH" if plus_di > minus_di else "BEARISH"
+                        
+                        # Return COMBINED REGIME: trend + volatility context
+                        if volatility_regime == "high":
+                            analysis_details.update({
+                                'trend_direction': trend_direction,
+                                'combined_regime': 'trending_high_vol',
+                                'reason': f'Strong trend ({adx:.1f}) with high volatility ({atr_ratio:.2f})'
+                            })
+                            return "HIGH_VOLATILITY", analysis_details  # High vol trend
+                        elif volatility_regime == "low":
+                            analysis_details.update({
+                                'trend_direction': trend_direction,
+                                'combined_regime': 'trending_low_vol',
+                                'reason': f'Strong trend ({adx:.1f}) with low volatility ({atr_ratio:.2f})'
+                            })
+                            return "TRENDING", analysis_details  # Smooth trend
+                        else:
+                            analysis_details.update({
+                                'trend_direction': trend_direction,
+                                'combined_regime': 'trending_normal_vol',
+                                'reason': f'Strong trend ({adx:.1f}) with normal volatility'
+                            })
+                            return "TRENDING", analysis_details
+            
+            # 2. PURE VOLATILITY EXTREMES (only when NOT trending)
+            if volatility_regime == "high":
+                # Check if this is explosive volatility without clear trend
+                analysis_details.update({
+                    'combined_regime': 'high_vol_no_trend',
+                    'reason': f'High volatility ({atr_ratio:.2f}) without sustained trend (ADX {adx:.1f})'
+                })
+                return "HIGH_VOLATILITY", analysis_details
+            
+            # 3. RANGING CHECK - with confirmation window  
+            if adx < adx_range_threshold and len(adx_values) >= confirmation_bars:
+                # Require sustained low ADX
+                adx_sustained_low = (adx_values <= adx_range_threshold).sum() >= (confirmation_bars - 1)
                 
-                if ma_diff > atr_threshold and has_direction:
-                    trend_direction = "BULLISH" if plus_di > minus_di else "BEARISH"
+                if adx_sustained_low:
+                    # Check price range boundaries
+                    range_data = data.tail(range_lookback)
+                    if len(range_data) >= range_lookback:
+                        highest_high = range_data['high'].max()
+                        lowest_low = range_data['low'].min()
+                        current_price = latest['close']
+                        range_pct = (highest_high - lowest_low) / current_price
+                        
+                        # Check for flat MA (low slope) over confirmation period
+                        ma_slope_threshold = 0.0005 * current_price  # Stricter: 0.05% of price
+                        ma_slope = abs(slow_ma - confirmation_data[slow_ma_col].iloc[0]) if len(confirmation_data) > 1 else 0
+                        
+                        if timeframe == '5m':
+                            range_threshold = 0.025  # Stricter: 2.5%
+                        else:  # 1m
+                            range_threshold = 0.008  # Stricter: 0.8%
+                        
+                        if range_pct < range_threshold and ma_slope < ma_slope_threshold:
+                            # Return COMBINED REGIME for ranging + volatility context
+                            if volatility_regime == "low":
+                                analysis_details.update({
+                                    'combined_regime': 'micro_range_low_vol',
+                                    'range_pct': float(range_pct),
+                                    'reason': f'Tight range ({range_pct:.1%}) with low volatility'
+                                })
+                                return "LOW_VOLATILITY", analysis_details  # Micro range
+                            else:
+                                analysis_details.update({
+                                    'combined_regime': 'normal_range',
+                                    'range_pct': float(range_pct),
+                                    'reason': f'Sustained ranging with normal volatility'
+                                })
+                                return "RANGING", analysis_details
+            
+            # 4. VOLATILITY SQUEEZE DETECTION (potential breakout setup)
+            if volatility_regime == "low" and adx_transition_lower <= adx <= adx_transition_upper:
+                # Check for squeeze breakout conditions
+                bb_squeeze_threshold = 0.6  # BB width < 60% of average indicates squeeze
+                if bb_width_avg > 0 and (bb_width / bb_width_avg) < bb_squeeze_threshold:
+                    # Additional confirmation: check for momentum building
+                    momentum_building = False
+                    if len(confirmation_data) >= 3:
+                        recent_closes = confirmation_data['close'].values
+                        price_momentum = abs(recent_closes[-1] - recent_closes[0]) / recent_closes[0]
+                        if price_momentum > 0.005:  # 0.5% price movement
+                            momentum_building = True
+                    
+                    if momentum_building:
+                        analysis_details.update({
+                            'combined_regime': 'squeeze_breakout_setup',
+                            'bb_squeeze_ratio': float(bb_width / bb_width_avg),
+                            'reason': f'Volatility squeeze with momentum building (BB ratio: {bb_width/bb_width_avg:.2f})'
+                        })
+                        return "TRANSITIONAL", analysis_details
+            
+            # 5. TRANSITIONAL - only for hysteresis zone with mixed signals  
+            if adx_transition_lower <= adx <= adx_transition_upper:
+                # Check for genuinely mixed signals, not just intermediate ADX
+                di_diff = abs(plus_di - minus_di)
+                price_vs_ma = abs(latest['close'] - slow_ma) / latest['close']
+                
+                # Only classify as TRANSITIONAL if there are truly mixed signals
+                if di_diff < 5 and price_vs_ma < 0.01:  # Very close DI values and price near MA
                     analysis_details.update({
-                        'trend_direction': trend_direction,
-                        'ma_separation': float(ma_diff),
-                        'atr_threshold': float(atr_threshold),
-                        'reason': f'Strong ADX ({adx:.1f}) with directional bias'
+                        'combined_regime': 'mixed_signals',
+                        'reason': f"Mixed directional signals (DI diff: {di_diff:.1f})",
+                        'adx_zone': 'transition',
+                        'di_difference': float(di_diff),
+                        'price_ma_distance': float(price_vs_ma)
+                    })
+                    return "TRANSITIONAL", analysis_details
+            
+            # 6. DEFAULT - favor the closest strong signal to prevent random classifications
+            if adx > adx_transition_upper:
+                # Closer to trending but not confirmed - use context
+                if volatility_regime == "low":
+                    analysis_details.update({
+                        'combined_regime': 'weak_trend_low_vol',
+                        'reason': f"Moderate trend ({adx:.1f}) with low volatility"
+                    })
+                    return "TRENDING", analysis_details  # Will map to pullback strategy
+                else:
+                    analysis_details.update({
+                        'combined_regime': 'weak_trend',
+                        'reason': f"Moderate ADX ({adx:.1f}) trending but unconfirmed"
                     })
                     return "TRENDING", analysis_details
-            
-            # 4. RANGING CHECK
-            if adx < adx_range_threshold:
-                # Check price range boundaries
-                range_data = data.tail(range_lookback)
-                if len(range_data) >= range_lookback:
-                    highest_high = range_data['high'].max()
-                    lowest_low = range_data['low'].min()
-                    current_price = latest['close']
-                    range_pct = (highest_high - lowest_low) / current_price
-                    
-                    # Check for flat MA (low slope)
-                    ma_slope_threshold = 0.001 * current_price  # 0.1% of price
-                    ma_slope = abs(slow_ma - data[slow_ma_col].iloc[-10]) if len(data) >= 10 else 0
-                    
-                    if timeframe == '5m':
-                        range_threshold = 0.03  # 3%
-                    else:  # 1m
-                        range_threshold = 0.01  # 1%
-                    
-                    if range_pct < range_threshold and ma_slope < ma_slope_threshold:
-                        analysis_details.update({
-                            'range_pct': float(range_pct),
-                            'ma_slope': float(ma_slope),
-                            'reason': f'Low ADX ({adx:.1f}) with confined price range'
-                        })
-                        return "RANGING", analysis_details
-            
-            # 5. TRANSITIONAL (default for unclear conditions)
-            # This covers ADX in the 20-25 zone or mixed signals
-            reason = "Mixed signals or ADX in transition zone"
-            if adx_range_threshold <= adx <= adx_trend_threshold:
-                reason = f"ADX in transition zone ({adx:.1f})"
-            
-            analysis_details.update({
-                'reason': reason,
-                'adx_zone': 'transition' if adx_range_threshold <= adx <= adx_trend_threshold else 'unclear'
-            })
-            return "TRANSITIONAL", analysis_details
+            elif adx < adx_transition_lower:
+                # Closer to ranging - check volatility context
+                if volatility_regime == "low":
+                    analysis_details.update({
+                        'combined_regime': 'weak_range_low_vol',
+                        'reason': f"Weak ranging with low volatility"
+                    })
+                    return "LOW_VOLATILITY", analysis_details  # Micro range
+                else:
+                    analysis_details.update({
+                        'combined_regime': 'weak_range',
+                        'reason': f"Moderate ADX ({adx:.1f}) ranging but unconfirmed"
+                    })
+                    return "RANGING", analysis_details
+            else:
+                # True neutral state
+                analysis_details.update({
+                    'combined_regime': 'neutral',
+                    'reason': f"ADX in neutral zone ({adx:.1f})"
+                })
+                return "TRANSITIONAL", analysis_details
             
         except Exception as e:
             self.logger.error(f"Error in market type determination: {e}")

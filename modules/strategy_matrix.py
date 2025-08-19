@@ -331,45 +331,124 @@ class StrategyMatrix:
         """
         self.logger = logger or logging.getLogger(self.__class__.__name__)
     
-    def select_strategy_and_timeframe(self, market_5min: str, market_1min: str) -> Tuple[str, str, str]:
+    def select_strategy_and_timeframe(self, market_5min: str, market_1min: str, analysis_5min: dict = None, analysis_1min: dict = None) -> Tuple[str, str, str]:
         """
-        Select optimal strategy and execution timeframe based on market conditions.
+        Select optimal strategy and execution timeframe based on market conditions with context-aware logic.
         
         Args:
             market_5min: 5-minute market condition (TRENDING, RANGING, HIGH_VOLATILITY, LOW_VOLATILITY, TRANSITIONAL)
             market_1min: 1-minute market condition (same options as above)
+            analysis_5min: Optional detailed analysis for 5m timeframe
+            analysis_1min: Optional detailed analysis for 1m timeframe
             
         Returns:
             Tuple[str, str, str]: (strategy_class_name, execution_timeframe, selection_reason)
         """
-        matrix_key = (market_5min, market_1min)
+        # Extract combined regime information if available
+        combined_5m = analysis_5min.get('analysis_details', {}).get('combined_regime', '') if analysis_5min else ''
+        combined_1m = analysis_1min.get('analysis_details', {}).get('combined_regime', '') if analysis_1min else ''
         
-        if matrix_key in self.STRATEGY_MATRIX:
-            selected_strategy = self.STRATEGY_MATRIX[matrix_key]
-            
-            # Get execution timeframe from risk profile
-            if selected_strategy in self.STRATEGY_RISK_PROFILES:
-                risk_profile = self.STRATEGY_RISK_PROFILES[selected_strategy]
-                execution_timeframe = risk_profile.execution_timeframe
-                description = risk_profile.description
+        # CONTEXT-AWARE SELECTION LOGIC
+        
+        # 1. Handle trending markets with volatility context
+        if market_5min == "TRENDING":
+            if 'trending_high_vol' in combined_5m or market_1min == "HIGH_VOLATILITY":
+                selected_strategy = 'StrategyHighVolatilityTrendRider'
+                context_reason = "High volatility trend requires robust trend rider"
+            elif 'trending_low_vol' in combined_5m or market_1min == "LOW_VOLATILITY":
+                selected_strategy = 'StrategyLowVolatilityTrendPullback'
+                context_reason = "Low volatility trend suits pullback strategy"
+            elif market_1min == "TRENDING":
+                selected_strategy = 'StrategyEMATrendRider'  # Both timeframes trending
+                context_reason = "Stable multi-timeframe trend"
             else:
-                execution_timeframe = '1m'  # Default fallback
-                description = "Strategy description not available"
-            
-            # Build selection reason
-            timeframe_reason = "5-min execution for stable trend-following" if execution_timeframe == '5m' else "1-min execution for precision and rapid response"
-            
-            reason = f"Selected {selected_strategy} on {execution_timeframe} timeframe for {market_5min}(5m) + {market_1min}(1m). {timeframe_reason}. {description}"
-            
-            self.logger.info(f"Strategy Matrix: {reason}")
-            return selected_strategy, execution_timeframe, reason
+                selected_strategy = 'StrategyBreakoutAndRetest'
+                context_reason = "Trend with mixed 1m conditions"
+        
+        # 2. Handle ranging markets with volatility context
+        elif market_5min == "RANGING":
+            if 'micro_range_low_vol' in combined_5m or (market_1min == "LOW_VOLATILITY" and 'micro_range' in combined_1m):
+                selected_strategy = 'StrategyMicroRangeScalping'
+                context_reason = "Micro range with low volatility"
+            elif market_1min == "HIGH_VOLATILITY":
+                selected_strategy = 'StrategyVolatilityReversalScalping'
+                context_reason = "Range with high volatility spikes"
+            elif market_1min == "TRENDING":
+                selected_strategy = 'StrategyRangeBreakoutMomentum'
+                context_reason = "Range with 1m trend breakout potential"
+            else:
+                selected_strategy = 'StrategyRSIRangeScalping'
+                context_reason = "Standard range conditions"
+        
+        # 3. Handle high volatility with confirmation
+        elif market_5min == "HIGH_VOLATILITY":
+            if 'high_vol_no_trend' in combined_5m:
+                selected_strategy = 'StrategyATRMomentumBreakout'
+                context_reason = "Pure high volatility momentum"
+            elif market_1min == "TRENDING" or 'trending_high_vol' in combined_1m:
+                selected_strategy = 'StrategyHighVolatilityTrendRider'
+                context_reason = "High volatility with trend component"
+            else:
+                selected_strategy = 'StrategyVolatilityReversalScalping'
+                context_reason = "High volatility mean reversion setup"
+        
+        # 4. Handle low volatility with squeeze detection
+        elif market_5min == "LOW_VOLATILITY":
+            if 'micro_range_low_vol' in combined_5m:
+                selected_strategy = 'StrategyMicroRangeScalping'
+                context_reason = "Confirmed micro range environment"
+            elif market_1min == "TRANSITIONAL" and 'squeeze_breakout_setup' in combined_1m:
+                selected_strategy = 'StrategyVolatilitySqueezeBreakout'
+                context_reason = "Volatility squeeze with breakout momentum detected"
+            elif market_1min == "TRENDING":
+                selected_strategy = 'StrategyLowVolatilityTrendPullback'
+                context_reason = "Low volatility with trending component"
+            else:
+                # Avoid squeeze breakout without confirmation
+                selected_strategy = 'StrategyMicroRangeScalping'
+                context_reason = "Low volatility without breakout signals"
+        
+        # 5. Handle transitional states
+        elif market_5min == "TRANSITIONAL":
+            if 'squeeze_breakout_setup' in combined_5m:
+                selected_strategy = 'StrategyVolatilitySqueezeBreakout'
+                context_reason = "Confirmed volatility squeeze setup"
+            elif market_1min == "HIGH_VOLATILITY":
+                selected_strategy = 'StrategyAdaptiveTransitionalMomentum'
+                context_reason = "Transitional with high volatility momentum"
+            elif market_1min == "TRENDING":
+                selected_strategy = 'StrategyBreakoutAndRetest'
+                context_reason = "Transitional with trend emergence"
+            else:
+                selected_strategy = 'StrategyAdaptiveTransitionalMomentum'
+                context_reason = "General transitional conditions"
+        
+        # 6. Fallback to matrix for standard combinations
         else:
-            # Fallback strategy if combination not found
-            fallback_strategy = 'StrategyBreakoutAndRetest'
-            fallback_timeframe = '1m'
-            reason = f"Unknown market combination {market_5min}(5m) + {market_1min}(1m). Using fallback: {fallback_strategy} on {fallback_timeframe}"
-            self.logger.warning(f"Strategy Matrix: {reason}")
-            return fallback_strategy, fallback_timeframe, reason
+            matrix_key = (market_5min, market_1min)
+            if matrix_key in self.STRATEGY_MATRIX:
+                selected_strategy = self.STRATEGY_MATRIX[matrix_key]
+                context_reason = f"Standard matrix selection for {matrix_key}"
+            else:
+                selected_strategy = 'StrategyBreakoutAndRetest'
+                context_reason = f"Fallback for unknown combination {matrix_key}"
+        
+        # Get execution timeframe from risk profile
+        if selected_strategy in self.STRATEGY_RISK_PROFILES:
+            risk_profile = self.STRATEGY_RISK_PROFILES[selected_strategy]
+            execution_timeframe = risk_profile.execution_timeframe
+            description = risk_profile.description
+        else:
+            execution_timeframe = '1m'  # Default fallback
+            description = "Strategy description not available"
+        
+        # Build comprehensive selection reason
+        timeframe_reason = "5-min execution for stable trend-following" if execution_timeframe == '5m' else "1-min execution for precision and rapid response"
+        
+        reason = f"Context-aware selection: {selected_strategy} on {execution_timeframe} for {market_5min}(5m) + {market_1min}(1m). {context_reason}. {timeframe_reason}."
+        
+        self.logger.info(f"Strategy Matrix: {reason}")
+        return selected_strategy, execution_timeframe, reason
 
     def get_strategy_risk_profile(self, strategy_name: str) -> Optional[StrategyRiskProfile]:
         """

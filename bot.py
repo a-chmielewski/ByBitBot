@@ -1849,8 +1849,12 @@ def automatic_strategy_and_timeframe_selection(analysis_results: dict, selected_
         logger_instance.error("Invalid market conditions detected. Cannot select strategy automatically.")
         return None, None, None, "Invalid market conditions"
     
-    # Select strategy and timeframe using the matrix
-    selected_strategy_class, execution_timeframe, selection_reason = strategy_matrix.select_strategy_and_timeframe(market_5min, market_1min)
+    # Select strategy and timeframe using the matrix with detailed analysis
+    analysis_5min = symbol_analysis.get('5m', {})
+    analysis_1min = symbol_analysis.get('1m', {})
+    selected_strategy_class, execution_timeframe, selection_reason = strategy_matrix.select_strategy_and_timeframe(
+        market_5min, market_1min, analysis_5min, analysis_1min
+    )
     strategy_description = strategy_matrix.get_strategy_description(selected_strategy_class)
     
     logger_instance.info(f"Strategy Matrix Selection:")
@@ -1867,9 +1871,10 @@ def automatic_strategy_and_timeframe_selection(analysis_results: dict, selected_
     
     return selected_strategy_class, execution_timeframe, strategy_description, selection_reason
 
-def check_strategy_needs_change(analysis_results: dict, selected_symbol: str, current_strategy_class: str, current_timeframe: str, logger_instance: logging.Logger) -> tuple:
+def check_strategy_needs_change(analysis_results: dict, selected_symbol: str, current_strategy_class: str, current_timeframe: str, logger_instance: logging.Logger, session_start_time=None, last_market_conditions=None) -> tuple:
     """
     Check if the current strategy and timeframe are still optimal for current market conditions.
+    Enhanced with persistence mechanisms to prevent excessive switching.
     
     Args:
         analysis_results: Current market analysis results
@@ -1877,6 +1882,8 @@ def check_strategy_needs_change(analysis_results: dict, selected_symbol: str, cu
         current_strategy_class: Current strategy class name
         current_timeframe: Current execution timeframe
         logger_instance: Logger instance
+        session_start_time: When current strategy session started
+        last_market_conditions: Previous market conditions for comparison
         
     Returns:
         tuple: (needs_change: bool, new_strategy_class: str, new_timeframe: str, reason: str)
@@ -1891,11 +1898,61 @@ def check_strategy_needs_change(analysis_results: dict, selected_symbol: str, cu
     market_5min = symbol_analysis.get('5m', {}).get('market_type', 'UNKNOWN')
     market_1min = symbol_analysis.get('1m', {}).get('market_type', 'UNKNOWN')
     
-    # Get optimal strategy and timeframe for current conditions
-    optimal_strategy_class, optimal_timeframe, selection_reason = strategy_matrix.select_strategy_and_timeframe(market_5min, market_1min)
+    # PERSISTENCE CHECK 1: Minimum session duration (90 minutes)
+    if session_start_time:
+        session_duration = (datetime.now() - session_start_time).total_seconds() / 60  # minutes
+        min_session_duration = 90  # 90 minutes minimum
+        
+        if session_duration < min_session_duration:
+            logger_instance.info(f"Strategy persistence: Session duration {session_duration:.1f}min < {min_session_duration}min minimum. Checking for opposite conditions only...")
+            
+            # Only allow immediate switch for truly opposite conditions
+            current_5min = last_market_conditions.get('5m') if last_market_conditions else 'UNKNOWN'
+            current_1min = last_market_conditions.get('1m') if last_market_conditions else 'UNKNOWN'
+            
+            # Define opposite condition pairs
+            opposite_conditions = {
+                'TRENDING': 'RANGING',
+                'RANGING': 'TRENDING',
+                'HIGH_VOLATILITY': 'LOW_VOLATILITY',
+                'LOW_VOLATILITY': 'HIGH_VOLATILITY'
+            }
+            
+            # Check if 5m condition is truly opposite (more weight on 5m)
+            is_opposite_5m = (current_5min in opposite_conditions and 
+                            opposite_conditions[current_5min] == market_5min)
+            
+            if not is_opposite_5m:
+                reason = f"Strategy persistence: Maintaining {current_strategy_class} (session {session_duration:.1f}min < {min_session_duration}min). Market: {market_5min}(5m) + {market_1min}(1m) not opposite to previous {current_5min}(5m) + {current_1min}(1m)"
+                logger_instance.info(reason)
+                return False, current_strategy_class, current_timeframe, reason
+            else:
+                logger_instance.warning(f"Opposite condition detected: {current_5min}(5m) -> {market_5min}(5m). Allowing immediate switch despite short session.")
+    
+    # PERSISTENCE CHECK 2: Confirmation filter - weight 5m conditions more heavily
+    if last_market_conditions:
+        prev_5min = last_market_conditions.get('5m', 'UNKNOWN')
+        prev_1min = last_market_conditions.get('1m', 'UNKNOWN')
+        
+        # If 5m condition hasn't changed, be more conservative about switching
+        if prev_5min == market_5min and prev_5min != 'UNKNOWN':
+            logger_instance.info(f"5m condition stable ({market_5min}). Requiring stronger 1m signal for strategy change...")
+            
+            # Only switch if 1m condition is significantly different or volatility extreme
+            if market_1min not in ['HIGH_VOLATILITY', 'LOW_VOLATILITY'] and prev_1min != 'UNKNOWN':
+                reason = f"Strategy persistence: 5m condition stable ({market_5min}), 1m change ({prev_1min}->{market_1min}) not extreme enough. Maintaining {current_strategy_class}"
+                logger_instance.info(reason)
+                return False, current_strategy_class, current_timeframe, reason
+    
+    # Get optimal strategy and timeframe for current conditions with detailed analysis
+    analysis_5min = symbol_analysis.get('5m', {})
+    analysis_1min = symbol_analysis.get('1m', {})
+    optimal_strategy_class, optimal_timeframe, selection_reason = strategy_matrix.select_strategy_and_timeframe(
+        market_5min, market_1min, analysis_5min, analysis_1min
+    )
     
     if optimal_strategy_class != current_strategy_class or optimal_timeframe != current_timeframe:
-        reason = f"Market conditions changed. Optimal setup is now {optimal_strategy_class} on {optimal_timeframe} instead of {current_strategy_class} on {current_timeframe}. {selection_reason}"
+        reason = f"Market conditions changed significantly. Optimal setup is now {optimal_strategy_class} on {optimal_timeframe} instead of {current_strategy_class} on {current_timeframe}. {selection_reason}"
         logger_instance.warning(reason)
         return True, optimal_strategy_class, optimal_timeframe, reason
     else:
@@ -2125,6 +2182,10 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
     current_strategy = strategy_instance
     current_strategy_name = current_strategy_class
     
+    # Strategy persistence tracking
+    session_start_time = datetime.now()
+    last_market_conditions = None
+    
     bot_logger.info(f"Initial strategy: {current_strategy_name}")
     bot_logger.info(f"Strategy check interval: {strategy_check_interval / 60:.0f} minutes")
     
@@ -2211,9 +2272,16 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                             current_analysis[symbol].update(analysis_5m[symbol])
                         
                         if current_analysis and symbol in current_analysis:
-                            # Check if strategy/timeframe needs to change
+                            # Store current market conditions for persistence checking
+                            current_market_conditions = {
+                                '5m': current_analysis[symbol].get('5m', {}).get('market_type', 'UNKNOWN'),
+                                '1m': current_analysis[symbol].get('1m', {}).get('market_type', 'UNKNOWN')
+                            }
+                            
+                            # Check if strategy/timeframe needs to change with persistence mechanisms
                             needs_change, new_strategy_class, new_timeframe, reason = check_strategy_needs_change(
-                                current_analysis, symbol, current_strategy_name, timeframe, bot_logger
+                                current_analysis, symbol, current_strategy_name, timeframe, bot_logger, 
+                                session_start_time, last_market_conditions
                             )
                             
                             if needs_change:
@@ -2282,6 +2350,9 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                                     current_strategy = new_strategy_instance
                                     current_strategy_name = new_strategy_class
                                     
+                                    # Reset session start time for new strategy
+                                    session_start_time = datetime.now()
+                                    
                                     # Update real-time monitor with new strategy info
                                     if 'real_time_monitor' in locals():
                                         real_time_monitor.set_current_strategy(new_strategy_class)
@@ -2308,6 +2379,11 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                 
                 # Update last check time regardless of whether we could evaluate
                 last_strategy_check = current_time
+                
+                # Update last market conditions if we successfully analyzed them
+                if 'current_market_conditions' in locals():
+                    last_market_conditions = current_market_conditions.copy()
+                
                 bot_logger.info("="*60)
                 bot_logger.info("STRATEGY EVALUATION CHECK COMPLETED")
                 bot_logger.info("="*60)
@@ -3449,11 +3525,14 @@ def main():
         bot_logger.info(f"Successfully loaded strategy class: {StratClass.__name__}")
     except Exception as e:
         bot_logger.error(f"Failed to load automatically selected strategy {selected_strategy_class}: {e}")
-        bot_logger.error("Falling back to StrategyBreakoutAndRetest with 1m timeframe as a working strategy")
+        bot_logger.error("Falling back to StrategyBreakoutAndRetest with its intended timeframe as a working strategy")
         try:
             StratClass = dynamic_import_strategy('breakout_and_retest_strategy', StrategyTemplate, bot_logger)
             selected_strategy_class = 'StrategyBreakoutAndRetest'
-            selected_timeframe = '1m'  # Use 1m as fallback timeframe
+            # Use the strategy's intended timeframe from risk profile
+            fallback_matrix = StrategyMatrix(bot_logger)
+            fallback_profile = fallback_matrix.get_strategy_risk_profile('StrategyBreakoutAndRetest')
+            selected_timeframe = fallback_profile.execution_timeframe if fallback_profile else '1m'
             bot_logger.info(f"Successfully loaded fallback strategy: {StratClass.__name__} on {selected_timeframe}")
         except Exception as fallback_error:
             bot_logger.error(f"Even fallback strategy failed to load: {fallback_error}")
