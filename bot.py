@@ -1959,6 +1959,7 @@ def automatic_strategy_and_timeframe_selection(analysis_results: dict, selected_
     # Apply short bias preference in uncertain conditions (leverage what's working)
     if directional_bias == 'NEUTRAL' and bias_strength == 'WEAK':
         # Check 5m trend for short bias hints
+        analysis_5min = symbol_analysis.get('5m', {})
         if market_5min == 'TRENDING' and analysis_5min:
             trend_dir_5m = analysis_5min.get('analysis_details', {}).get('trend_direction', 'NEUTRAL')
             if trend_dir_5m == 'BEARISH':
@@ -3529,6 +3530,8 @@ def main():
     risk_manager = AdvancedRiskManager(
         exchange=exchange,
         performance_tracker=perf_tracker,
+        session_manager=session_manager,
+        strategy_matrix=StrategyMatrix(bot_logger),
         logger=bot_logger
     )
     bot_logger.info("✅ AdvancedRiskManager initialized")

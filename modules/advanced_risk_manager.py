@@ -209,6 +209,7 @@ class AdvancedRiskManager:
         self.daily_loss_limit_hit = False
         self.total_open_risk = 0.0
         self.asset_exposures: Dict[str, AssetExposure] = {}
+        self.emergency_stop_active = False
         
         # Thread safety and caching
         self._lock = threading.Lock()
