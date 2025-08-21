@@ -113,7 +113,9 @@ def enhanced_order_validation(
     exchange: ExchangeConnector,
     account_equity: float,
     open_positions: List[Dict[str, Any]],
-    logger: logging.Logger
+    logger: logging.Logger,
+    directional_bias: str = 'NEUTRAL',
+    bias_strength: str = 'WEAK'
 ) -> Tuple[bool, Dict[str, Any], str]:
     """
     Enhanced order validation with comprehensive risk management integration.
@@ -141,6 +143,8 @@ def enhanced_order_validation(
         account_equity: Current account equity
         open_positions: List of currently open positions
         logger: Logger instance
+        directional_bias: Higher timeframe directional bias
+        bias_strength: Strength of the bias (WEAK/MODERATE/STRONG)
         
     Returns:
         Tuple[bool, Dict[str, Any], str]: (approved, order_details, reason)
@@ -206,6 +210,70 @@ def enhanced_order_validation(
             current_volatility_pct = 1.0
             volatility_regime = 'normal'
             market_regime = 'unknown'
+        
+        # ===== DIRECTIONAL BIAS FILTER =====
+        logger.info("🧭 Step 2.5: Applying directional bias filter...")
+        
+        # Block long trades in strong bearish bias
+        if side.lower() == 'buy' and directional_bias in ['BEARISH', 'BEARISH_BIASED']:
+            if bias_strength == 'STRONG':
+                return False, {}, f"BLOCKED: Long trade rejected due to STRONG bearish bias ({directional_bias})"
+            elif bias_strength == 'MODERATE' and directional_bias == 'BEARISH':
+                return False, {}, f"BLOCKED: Long trade rejected due to MODERATE bearish bias"
+        
+        # Apply stricter criteria for long trades in any bearish conditions
+        if side.lower() == 'buy' and directional_bias in ['BEARISH', 'BEARISH_BIASED', 'NEUTRAL']:
+            # Get current market data for ADX check
+            try:
+                current_data = market_analyzer._get_cached_data(symbol, '1m', min_periods=50)
+                if current_data is not None and 'adx' in current_data.columns:
+                    current_adx = current_data['adx'].iloc[-1]
+                    
+                    # Stricter ADX threshold for long entries (30 vs normal 25)
+                    min_adx_long = 30 if directional_bias in ['BEARISH', 'BEARISH_BIASED'] else 28
+                    
+                    if current_adx < min_adx_long:
+                        return False, {}, f"BLOCKED: Long trade ADX ({current_adx:.1f}) below strict threshold ({min_adx_long}) in {directional_bias} bias"
+                    
+                    logger.info(f"   Long trade ADX check passed: {current_adx:.1f} >= {min_adx_long}")
+                else:
+                    logger.warning("   Cannot apply ADX filter for long trade - no data available")
+            except Exception as adx_error:
+                logger.warning(f"   ADX filter failed: {adx_error}")
+        
+        # Log directional bias decision
+        if directional_bias != 'NEUTRAL':
+            logger.info(f"   Directional bias: {directional_bias} ({bias_strength}) - {'LONG RESTRICTED' if side.lower() == 'buy' else 'SHORT FAVORED'}")
+        else:
+            logger.info(f"   Directional bias: NEUTRAL - No bias restrictions")
+        
+        # ===== MINIMUM EXPECTED MOVE CHECK =====
+        logger.info("💰 Step 2.6: Checking minimum expected move vs fees...")
+        
+        try:
+            # Get current market data for ATR calculation
+            current_data = market_analyzer._get_cached_data(symbol, '1m', min_periods=20)
+            if current_data is not None and 'atr_14' in current_data.columns:
+                current_atr = current_data['atr_14'].iloc[-1]
+                expected_move_pct = (current_atr / entry_price) * 100
+                
+                # Estimate trading fees (assume 0.1% total roundtrip fees)
+                estimated_fees_pct = 0.1
+                min_expected_move_pct = estimated_fees_pct * 2.5  # Need 2.5x fees to be profitable
+                
+                if expected_move_pct < min_expected_move_pct:
+                    return False, {}, f"BLOCKED: Expected move ({expected_move_pct:.2f}%) too small vs fees ({min_expected_move_pct:.2f}% required)"
+                
+                # Additional check: avoid trading in extremely low volatility
+                min_volatility_threshold = 0.3  # 0.3% minimum volatility
+                if expected_move_pct < min_volatility_threshold:
+                    return False, {}, f"BLOCKED: Market too quiet ({expected_move_pct:.2f}% < {min_volatility_threshold}%) - avoid noise trades"
+                
+                logger.info(f"   Expected move check passed: {expected_move_pct:.2f}% >= {min_expected_move_pct:.2f}%")
+            else:
+                logger.warning("   Cannot calculate expected move - no ATR data available")
+        except Exception as move_error:
+            logger.warning(f"   Expected move check failed: {move_error}")
         
         # ===== STEP 3: Compute Stop Loss and Take Profit =====
         logger.info("🛡️  Step 3: Computing stop loss and take profit levels...")
@@ -274,8 +342,8 @@ def enhanced_order_validation(
             except Exception as e:
                 logger.warning(f"⚠️  RiskUtilities calculation failed, using fallback: {e}")
                 # Fallback to simple percentage-based calculation
-                sl_pct = risk_config.get('stop_loss_fixed_pct', 0.02)
-                tp_pct = risk_config.get('take_profit_fixed_pct', 0.04)
+                sl_pct = risk_config.get('stop_loss_fixed_pct', 0.03)
+                tp_pct = risk_config.get('take_profit_fixed_pct', 0.06)
                 
                 if side.lower() == 'buy':
                     sl_price = entry_price * (1 - sl_pct)
@@ -289,8 +357,8 @@ def enhanced_order_validation(
         else:
             # No risk utilities available, use simple percentage-based approach
             logger.warning("⚠️  RiskUtilities not available, using simple percentage calculation")
-            sl_pct = risk_config.get('stop_loss_fixed_pct', 0.02)
-            tp_pct = risk_config.get('take_profit_fixed_pct', 0.04)
+            sl_pct = risk_config.get('stop_loss_fixed_pct', 0.03)
+            tp_pct = risk_config.get('take_profit_fixed_pct', 0.06)
             
             if side.lower() == 'buy':
                 sl_price = entry_price * (1 - sl_pct)
@@ -461,8 +529,8 @@ def enhanced_order_validation(
         logger.info("📋 Step 7: Preparing final order details...")
         
         # Calculate percentages for OrderManager compatibility
-        sl_pct = abs(entry_price - sl_price) / entry_price if sl_price else 0.02
-        tp_pct = abs(tp_prices[0] - entry_price) / entry_price if tp_prices else 0.04
+        sl_pct = abs(entry_price - sl_price) / entry_price if sl_price else 0.03
+        tp_pct = abs(tp_prices[0] - entry_price) / entry_price if tp_prices else 0.06
         
         order_details = {
             'symbol': symbol,
@@ -533,7 +601,9 @@ def enhanced_order_placement_with_validation(
     account_equity: float,
     open_positions: List[Dict[str, Any]],
     logger: logging.Logger,
-    trailing_handler: Optional[TrailingTPHandler] = None
+    trailing_handler: Optional[TrailingTPHandler] = None,
+    directional_bias: str = 'NEUTRAL',
+    bias_strength: str = 'WEAK'
 ) -> Tuple[bool, Optional[Dict[str, Any]], str]:
     """
     Enhanced order placement that uses comprehensive risk validation before submitting orders.
@@ -600,7 +670,9 @@ def enhanced_order_placement_with_validation(
             exchange=exchange,
             account_equity=account_equity,
             open_positions=open_positions,
-            logger=logger
+            logger=logger,
+            directional_bias=directional_bias,
+            bias_strength=bias_strength
         )
         
         if not approved:
@@ -801,7 +873,9 @@ def dry_run_enhanced_order_validation_demo(
             exchange=exchange,
             account_equity=demo_account_equity,
             open_positions=demo_open_positions,
-            logger=logger
+            logger=logger,
+            directional_bias='BEARISH_BIASED',  # Demo with bearish bias
+            bias_strength='MODERATE'
         )
         
         logger.info("🏁 DRY-RUN RESULTS:")
@@ -1408,7 +1482,7 @@ def restart_configuration_with_new_strategy(new_strategy_name, available_strateg
         bot_logger.error(f"Error during strategy reconfiguration: {e}", exc_info=True)
         bot_logger.error("Strategy change failed - bot will shut down")
 
-def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, data_fetcher, order_manager, perf_tracker, exchange, config, bot_logger, strategy_matrix=None, config_loader=None, market_analyzer=None, risk_manager=None):
+def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, data_fetcher, order_manager, perf_tracker, exchange, config, bot_logger, strategy_matrix=None, config_loader=None, market_analyzer=None, risk_manager=None, directional_bias: str = 'NEUTRAL', bias_strength: str = 'WEAK'):
     """
     Main trading loop that can be reused for strategy changes.
     Enhanced with comprehensive risk management integration.
@@ -1438,6 +1512,10 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
     
     # Wrap strategy in list for compatibility with existing loop logic
     strategies = [strategy_instance]
+    
+    # Store bias parameters for order validation (initialize before main loop)
+    current_directional_bias = directional_bias
+    current_bias_strength = bias_strength
     
     while True:
         bot_logger.debug("Main loop iteration started.")
@@ -1563,8 +1641,14 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                         account_equity=account_equity,
                         open_positions=open_positions,
                         logger=bot_logger,
-                        trailing_handler=trailing_tp_handler
+                        trailing_handler=trailing_tp_handler,
+                        directional_bias=current_directional_bias,
+                        bias_strength=current_bias_strength
                     )
+                    
+                    # Track order placement time for minimum hold logic
+                    if success and order_responses:
+                        order_manager.track_order_placement(symbol)
                     
                     if not success:
                         # Enhanced validation failed - create error response for strategy
@@ -1683,6 +1767,11 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                         bot_logger.debug(f"Position sync confirmed for {symbol}: Strategy size {current_position_details.get('size', 0)}, Exchange size {actual_size}")
                 except Exception as e:
                     bot_logger.warning(f"Failed to verify position for {symbol}: {e}. Proceeding with exit attempt.")
+                
+                # Check minimum hold time before allowing exits
+                if not order_manager.can_close_position(symbol):
+                    bot_logger.debug(f"Position {symbol} in minimum hold period - skipping exit check")
+                    continue
                 
                 exit_signal = strat.check_exit(symbol=symbol)
                 if exit_signal:
@@ -1839,6 +1928,44 @@ def automatic_strategy_and_timeframe_selection(analysis_results: dict, selected_
     
     market_5min = symbol_analysis.get('5m', {}).get('market_type', 'UNKNOWN')
     market_1min = symbol_analysis.get('1m', {}).get('market_type', 'UNKNOWN')
+    analysis_1h = symbol_analysis.get('1h', {})
+    
+    # Determine higher-timeframe directional bias from 1-hour analysis with multiple confirmations
+    directional_bias = 'NEUTRAL'
+    bias_strength = 'WEAK'
+    
+    if analysis_1h and 'analysis_details' in analysis_1h:
+        analysis_details = analysis_1h['analysis_details']
+        market_type_1h = analysis_1h.get('market_type', 'UNKNOWN')
+        
+        # Primary bias from trend direction
+        if market_type_1h == 'TRENDING':
+            trend_direction = analysis_details.get('trend_direction', 'NEUTRAL')
+            directional_bias = trend_direction
+            
+            # Check trend strength for bias confidence
+            adx_1h = analysis_details.get('adx', 0)
+            if adx_1h > 35:
+                bias_strength = 'STRONG'
+            elif adx_1h > 25:
+                bias_strength = 'MODERATE'
+        
+        # Additional confirmation from combined regime
+        combined_regime = analysis_details.get('combined_regime', '')
+        if 'trending_high_vol' in combined_regime or 'trending_low_vol' in combined_regime:
+            if bias_strength == 'WEAK':
+                bias_strength = 'MODERATE'
+    
+    # Apply short bias preference in uncertain conditions (leverage what's working)
+    if directional_bias == 'NEUTRAL' and bias_strength == 'WEAK':
+        # Check 5m trend for short bias hints
+        if market_5min == 'TRENDING' and analysis_5min:
+            trend_dir_5m = analysis_5min.get('analysis_details', {}).get('trend_direction', 'NEUTRAL')
+            if trend_dir_5m == 'BEARISH':
+                directional_bias = 'BEARISH_BIASED'  # Prefer shorts in uncertain conditions
+                bias_strength = 'MODERATE'
+    
+    logger_instance.info(f"Directional Bias (1h): {directional_bias} ({bias_strength})")
     
     logger_instance.info(f"Market conditions for {selected_symbol}:")
     logger_instance.info(f"  5-minute timeframe: {market_5min}")
@@ -1847,13 +1974,13 @@ def automatic_strategy_and_timeframe_selection(analysis_results: dict, selected_
     # Validate market conditions
     if not strategy_matrix.validate_market_conditions(market_5min, market_1min):
         logger_instance.error("Invalid market conditions detected. Cannot select strategy automatically.")
-        return None, None, None, "Invalid market conditions"
+        return None, None, None, "Invalid market conditions", "NEUTRAL"
     
     # Select strategy and timeframe using the matrix with detailed analysis
     analysis_5min = symbol_analysis.get('5m', {})
     analysis_1min = symbol_analysis.get('1m', {})
     selected_strategy_class, execution_timeframe, selection_reason = strategy_matrix.select_strategy_and_timeframe(
-        market_5min, market_1min, analysis_5min, analysis_1min
+        market_5min, market_1min, analysis_5min, analysis_1min, directional_bias
     )
     strategy_description = strategy_matrix.get_strategy_description(selected_strategy_class)
     
@@ -1869,7 +1996,7 @@ def automatic_strategy_and_timeframe_selection(analysis_results: dict, selected_
     
     logger_instance.info("="*60)
     
-    return selected_strategy_class, execution_timeframe, strategy_description, selection_reason
+    return selected_strategy_class, execution_timeframe, strategy_description, selection_reason, directional_bias, bias_strength
 
 def check_strategy_needs_change(analysis_results: dict, selected_symbol: str, current_strategy_class: str, current_timeframe: str, logger_instance: logging.Logger, session_start_time=None, last_market_conditions=None) -> tuple:
     """
@@ -2151,7 +2278,7 @@ def sync_strategy_position_with_exchange(strategy, symbol, exchange, category, l
         logger.error(f"Error during position sync for {symbol}: {e}")
         return sync_result
 
-def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_class, symbol, timeframe, leverage, category, data_fetcher, order_manager, perf_tracker, exchange, config, analysis_results, bot_logger, session_manager, risk_manager, real_time_monitor, strategy_matrix=None, config_loader=None, market_analyzer_enhanced=None):
+def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_class, symbol, timeframe, leverage, category, data_fetcher, order_manager, perf_tracker, exchange, config, analysis_results, bot_logger, session_manager, risk_manager, real_time_monitor, directional_bias: str, bias_strength: str = 'WEAK', strategy_matrix=None, config_loader=None, market_analyzer_enhanced=None):
     """
     Main trading loop with automatic strategy switching based on market conditions.
     Enhanced with comprehensive risk management integration.
@@ -2186,7 +2313,10 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
     session_start_time = datetime.now()
     last_market_conditions = None
     
+    # Bias parameters already initialized before main loop
+    
     bot_logger.info(f"Initial strategy: {current_strategy_name}")
+    bot_logger.info(f"Initial directional bias: {directional_bias} ({bias_strength})")
     bot_logger.info(f"Strategy check interval: {strategy_check_interval / 60:.0f} minutes")
     
     while True:
@@ -2426,8 +2556,8 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                     try:
                         # Calculate stop loss and take profit prices for risk validation
                         entry_price = entry_signal.get('price') or current_strategy.data.iloc[-1]['close']
-                        sl_pct = entry_signal.get('sl_pct', 2.0)
-                        tp_pct = entry_signal.get('tp_pct', 3.0)
+                        sl_pct = entry_signal.get('sl_pct', 3.0)
+                        tp_pct = entry_signal.get('tp_pct', 6.0)
                         side = entry_signal.get('side')
                         
                         # Calculate stop loss and take profit prices
@@ -2600,6 +2730,11 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                      
                 except Exception as e:
                     bot_logger.warning(f"Position sync failed for {symbol}: {e}. Proceeding with exit check.")
+                
+                # Check minimum hold time before allowing exits
+                if not order_manager.can_close_position(symbol):
+                    bot_logger.debug(f"Position {symbol} in minimum hold period - skipping exit check")
+                    continue
                 
                 exit_signal = current_strategy.check_exit(symbol)
                 if exit_signal:
@@ -3503,7 +3638,7 @@ def main():
     selected_leverage = select_leverage(bot_logger)
     
     # AUTOMATIC STRATEGY AND TIMEFRAME SELECTION based on market conditions
-    selected_strategy_class, selected_timeframe, strategy_description, selection_reason = automatic_strategy_and_timeframe_selection(
+    selected_strategy_class, selected_timeframe, strategy_description, selection_reason, directional_bias, bias_strength = automatic_strategy_and_timeframe_selection(
         analysis_results, selected_symbol, bot_logger
     )
     
@@ -3744,7 +3879,7 @@ def main():
         run_trading_loop_with_auto_strategy(
             strategy_instance, selected_strategy_class, symbol, timeframe, leverage, category,
             data_fetcher, order_manager, perf_tracker, exchange, config, analysis_results, bot_logger,
-            session_manager, risk_manager, real_time_monitor, strategy_matrix, config_loader, market_analyzer
+            session_manager, risk_manager, real_time_monitor, directional_bias, bias_strength, strategy_matrix, config_loader, market_analyzer
         )
     except KeyboardInterrupt:
         bot_logger.info('Bot shutting down (KeyboardInterrupt).')

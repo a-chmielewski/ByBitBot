@@ -13,33 +13,33 @@ from dataclasses import dataclass, asdict
 @dataclass
 class StopLossConfig:
     """Stop loss configuration for strategies"""
-    mode: str = 'fixed_pct'  # 'fixed_pct' | 'atr_mult'
-    fixed_pct: float = 0.02  # Fixed percentage (2%)
-    atr_multiplier: float = 1.5  # ATR multiplier for dynamic stops
-    max_loss_pct: float = 0.05  # Maximum loss percentage (5%)
+    mode: str = 'atr_mult'  # 'fixed_pct' | 'atr_mult'
+    fixed_pct: float = 0.015  # Fixed percentage (1.5%) - widened from 0.5%
+    atr_multiplier: float = 2.5  # ATR multiplier for dynamic stops - widened from 1.5x
+    max_loss_pct: float = 0.08  # Maximum loss percentage (8%) - increased from 5%
 
 @dataclass
 class TakeProfitConfig:
     """Take profit configuration for strategies"""
-    mode: str = 'fixed_pct'  # 'fixed_pct' | 'progressive_levels'
-    fixed_pct: float = 0.04  # Fixed percentage (4%)
-    progressive_levels: List[float] = None  # Progressive levels [0.02, 0.04, 0.06]
-    partial_exit_sizes: List[float] = None  # Partial exit sizes [0.5, 0.3, 0.2]
+    mode: str = 'progressive_levels'  # 'fixed_pct' | 'progressive_levels'
+    fixed_pct: float = 0.06  # Fixed percentage (6%) - increased from 4%
+    progressive_levels: List[float] = None  # Progressive levels - widened for better R:R
+    partial_exit_sizes: List[float] = None  # Partial exit sizes [0.3, 0.3, 0.4] - let winners run longer
     
     def __post_init__(self):
         if self.progressive_levels is None:
-            self.progressive_levels = [0.02, 0.04, 0.06]
+            self.progressive_levels = [0.025, 0.05, 0.10]  # Widened: 2.5%, 5%, 10%
         if self.partial_exit_sizes is None:
-            self.partial_exit_sizes = [0.5, 0.3, 0.2]
+            self.partial_exit_sizes = [0.3, 0.3, 0.4]  # Let 40% run to final target
 
 @dataclass
 class TrailingStopConfig:
     """Trailing stop configuration for strategies"""
-    enabled: bool = False
-    mode: str = 'price_pct'  # 'price_pct' | 'atr_mult'
-    offset_pct: float = 0.015  # 1.5% trailing offset
-    atr_multiplier: float = 1.5  # ATR multiplier for trailing offset
-    activation_pct: float = 0.01  # Activate after 1% profit
+    enabled: bool = True  # Enable by default to let winners run
+    mode: str = 'atr_mult'  # 'price_pct' | 'atr_mult'
+    offset_pct: float = 0.02  # 2% trailing offset - widened
+    atr_multiplier: float = 2.0  # ATR multiplier for trailing offset - widened
+    activation_pct: float = 0.015  # Activate after 1.5% profit - slightly higher threshold
 
 @dataclass
 class PositionSizingConfig:
@@ -118,9 +118,9 @@ class StrategyMatrix:
             description='EMA Trend Rider with ADX Filter - Stable trend-following on 5m timeframe',
             market_type_tags=['TRENDING'],
             execution_timeframe='5m',
-            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=1.8, fixed_pct=0.015),
-            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.015, 0.03, 0.045]),
-            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.2),
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=3.0, max_loss_pct=0.08),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.03, 0.06, 0.12]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=2.0, activation_pct=0.02),
             position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.008, max_position_pct=4.0),
             leverage_by_regime=LeverageByRegimeConfig(low=1.3, normal=1.0, high=0.7),
             portfolio_tags=PortfolioTagsConfig(factor='trend_following', correlation_group='trend_momentum'),
@@ -133,9 +133,9 @@ class StrategyMatrix:
             description='ATR Momentum Breakout for high-volatility momentum trading',
             market_type_tags=['HIGH_VOLATILITY'],
             execution_timeframe='1m',
-            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=1.5, max_loss_pct=0.04),
-            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.02, 0.035, 0.05]),
-            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.0, activation_pct=0.015),
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=2.8, max_loss_pct=0.08),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.035, 0.07, 0.14]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=2.0, activation_pct=0.02),
             position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.012, max_position_pct=3.0),
             leverage_by_regime=LeverageByRegimeConfig(low=1.0, normal=0.9, high=0.6),
             portfolio_tags=PortfolioTagsConfig(factor='momentum', correlation_group='high_vol_breakout'),
@@ -148,9 +148,9 @@ class StrategyMatrix:
             description='Breakout and Retest for trend continuation trades',
             market_type_tags=['TRENDING', 'TRANSITIONAL'],
             execution_timeframe='1m',
-            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=2.0, fixed_pct=0.02),
-            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.025, 0.04, 0.06]),
-            trailing_stop=TrailingStopConfig(enabled=True, mode='price_pct', offset_pct=0.018),
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=3.2, max_loss_pct=0.08),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.04, 0.08, 0.16]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=2.0, activation_pct=0.02),
             position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.01, max_position_pct=3.5),
             leverage_by_regime=LeverageByRegimeConfig(low=1.2, normal=1.0, high=0.8),
             portfolio_tags=PortfolioTagsConfig(factor='momentum', correlation_group='breakout_momentum'),
@@ -163,9 +163,9 @@ class StrategyMatrix:
             description='RSI Range Scalping with candlestick confirmation for ranging markets',
             market_type_tags=['RANGING'],
             execution_timeframe='1m',
-            stop_loss=StopLossConfig(mode='fixed_pct', fixed_pct=0.015, max_loss_pct=0.025),
-            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.01, 0.02, 0.03]),
-            trailing_stop=TrailingStopConfig(enabled=False),
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=2.5, max_loss_pct=0.06),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.03, 0.06, 0.12]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.8, activation_pct=0.015),
             position_sizing=PositionSizingConfig(mode='fixed_notional', fixed_notional=800.0, max_position_pct=2.5),
             leverage_by_regime=LeverageByRegimeConfig(low=1.4, normal=1.2, high=0.8),
             portfolio_tags=PortfolioTagsConfig(factor='mean_reversion', correlation_group='range_scalping'),
@@ -178,9 +178,9 @@ class StrategyMatrix:
             description='Volatility Reversal Scalping for high-vol mean reversion',
             market_type_tags=['HIGH_VOLATILITY', 'RANGING'],
             execution_timeframe='1m',
-            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=1.2, max_loss_pct=0.03),
-            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.015, 0.025, 0.04]),
-            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=0.8, activation_pct=0.01),
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=2.6, max_loss_pct=0.07),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.035, 0.07, 0.14]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.8, activation_pct=0.02),
             position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.015, max_position_pct=3.0),
             leverage_by_regime=LeverageByRegimeConfig(low=1.1, normal=0.9, high=0.6),
             portfolio_tags=PortfolioTagsConfig(factor='mean_reversion', correlation_group='vol_reversal'),
@@ -193,9 +193,9 @@ class StrategyMatrix:
             description='Micro Range Scalping for low-volatility tight ranges',
             market_type_tags=['LOW_VOLATILITY', 'RANGING'],
             execution_timeframe='1m',
-            stop_loss=StopLossConfig(mode='fixed_pct', fixed_pct=0.008, max_loss_pct=0.015),
-            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.005, 0.01, 0.015]),
-            trailing_stop=TrailingStopConfig(enabled=True, mode='price_pct', offset_pct=0.008),
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=2.2, max_loss_pct=0.05),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.02, 0.04, 0.08]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.5, activation_pct=0.01),
             position_sizing=PositionSizingConfig(mode='fixed_notional', fixed_notional=1200.0, max_position_pct=4.0),
             leverage_by_regime=LeverageByRegimeConfig(low=1.5, normal=1.3, high=1.0),
             portfolio_tags=PortfolioTagsConfig(factor='mean_reversion', correlation_group='micro_scalping'),
@@ -208,9 +208,9 @@ class StrategyMatrix:
             description='Adaptive Transitional Momentum for regime change detection',
             market_type_tags=['TRANSITIONAL'],
             execution_timeframe='1m',
-            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=1.8, fixed_pct=0.025),
-            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.02, 0.035, 0.055]),
-            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.3, activation_pct=0.015),
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=2.8, max_loss_pct=0.08),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.04, 0.08, 0.16]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=2.0, activation_pct=0.02),
             position_sizing=PositionSizingConfig(mode='kelly_capped', kelly_cap=0.08, risk_per_trade=0.012),
             leverage_by_regime=LeverageByRegimeConfig(low=1.1, normal=1.0, high=0.7),
             portfolio_tags=PortfolioTagsConfig(factor='adaptive', correlation_group='transitional_momentum'),
@@ -223,9 +223,9 @@ class StrategyMatrix:
             description='High-Volatility Trend Rider for volatile trending markets',
             market_type_tags=['HIGH_VOLATILITY', 'TRENDING'],
             execution_timeframe='1m',
-            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=2.2, max_loss_pct=0.045),
-            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.03, 0.05, 0.08]),
-            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.5),
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=3.5, max_loss_pct=0.10),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.05, 0.10, 0.20]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=2.2, activation_pct=0.025),
             position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.01, max_position_pct=3.0),
             leverage_by_regime=LeverageByRegimeConfig(low=1.0, normal=0.8, high=0.5),
             portfolio_tags=PortfolioTagsConfig(factor='trend_following', correlation_group='high_vol_trend'),
@@ -238,9 +238,9 @@ class StrategyMatrix:
             description='Low-Volatility Trend Pullback for quiet trending markets',
             market_type_tags=['LOW_VOLATILITY', 'TRENDING'],
             execution_timeframe='1m',
-            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=1.5, fixed_pct=0.012),
-            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.012, 0.025, 0.04]),
-            trailing_stop=TrailingStopConfig(enabled=True, mode='price_pct', offset_pct=0.012),
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=2.8, max_loss_pct=0.06),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.035, 0.07, 0.14]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.8, activation_pct=0.02),
             position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.008, max_position_pct=3.5),
             leverage_by_regime=LeverageByRegimeConfig(low=1.4, normal=1.2, high=0.9),
             portfolio_tags=PortfolioTagsConfig(factor='trend_following', correlation_group='low_vol_trend'),
@@ -253,9 +253,9 @@ class StrategyMatrix:
             description='Range Breakout Momentum for range-to-trend transitions',
             market_type_tags=['RANGING', 'TRANSITIONAL'],
             execution_timeframe='1m',
-            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=1.8, fixed_pct=0.022),
-            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.025, 0.045, 0.07]),
-            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.2),
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=3.0, max_loss_pct=0.08),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.04, 0.08, 0.16]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=2.0, activation_pct=0.02),
             position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.011, max_position_pct=3.5),
             leverage_by_regime=LeverageByRegimeConfig(low=1.2, normal=1.0, high=0.8),
             portfolio_tags=PortfolioTagsConfig(factor='momentum', correlation_group='range_breakout'),
@@ -268,9 +268,9 @@ class StrategyMatrix:
             description='Volatility Squeeze Breakout for low-to-high vol transitions',
             market_type_tags=['LOW_VOLATILITY', 'TRANSITIONAL'],
             execution_timeframe='1m',
-            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=1.6, fixed_pct=0.018),
-            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.02, 0.04, 0.065]),
-            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.1, activation_pct=0.015),
+            stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=2.8, max_loss_pct=0.08),
+            take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.04, 0.08, 0.16]),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=2.0, activation_pct=0.02),
             position_sizing=PositionSizingConfig(mode='vol_normalized', risk_per_trade=0.01, max_position_pct=3.5),
             leverage_by_regime=LeverageByRegimeConfig(low=1.3, normal=1.1, high=0.8),
             portfolio_tags=PortfolioTagsConfig(factor='volatility', correlation_group='squeeze_breakout'),
@@ -331,7 +331,7 @@ class StrategyMatrix:
         """
         self.logger = logger or logging.getLogger(self.__class__.__name__)
     
-    def select_strategy_and_timeframe(self, market_5min: str, market_1min: str, analysis_5min: dict = None, analysis_1min: dict = None) -> Tuple[str, str, str]:
+    def select_strategy_and_timeframe(self, market_5min: str, market_1min: str, analysis_5min: dict = None, analysis_1min: dict = None, directional_bias: str = 'NEUTRAL') -> Tuple[str, str, str]:
         """
         Select optimal strategy and execution timeframe based on market conditions with context-aware logic.
         
@@ -340,6 +340,7 @@ class StrategyMatrix:
             market_1min: 1-minute market condition (same options as above)
             analysis_5min: Optional detailed analysis for 5m timeframe
             analysis_1min: Optional detailed analysis for 1m timeframe
+            directional_bias: Higher timeframe directional bias (BEARISH, BULLISH, NEUTRAL, etc.)
             
         Returns:
             Tuple[str, str, str]: (strategy_class_name, execution_timeframe, selection_reason)
@@ -442,10 +443,26 @@ class StrategyMatrix:
             execution_timeframe = '1m'  # Default fallback
             description = "Strategy description not available"
         
+        # Apply directional bias preference (favor short-oriented strategies in bearish conditions)
+        bias_adjustment = ""
+        if directional_bias in ['BEARISH', 'BEARISH_BIASED']:
+            # Prefer strategies that work well with short trades
+            short_friendly_strategies = {
+                'StrategyBreakoutAndRetest': 'StrategyVolatilityReversalScalping',
+                'StrategyEMATrendRider': 'StrategyHighVolatilityTrendRider',
+                'StrategyRSIRangeScalping': 'StrategyVolatilityReversalScalping'
+            }
+            
+            if selected_strategy in short_friendly_strategies:
+                alternative = short_friendly_strategies[selected_strategy]
+                if alternative in self.STRATEGY_RISK_PROFILES:
+                    selected_strategy = alternative
+                    bias_adjustment = f" (switched to {alternative} for bearish bias)"
+        
         # Build comprehensive selection reason
         timeframe_reason = "5-min execution for stable trend-following" if execution_timeframe == '5m' else "1-min execution for precision and rapid response"
         
-        reason = f"Context-aware selection: {selected_strategy} on {execution_timeframe} for {market_5min}(5m) + {market_1min}(1m). {context_reason}. {timeframe_reason}."
+        reason = f"Context-aware selection: {selected_strategy} on {execution_timeframe} for {market_5min}(5m) + {market_1min}(1m). {context_reason}. {timeframe_reason}.{bias_adjustment}"
         
         self.logger.info(f"Strategy Matrix: {reason}")
         return selected_strategy, execution_timeframe, reason

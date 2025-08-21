@@ -443,8 +443,8 @@ class StrategyATRMomentumBreakout(StrategyTemplate):
             current_price = self.data['close'].iloc[idx]
             bars_held = idx - self.entry_bar
             
-            # Time-based exit for failed breakouts
-            failed_breakout_time = self.config.get('failed_breakout_time', 3)
+            # Time-based exit for failed breakouts (increased from 3 to 6 bars)
+            failed_breakout_time = self.config.get('failed_breakout_time', 6)
             if bars_held >= failed_breakout_time and not self.scalp_target_hit:
                 # Check if trade is not profitable
                 if self.entry_side == 'long' and current_price <= self.entry_price:

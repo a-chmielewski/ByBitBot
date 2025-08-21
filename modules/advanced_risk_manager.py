@@ -188,115 +188,173 @@ class AdvancedRiskManager:
     - Risk reporting and analytics
     """
     
-    def __init__(self, exchange, performance_tracker, logger: Optional[logging.Logger] = None,
-                 risk_limits: Optional[RiskLimits] = None):
+    def __init__(self, exchange, performance_tracker, session_manager, strategy_matrix, config: Dict = None, logger: Optional[logging.Logger] = None):
         self.exchange = exchange
         self.performance_tracker = performance_tracker
+        self.session_manager = session_manager
+        self.strategy_matrix = strategy_matrix
+        self.config = config or {}
         self.logger = logger or logging.getLogger(self.__class__.__name__)
-        self.risk_limits = risk_limits or RiskLimits()
         
-        # Risk state tracking
+        # Load risk limits from config
+        self.risk_limits = RiskLimits(**self.config.get('risk_limits', {}))
+        
+        # State tracking
         self.positions: Dict[str, PositionRisk] = {}
         self.risk_violations: List[Dict[str, Any]] = []
-        self.emergency_stop_active = False
-        self.last_trade_time = None
-        self.daily_start_balance = None
-        self.session_start_time = datetime.now(timezone.utc)
-        
-        # Enhanced portfolio-level state tracking
         self.trading_state = TradingState.ACTIVE
-        self.daily_loss_limit_hit = False
         self.circuit_breaker_state = CircuitBreakerState()
-        self.asset_exposures: Dict[str, AssetExposure] = {}
-        self.total_open_risk = 0.0
-        self.correlation_cache: Dict[str, CorrelationData] = {}
-        self.last_correlation_update = None
-        self.read_only_mode = False  # For non-blocking operations
-        
-        # Drawdown tracking for circuit breaker
         self.drawdown_history: List[Dict[str, Any]] = []
         self.rolling_drawdown_pct = 0.0
+        self.daily_loss_limit_hit = False
+        self.total_open_risk = 0.0
+        self.asset_exposures: Dict[str, AssetExposure] = {}
         
-        # Thread safety
+        # Thread safety and caching
         self._lock = threading.Lock()
-        
-        # Risk calculation cache
         self._portfolio_risk_cache = None
         self._cache_timestamp = None
-        self._cache_validity_seconds = 10  # Cache valid for 10 seconds
+        self._cache_validity_seconds = self.config.get('cache_validity_seconds', 10)
         
         self.logger.info("AdvancedRiskManager initialized with enhanced portfolio-level controls")
 
-    def calculate_position_size(self, symbol: str, strategy_name: str, market_context: Dict[str, Any],
-                              risk_pct: float = 2.0, volatility_data: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    def calculate_trade_parameters(self, symbol: str, side: str, entry_price: float, 
+                                   strategy_risk_profile, directional_bias: str, latest_data: pd.DataFrame) -> Optional[Dict[str, Any]]:
         """
-        Calculate optimal position size using advanced risk management
-        
-        Args:
-            symbol: Trading symbol
-            strategy_name: Name of the strategy
-            market_context: Market condition context
-            risk_pct: Risk percentage of account
-            volatility_data: Volatility metrics (ATR, volatility regime, etc.)
-            
-        Returns:
-            Dict with position sizing recommendations
+        Calculate all trade parameters including position size, SL, and TP.
+        Includes directional bias filter.
         """
         try:
-            with self._lock:
-                # Get current account information
-                account_info = self._get_account_info()
-                if not account_info:
-                    return self._get_fallback_position_size(risk_pct)
-                
-                account_balance = account_info.get('total_balance', 0)
-                if account_balance <= 0:
-                    self.logger.error("Invalid account balance for position sizing")
-                    return self._get_fallback_position_size(risk_pct)
-                
-                # Base risk amount
-                base_risk_amount = account_balance * (risk_pct / 100)
-                
-                # Adjust for market conditions
-                market_adjustment = self._get_market_condition_adjustment(market_context)
-                
-                # Adjust for volatility
-                volatility_adjustment = self._get_volatility_adjustment(volatility_data)
-                
-                # Adjust for strategy-specific factors
-                strategy_adjustment = self._get_strategy_risk_adjustment(strategy_name)
-                
-                # Calculate final risk amount (removed portfolio_adjustment to prevent circular dependency)
-                adjusted_risk_amount = base_risk_amount * market_adjustment * volatility_adjustment * strategy_adjustment
-                
-                # Apply risk limits
-                max_risk_amount = account_balance * (self.risk_limits.max_position_size_pct / 100)
-                final_risk_amount = min(adjusted_risk_amount, max_risk_amount)
-                
-                # Get current price for position size calculation
-                current_price = self._get_current_price(symbol)
-                if not current_price:
-                    return self._get_fallback_position_size(risk_pct)
-                
-                # Calculate position size based on risk amount and stop loss
-                # This will be refined when we have actual stop loss price
-                estimated_position_size = final_risk_amount / current_price
-                
-                return {
-                    'recommended_size': estimated_position_size,
-                    'risk_amount': final_risk_amount,
-                    'risk_pct': (final_risk_amount / account_balance) * 100,
-                    'market_adjustment': market_adjustment,
-                    'volatility_adjustment': volatility_adjustment,
-                    'strategy_adjustment': strategy_adjustment,
-                    'current_price': current_price,
-                    'account_balance': account_balance,
-                    'max_position_value': max_risk_amount
-                }
-                
+            # 1. Apply Directional Bias Filter
+            if not self._apply_directional_filter(side, directional_bias, latest_data):
+                self.logger.info(f"Trade signal '{side}' for {symbol} filtered out by directional bias '{directional_bias}'.")
+                return None
+
+            # 2. Calculate Stop-Loss and Take-Profit
+            sl_tp = self._calculate_sl_tp(symbol, side, entry_price, strategy_risk_profile, latest_data)
+            if not sl_tp:
+                return None
+            
+            stop_loss_price = sl_tp['stop_loss_price']
+            
+            # 3. Calculate Position Size
+            position_size_info = self._calculate_position_size(
+                symbol=symbol,
+                entry_price=entry_price,
+                stop_loss_price=stop_loss_price,
+                strategy_risk_profile=strategy_risk_profile
+            )
+            
+            if not position_size_info or position_size_info['quantity'] <= 0:
+                self.logger.warning("Position size calculation resulted in zero or negative quantity.")
+                return None
+
+            # 4. Final Validation (optional, can add portfolio checks here)
+
+            return {**sl_tp, **position_size_info}
+
         except Exception as e:
-            self.logger.error(f"Error calculating position size: {e}", exc_info=True)
-            return self._get_fallback_position_size(risk_pct)
+            self.logger.error(f"Error calculating trade parameters for {symbol}: {e}", exc_info=True)
+            return None
+
+    def _apply_directional_filter(self, side: str, directional_bias: str, latest_data: pd.DataFrame) -> bool:
+        """
+        Apply higher-timeframe directional bias and stricter entry criteria.
+        """
+        if directional_bias == 'BEARISH' and side == 'BUY':
+            self.logger.warning("FILTER: Blocking LONG trade due to strong BEARISH 1h bias.")
+            return False
+        
+        if directional_bias == 'BULLISH' and side == 'BUY':
+            # Apply stricter criteria for long trades even in a bullish market
+            if 'adx' in latest_data.columns:
+                adx = latest_data['adx'].iloc[-1]
+                
+                # Stricter ADX threshold for long entries
+                if adx < self.config.get('long_entry_adx_threshold', 30):
+                    self.logger.info(f"FILTER: Blocking LONG trade. ADX ({adx:.2f}) is below stricter threshold of 30.")
+                    return False
+            else:
+                self.logger.warning("ADX column not found in latest_data, skipping ADX filter for long entry.")
+        
+        # Allow all short trades and long trades that pass the stricter criteria
+        return True
+
+    def _calculate_sl_tp(self, symbol: str, side: str, entry_price: float, 
+                         strategy_risk_profile, latest_data: pd.DataFrame) -> Optional[Dict[str, float]]:
+        """Calculates stop-loss and take-profit prices."""
+        try:
+            sl_config = strategy_risk_profile.stop_loss
+            tp_config = strategy_risk_profile.take_profit
+            
+            # Stop-Loss Calculation
+            stop_loss_price = 0.0
+            if sl_config.mode == 'atr_mult':
+                atr = latest_data['atr_14'].iloc[-1]
+                offset = atr * sl_config.atr_multiplier
+            else: # fixed_pct
+                offset = entry_price * sl_config.fixed_pct
+
+            # Max loss cap
+            max_loss_offset = entry_price * sl_config.max_loss_pct
+            offset = min(offset, max_loss_offset)
+
+            if side == 'BUY':
+                stop_loss_price = entry_price - offset
+            else: # SELL
+                stop_loss_price = entry_price + offset
+
+            # Take-Profit Calculation (simplified for first target)
+            take_profit_price = 0.0
+            if tp_config.mode == 'progressive_levels' and tp_config.progressive_levels:
+                tp_pct = tp_config.progressive_levels[0] # Use first TP level for initial order
+                tp_offset = entry_price * tp_pct
+            else: # fixed_pct
+                tp_offset = entry_price * tp_config.fixed_pct
+            
+            if side == 'BUY':
+                take_profit_price = entry_price + tp_offset
+            else: # SELL
+                take_profit_price = entry_price - tp_offset
+
+            return {'stop_loss_price': stop_loss_price, 'take_profit_price': take_profit_price}
+        
+        except Exception as e:
+            self.logger.error(f"Error calculating SL/TP for {symbol}: {e}")
+            return None
+
+    def _calculate_position_size(self, symbol: str, entry_price: float, stop_loss_price: float, 
+                                 strategy_risk_profile) -> Optional[Dict[str, float]]:
+        """Calculates position size based on risk parameters."""
+        try:
+            sizing_config = strategy_risk_profile.position_sizing
+            account_balance = self.exchange.get_balance() # Simplified
+
+            risk_per_trade_abs = abs(entry_price - stop_loss_price)
+            if risk_per_trade_abs == 0:
+                self.logger.warning("Risk per trade is zero, cannot calculate position size.")
+                return None
+
+            quantity = 0.0
+            if sizing_config.mode == 'fixed_notional':
+                quantity = sizing_config.fixed_notional / entry_price
+            elif sizing_config.mode == 'vol_normalized' or sizing_config.mode == 'kelly_capped':
+                risk_amount = account_balance * sizing_config.risk_per_trade
+                quantity = risk_amount / risk_per_trade_abs
+
+            # Apply max position constraint
+            max_position_value = account_balance * (sizing_config.max_position_pct / 100)
+            max_quantity = max_position_value / entry_price
+            
+            final_quantity = min(quantity, max_quantity)
+
+            # TODO: Add portfolio-level risk checks from enforce_portfolio_limits
+            
+            return {'quantity': final_quantity}
+
+        except Exception as e:
+            self.logger.error(f"Error calculating position size for {symbol}: {e}")
+            return None
 
     def validate_trade_risk(self, symbol: str, side: str, size: float, entry_price: float,
                            stop_loss_price: Optional[float] = None, take_profit_price: Optional[float] = None,

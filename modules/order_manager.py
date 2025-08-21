@@ -31,11 +31,36 @@ class OrderManager:
         self.backoff_base = backoff_base
         self.active_orders = {}
         self.MIN_NOTIONAL_USDT = 5.0  # Minimum notional value enforced by bot
+        
+        # Track order placement times for minimum hold logic
+        self.order_placement_times = {}  # symbol -> timestamp
+        self.MIN_HOLD_TIME_SECONDS = 120  # 2 minutes minimum hold time
 
     POLL_INTERVAL_SECONDS = 1
     FILL_TIMEOUT_SECONDS = 30
     OCO_POLL_INTERVAL_SECONDS = 1
     OCO_TIMEOUT_SECONDS = 60
+    
+    def track_order_placement(self, symbol: str) -> None:
+        """Track when an order was placed for minimum hold time logic"""
+        import time
+        self.order_placement_times[symbol] = time.time()
+        self.logger.debug(f"Tracking order placement time for {symbol}")
+    
+    def can_close_position(self, symbol: str) -> bool:
+        """Check if position can be closed based on minimum hold time"""
+        if symbol not in self.order_placement_times:
+            return True  # No tracking info, allow closure
+        
+        import time
+        elapsed_time = time.time() - self.order_placement_times[symbol]
+        can_close = elapsed_time >= self.MIN_HOLD_TIME_SECONDS
+        
+        if not can_close:
+            remaining_time = self.MIN_HOLD_TIME_SECONDS - elapsed_time
+            self.logger.info(f"Position {symbol} in minimum hold period: {remaining_time:.0f}s remaining")
+        
+        return can_close
 
     def _cancel_existing_conditional_orders(self, symbol: str, category: str = 'linear') -> None:
         """
@@ -490,26 +515,26 @@ class OrderManager:
                     # CRITICAL FIX: Validate stop-loss trigger direction before placing order
                     current_price = self.exchange.get_current_price(symbol)
                     if current_price:
-                        # Check if stop-loss configuration is valid
+                        # Check if stop-loss configuration is valid with minimum buffer
                         sl_valid = True
+                        min_buffer_pct = 0.003  # 0.3% minimum buffer (increased from 0.1%)
+                        min_buffer = current_price * min_buffer_pct
+                        
                         if side.lower() == 'buy':
-                            # Long position: stop-loss should be below current price, trigger when falling
-                            if stop_loss_price_calculated >= current_price:
-                                self.logger.warning(f"Invalid stop-loss for long position: SL price {stop_loss_price_calculated} >= current {current_price}")
-                                sl_valid = False
+                            # Long position: stop-loss should be below current price with minimum buffer
+                            if stop_loss_price_calculated >= (current_price - min_buffer):
+                                self.logger.warning(f"Stop-loss too tight for long position: SL {stop_loss_price_calculated} >= current-buffer {current_price - min_buffer}")
+                                # Adjust stop-loss to minimum buffer
+                                stop_loss_price_calculated = current_price - min_buffer
+                                self.logger.info(f"Adjusted long SL to minimum buffer: {stop_loss_price_calculated}")
                         else:  # sell/short position
-                            # Short position: stop-loss should be above current price, trigger when rising
-                            if stop_loss_price_calculated <= current_price:
-                                self.logger.warning(f"Invalid stop-loss for short position: SL price {stop_loss_price_calculated} <= current {current_price}")
-                                # Try to adjust stop-loss to a valid level
-                                adjusted_sl = current_price * (1 + 0.001)  # 0.1% above current price
-                                self.logger.warning(f"Adjusting stop-loss from {stop_loss_price_calculated} to {adjusted_sl}")
-                                stop_loss_price_calculated = round(adjusted_sl, price_precision)
-                                
-                                # Re-validate after adjustment
-                                if stop_loss_price_calculated <= current_price:
-                                    self.logger.error(f"Cannot place valid stop-loss for short position. Price moved too far.")
-                                    sl_valid = False
+                            # Short position: stop-loss should be above current price with minimum buffer
+                            if stop_loss_price_calculated <= (current_price + min_buffer):
+                                self.logger.warning(f"Stop-loss too tight for short position: SL {stop_loss_price_calculated} <= current+buffer {current_price + min_buffer}")
+                                # Adjust stop-loss to minimum buffer
+                                stop_loss_price_calculated = current_price + min_buffer
+                                self.logger.info(f"Adjusted short SL to minimum buffer: {stop_loss_price_calculated}")
+
                         
                         if not sl_valid:
                             self.logger.error(f"Skipping stop-loss order placement due to invalid configuration")

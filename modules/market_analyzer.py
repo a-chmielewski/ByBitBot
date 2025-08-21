@@ -53,7 +53,7 @@ class MarketAnalyzer:
         
         # Get market analysis configuration
         market_config = config.get('market_analysis', {})
-        self.timeframes = market_config.get('timeframes', ['1m', '5m'])
+        self.timeframes = market_config.get('timeframes', ['1m', '5m', '1h'])
         
         # Determine symbol source (static list or dynamic top volume)
         self.use_dynamic_symbols = market_config.get('use_dynamic_symbols', False)
@@ -216,7 +216,7 @@ class MarketAnalyzer:
             # Create a temporary data fetcher for this symbol/timeframe
             # Need enough data for longest period indicators (atr_240, bb_width_avg_200)
             # Plus buffer for reliable calculation
-            window_size = 350 if timeframe == '5m' else 400  # More data for 1m due to higher noise
+            window_size = 350 if timeframe == '5m' else (500 if timeframe == '1h' else 400)
             data_fetcher = LiveDataFetcher(
                 exchange=self.exchange,
                 symbol=symbol,
@@ -432,6 +432,23 @@ class MarketAnalyzer:
                 volatility_high_bb_ratio = 1.6
                 volatility_low_atr_ratio = 0.8
                 volatility_low_bb_ratio = 0.7
+            elif timeframe == '1h': # ADD THIS
+                # 1-hour parameters - even stricter thresholds
+                adx_trend_threshold = 25
+                adx_range_threshold = 20
+                adx_transition_upper = 25
+                adx_transition_lower = 20
+                atr_short_col = 'atr_12'  # 12 hours
+                atr_long_col = 'atr_48'   # 2 days
+                bb_width_avg_col = 'bb_width_avg_100'
+                fast_ma_col = 'ema_20'
+                slow_ma_col = 'ema_50'
+                range_lookback = 100 # ~4 days
+                confirmation_bars = 3
+                volatility_high_atr_ratio = 1.4
+                volatility_high_bb_ratio = 1.8
+                volatility_low_atr_ratio = 0.7
+                volatility_low_bb_ratio = 0.6
             else:  # 1m
                 # 1-minute parameters - stricter thresholds with hysteresis
                 adx_trend_threshold = 28  # Increased from 22

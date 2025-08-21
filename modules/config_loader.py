@@ -230,11 +230,11 @@ class StrategyConfigLoader:
             if risk_config['stop_loss_mode'] not in ['fixed_pct', 'atr_mult']:
                 raise ConfigValidationError(f"Invalid stop_loss_mode: {risk_config['stop_loss_mode']}")
             
-            if risk_config['stop_loss_fixed_pct'] <= 0 or risk_config['stop_loss_fixed_pct'] > 0.1:
-                raise ConfigValidationError(f"stop_loss_fixed_pct must be between 0 and 0.1 (10%)")
+            if risk_config['stop_loss_fixed_pct'] <= 0 or risk_config['stop_loss_fixed_pct'] > 0.15:
+                raise ConfigValidationError(f"stop_loss_fixed_pct must be between 0 and 0.15 (15%)")
             
-            if risk_config['stop_loss_atr_multiplier'] <= 0 or risk_config['stop_loss_atr_multiplier'] > 5.0:
-                raise ConfigValidationError(f"stop_loss_atr_multiplier must be between 0 and 5.0")
+            if risk_config['stop_loss_atr_multiplier'] <= 0 or risk_config['stop_loss_atr_multiplier'] > 6.0:
+                raise ConfigValidationError(f"stop_loss_atr_multiplier must be between 0 and 6.0")
             
             # Validate take profit configuration
             if risk_config['take_profit_mode'] not in ['fixed_pct', 'progressive_levels']:
