@@ -377,6 +377,9 @@ class StrategyMatrix:
             elif market_1min == "TRENDING":
                 selected_strategy = 'StrategyRangeBreakoutMomentum'
                 context_reason = "Range with 1m trend breakout potential"
+            elif market_1min == "TRANSITIONAL":
+                selected_strategy = 'StrategyRangeBreakoutMomentum'
+                context_reason = "Range with 1m transitional breakout potential"
             else:
                 selected_strategy = 'StrategyRSIRangeScalping'
                 context_reason = "Standard range conditions"
