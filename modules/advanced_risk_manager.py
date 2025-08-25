@@ -357,6 +357,71 @@ class AdvancedRiskManager:
             self.logger.error(f"Error calculating position size for {symbol}: {e}")
             return None
 
+    def calculate_position_size(self, symbol: str, strategy_name: str, market_context: Dict[str, Any], 
+                               risk_pct: float = 0.01, entry_price: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Public method for calculating position size used by bot.py
+        Delegates to strategy matrix for proper risk profile-based calculation
+        """
+        try:
+            # Get strategy risk profile from strategy matrix
+            strategy_risk_profile = self.strategy_matrix.get_strategy_risk_profile(strategy_name)
+            if not strategy_risk_profile:
+                # Fallback calculation if no strategy profile
+                account_balance = self.exchange.get_balance()
+                if not account_balance or account_balance <= 0:
+                    return {'size': 0.001, 'error': 'Invalid account balance'}
+                
+                # Simple risk-based sizing
+                risk_amount = account_balance * risk_pct
+                stop_distance_pct = 0.02  # Assume 2% stop loss
+                position_size = risk_amount / ((entry_price or 1.0) * stop_distance_pct)
+                position_size = max(position_size, 0.001)
+                
+                return {'size': position_size, 'risk_amount': risk_amount, 'account_balance': account_balance}
+            
+            # Use strategy's position sizing configuration
+            account_balance = self.exchange.get_balance()
+            if not account_balance or account_balance <= 0:
+                return {'size': 0.001, 'error': 'Invalid account balance'}
+            
+            sizing_config = strategy_risk_profile.position_sizing
+            
+            if sizing_config.mode == 'fixed_notional':
+                position_size = sizing_config.fixed_notional / (entry_price or 1.0)
+            elif sizing_config.mode == 'vol_normalized':
+                # Use risk percentage for volatility normalized sizing
+                risk_amount = account_balance * risk_pct
+                stop_distance_pct = 0.02  # Default stop distance
+                position_size = risk_amount / ((entry_price or 1.0) * stop_distance_pct)
+            elif sizing_config.mode == 'kelly_capped':
+                # Conservative Kelly sizing
+                kelly_fraction = min(risk_pct * 2, 0.05)  # Cap at 5%
+                position_size = (account_balance * kelly_fraction) / (entry_price or 1.0)
+            else:
+                # Default to risk-based sizing
+                risk_amount = account_balance * risk_pct
+                stop_distance_pct = 0.02
+                position_size = risk_amount / ((entry_price or 1.0) * stop_distance_pct)
+            
+            # Apply max position constraint
+            max_position_pct = sizing_config.max_position_pct / 100
+            max_position_value = account_balance * max_position_pct
+            max_quantity = max_position_value / (entry_price or 1.0)
+            
+            final_size = min(max(position_size, 0.001), max_quantity)
+            
+            return {
+                'size': final_size,
+                'risk_amount': account_balance * risk_pct,
+                'account_balance': account_balance,
+                'sizing_mode': sizing_config.mode
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error in calculate_position_size: {e}")
+            return {'size': 0.001, 'error': str(e)}
+
     def validate_trade_risk(self, symbol: str, side: str, size: float, entry_price: float,
                            stop_loss_price: Optional[float] = None, take_profit_price: Optional[float] = None,
                            leverage: float = 1.0) -> Dict[str, Any]:

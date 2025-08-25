@@ -107,7 +107,7 @@ def configure_logging_session(symbol: str, session_date: str = None) -> None:
     _current_date_str = session_date or datetime.now().strftime('%Y%m%d')
     
     # Create log file path with symbol and date
-    log_filename = f'bot_{_current_symbol}_{_current_date_str}.log'
+    log_filename = f'{_current_date_str}_{_current_symbol}_.log'
     _log_file_path = os.path.join(LOG_DIR, log_filename)
     
     # Log the configuration
@@ -196,7 +196,7 @@ def get_logger(name: str = 'bot') -> logging.Logger:
             _add_file_handler(logger)
         else:
             # Fallback to generic log file if session not configured yet
-            fallback_path = os.path.join(LOG_DIR, f'bot_startup_{datetime.now().strftime("%Y%m%d")}.log')
+            fallback_path = os.path.join(LOG_DIR, f'{datetime.now().strftime("%Y%m%d")}_bot_startup.log')
             file_formatter = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
             
             if platform.system() == 'Windows':

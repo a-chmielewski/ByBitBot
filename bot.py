@@ -2542,9 +2542,10 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                                 symbol=symbol,
                                 strategy_name=current_strategy_name,
                                 market_context={},
-                                risk_pct=1.0  # Default 1% risk
+                                risk_pct=0.01,  # Default 1% risk (as decimal)
+                                entry_price=entry_signal.get('price')
                             )
-                            signal_size = position_sizing.get('recommended_size', 0.01)  # Fallback to 0.01
+                            signal_size = position_sizing.get('size', 0.01)  # Fallback to 0.01
                             bot_logger.info(f"Strategy provided size=None, calculated default size: {signal_size}")
                             entry_signal['size'] = signal_size
                         except Exception as size_calc_error:
