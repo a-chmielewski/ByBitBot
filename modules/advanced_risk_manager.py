@@ -210,6 +210,7 @@ class AdvancedRiskManager:
         self.total_open_risk = 0.0
         self.asset_exposures: Dict[str, AssetExposure] = {}
         self.emergency_stop_active = False
+        self.read_only_mode = False
         
         # Thread safety and caching
         self._lock = threading.Lock()
@@ -329,7 +330,7 @@ class AdvancedRiskManager:
         """Calculates position size based on risk parameters."""
         try:
             sizing_config = strategy_risk_profile.position_sizing
-            account_balance = self.exchange.get_balance() # Simplified
+            account_balance = self._get_account_balance()
 
             risk_per_trade_abs = abs(entry_price - stop_loss_price)
             if risk_per_trade_abs == 0:
@@ -368,7 +369,7 @@ class AdvancedRiskManager:
             strategy_risk_profile = self.strategy_matrix.get_strategy_risk_profile(strategy_name)
             if not strategy_risk_profile:
                 # Fallback calculation if no strategy profile
-                account_balance = self.exchange.get_balance()
+                account_balance = self._get_account_balance()
                 if not account_balance or account_balance <= 0:
                     return {'size': 0.001, 'error': 'Invalid account balance'}
                 
@@ -381,7 +382,7 @@ class AdvancedRiskManager:
                 return {'size': position_size, 'risk_amount': risk_amount, 'account_balance': account_balance}
             
             # Use strategy's position sizing configuration
-            account_balance = self.exchange.get_balance()
+            account_balance = self._get_account_balance()
             if not account_balance or account_balance <= 0:
                 return {'size': 0.001, 'error': 'Invalid account balance'}
             
@@ -718,16 +719,54 @@ class AdvancedRiskManager:
             self.logger.info(f"Emergency stop deactivated: {reason}")
 
     # Helper methods
+    def _get_account_balance(self) -> float:
+        """Get account balance from exchange"""
+        try:
+            balance_response = self.exchange.fetch_balance()
+            # Extract balance from ByBit response structure
+            result = balance_response.get('result', {})
+            list_data = result.get('list', [])
+            if list_data:
+                # Look for USDT coin balance
+                for coin_data in list_data:
+                    coins = coin_data.get('coin', [])
+                    for coin in coins:
+                        if coin.get('coin') == 'USDT':
+                            return float(coin.get('equity', 0))
+                # Fallback: use first available balance
+                if list_data[0].get('coin'):
+                    return float(list_data[0]['coin'][0].get('equity', 0))
+            return 0.0
+        except Exception as e:
+            self.logger.error(f"Error fetching account balance: {e}")
+            return 0.0
+
     def _get_account_info(self) -> Optional[Dict[str, Any]]:
         """Get account information from exchange"""
         try:
-            # This would integrate with your exchange connector
-            # For now, return mock data
-            return {
-                'total_balance': 10000.0,  # Mock balance
-                'available_balance': 9000.0,
-                'unrealized_pnl': 0.0
-            }
+            balance_response = self.exchange.fetch_balance()
+            result = balance_response.get('result', {})
+            list_data = result.get('list', [])
+            if list_data:
+                # Look for USDT account data
+                for account_data in list_data:
+                    coins = account_data.get('coin', [])
+                    for coin in coins:
+                        if coin.get('coin') == 'USDT':
+                            return {
+                                'total_balance': float(coin.get('equity', 0)),
+                                'available_balance': float(coin.get('availableToWithdraw', 0)),
+                                'unrealized_pnl': float(coin.get('unrealisedPnl', 0))
+                            }
+                # Fallback to first available account
+                if list_data[0].get('coin'):
+                    first_coin = list_data[0]['coin'][0]
+                    return {
+                        'total_balance': float(first_coin.get('equity', 0)),
+                        'available_balance': float(first_coin.get('availableToWithdraw', 0)),
+                        'unrealized_pnl': float(first_coin.get('unrealisedPnl', 0))
+                    }
+            return None
         except Exception as e:
             self.logger.error(f"Error fetching account info: {e}")
             return None
@@ -735,9 +774,7 @@ class AdvancedRiskManager:
     def _get_current_price(self, symbol: str) -> Optional[float]:
         """Get current price for symbol"""
         try:
-            # This would integrate with your exchange connector
-            # For now, return mock price
-            return 50000.0  # Mock price
+            return self.exchange.get_current_price(symbol)
         except Exception as e:
             self.logger.error(f"Error fetching current price for {symbol}: {e}")
             return None
@@ -1078,7 +1115,7 @@ class AdvancedRiskManager:
             EnforceResult: Detailed enforcement result with action, scaling, and reasons
         """
         try:
-            with self._lock if not self.read_only_mode else threading.RLock():
+            with self._lock if not getattr(self, 'read_only_mode', False) else threading.RLock():
                 # Initialize result structure
                 result = EnforceResult(
                     action=EnforceAction.ALLOW,

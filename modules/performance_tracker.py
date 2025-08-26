@@ -115,10 +115,14 @@ class PerformanceTracker:
     """
     
     def __init__(self, log_dir: str = "performance", logger: Optional[logging.Logger] = None,
-                 alert_thresholds: Optional[Dict[str, float]] = None):
+                 alert_thresholds: Optional[Dict[str, float]] = None, 
+                 real_time_monitor=None):
         self.log_dir = log_dir
         os.makedirs(self.log_dir, exist_ok=True)
         self.logger = logger or logging.getLogger(self.__class__.__name__)
+        
+        # Real-time monitor integration
+        self.real_time_monitor = real_time_monitor
         
         # Core data storage
         self.trades: List[TradeRecord] = []
@@ -140,8 +144,10 @@ class PerformanceTracker:
         }
         self.recent_alerts: List[Dict] = []
         
-        # Session tracking
-        self.session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # Session tracking - make unique per instance to avoid conflicts
+        import os
+        process_id = os.getpid()
+        self.session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{process_id}"
         self.session_start_time = datetime.now(timezone.utc)
         
         # Thread safety
@@ -192,6 +198,14 @@ class PerformanceTracker:
                 self.logger.info(f"✅ TRADE RECORDED {trade_id}: {trade_record.strategy} {trade_record.side} "
                                f"{trade_record.symbol} PnL: ${trade_record.pnl:.2f} "
                                f"(Cumulative: ${self.cumulative_pnl:.2f}) [Total trades: {len(self.trades)}]")
+                
+                # Immediately notify RealTimeMonitor of new trade
+                if self.real_time_monitor:
+                    try:
+                        self.real_time_monitor.update_metrics(force_update=True)
+                        self.logger.debug(f"RealTimeMonitor notified of new trade {trade_id}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to notify RealTimeMonitor of new trade: {e}")
                 
                 return trade_id
                 
@@ -832,4 +846,9 @@ class PerformanceTracker:
             
         except Exception as exc:
             if hasattr(tracker, 'logger'):
-                tracker.logger.error(f"Failed to persist trades on exception: {exc}") 
+                tracker.logger.error(f"Failed to persist trades on exception: {exc}")
+    
+    def set_real_time_monitor(self, real_time_monitor):
+        """Set the RealTimeMonitor instance for automatic notifications"""
+        self.real_time_monitor = real_time_monitor
+        self.logger.info("RealTimeMonitor integration enabled") 

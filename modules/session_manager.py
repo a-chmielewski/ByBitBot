@@ -106,7 +106,10 @@ class SessionManager:
         """Create a new trading session"""
         try:
             with self._lock:
-                session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{strategy_name}"
+                # Make session IDs unique per process to avoid conflicts between multiple bot instances
+                import os
+                process_id = os.getpid()
+                session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{process_id}_{strategy_name}"
                 
                 metadata = SessionMetadata(
                     session_id=session_id,

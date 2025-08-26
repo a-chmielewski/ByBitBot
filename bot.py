@@ -1454,6 +1454,11 @@ def restart_configuration_with_new_strategy(new_strategy_name, available_strateg
         order_manager = OrderManager(exchange, logger=bot_logger)
         perf_tracker = PerformanceTracker(logger=bot_logger)
         
+        # Link with existing real_time_monitor if available
+        if 'real_time_monitor' in globals() and real_time_monitor:
+            perf_tracker.set_real_time_monitor(real_time_monitor)
+            bot_logger.info("✅ New PerformanceTracker linked with existing RealTimeMonitor")
+        
         # Initialize the new strategy instance
         try:
             strategy_specific_logger = get_logger(new_strategy_name)
@@ -3587,6 +3592,10 @@ def main():
         logger=bot_logger
     )
     bot_logger.info("✅ RealTimeMonitor initialized (will start after setup)")
+    
+    # Link PerformanceTracker and RealTimeMonitor for automatic trade notifications
+    perf_tracker.set_real_time_monitor(real_time_monitor)
+    bot_logger.info("✅ PerformanceTracker-RealTimeMonitor integration enabled")
     
     # RUN MARKET ANALYSIS FIRST - before strategy selection
     bot_logger.info("="*60)
