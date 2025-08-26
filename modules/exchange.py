@@ -666,6 +666,21 @@ class ExchangeConnector:
             self.logger.error(f"Fetch all positions failed: {e}")
             raise ExchangeError(f"Fetch all positions failed: {str(e)}")
 
+    def get_positions(self, category: str = "linear") -> List[Dict[str, Any]]:
+        """
+        Get all positions as a list (used by bot.py).
+        Args:
+            category: Bybit category (default 'linear')
+        Returns:
+            List of position dictionaries
+        """
+        try:
+            response = self.fetch_all_positions(category)
+            return response.get('result', {}).get('list', [])
+        except Exception as e:
+            self.logger.error(f"Get positions failed: {e}")
+            return []
+
     def fetch_ohlcv(self, symbol: str, timeframe: str = '1m', limit: int = 1000) -> Any:
         """
         Fetch OHLCV market data for a symbol.

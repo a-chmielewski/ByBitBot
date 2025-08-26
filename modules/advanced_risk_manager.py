@@ -723,19 +723,14 @@ class AdvancedRiskManager:
         """Get account balance from exchange"""
         try:
             balance_response = self.exchange.fetch_balance()
-            # Extract balance from ByBit response structure
+            # Use the same approach as in bot.py - get totalEquity directly
             result = balance_response.get('result', {})
             list_data = result.get('list', [])
             if list_data:
-                # Look for USDT coin balance
-                for coin_data in list_data:
-                    coins = coin_data.get('coin', [])
-                    for coin in coins:
-                        if coin.get('coin') == 'USDT':
-                            return float(coin.get('equity', 0))
-                # Fallback: use first available balance
-                if list_data[0].get('coin'):
-                    return float(list_data[0]['coin'][0].get('equity', 0))
+                # Get totalEquity from the first account (unified account)
+                account_data = list_data[0]
+                total_equity = account_data.get('totalEquity', '0')
+                return float(total_equity) if total_equity else 0.0
             return 0.0
         except Exception as e:
             self.logger.error(f"Error fetching account balance: {e}")
@@ -748,24 +743,17 @@ class AdvancedRiskManager:
             result = balance_response.get('result', {})
             list_data = result.get('list', [])
             if list_data:
-                # Look for USDT account data
-                for account_data in list_data:
-                    coins = account_data.get('coin', [])
-                    for coin in coins:
-                        if coin.get('coin') == 'USDT':
-                            return {
-                                'total_balance': float(coin.get('equity', 0)),
-                                'available_balance': float(coin.get('availableToWithdraw', 0)),
-                                'unrealized_pnl': float(coin.get('unrealisedPnl', 0))
-                            }
-                # Fallback to first available account
-                if list_data[0].get('coin'):
-                    first_coin = list_data[0]['coin'][0]
-                    return {
-                        'total_balance': float(first_coin.get('equity', 0)),
-                        'available_balance': float(first_coin.get('availableToWithdraw', 0)),
-                        'unrealized_pnl': float(first_coin.get('unrealisedPnl', 0))
-                    }
+                # Get account data from unified account
+                account_data = list_data[0]
+                total_equity = account_data.get('totalEquity', '0')
+                available_balance = account_data.get('totalAvailableBalance', '0')
+                unrealized_pnl = account_data.get('totalPerpUPL', '0')
+                
+                return {
+                    'total_balance': float(total_equity) if total_equity else 0.0,
+                    'available_balance': float(available_balance) if available_balance else 0.0,
+                    'unrealized_pnl': float(unrealized_pnl) if unrealized_pnl else 0.0
+                }
             return None
         except Exception as e:
             self.logger.error(f"Error fetching account info: {e}")

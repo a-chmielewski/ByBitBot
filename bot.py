@@ -2596,10 +2596,44 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                             # Risk rejected
                             risk_reason = risk_assessment.get('reason', 'Unknown risk violation')
                             bot_logger.warning(f"Trade rejected by risk manager: {risk_reason}")
+                            
+                            # Notify strategy of rejection to reset order_pending state
+                            error_response = {
+                                'main_order': {
+                                    'result': {
+                                        'orderId': None,
+                                        'orderStatus': 'rejected',
+                                        'error': risk_reason,
+                                        'validation_type': 'legacy_risk_management'
+                                    }
+                                }
+                            }
+                            try:
+                                current_strategy.on_order_update(error_response, symbol=symbol)
+                            except Exception as callback_error:
+                                bot_logger.error(f"Failed to notify strategy of legacy risk rejection: {callback_error}", exc_info=True)
+                            
                             continue  # Skip this trade
                         
                     except Exception as e:
                         bot_logger.error(f"Risk assessment failed: {e}")
+                        
+                        # Notify strategy of assessment failure to reset order_pending state
+                        error_response = {
+                            'main_order': {
+                                'result': {
+                                    'orderId': None,
+                                    'orderStatus': 'rejected',
+                                    'error': f'Risk assessment failed: {str(e)}',
+                                    'validation_type': 'risk_assessment_error'
+                                }
+                            }
+                        }
+                        try:
+                            current_strategy.on_order_update(error_response, symbol=symbol)
+                        except Exception as callback_error:
+                            bot_logger.error(f"Failed to notify strategy of risk assessment failure: {callback_error}", exc_info=True)
+                        
                         continue  # Skip trade on risk assessment failure
                     
                     try:
