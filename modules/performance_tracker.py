@@ -117,6 +117,7 @@ class PerformanceTracker:
     def __init__(self, log_dir: str = "performance", logger: Optional[logging.Logger] = None,
                  alert_thresholds: Optional[Dict[str, float]] = None, 
                  real_time_monitor=None):
+        import os
         self.log_dir = log_dir
         os.makedirs(self.log_dir, exist_ok=True)
         self.logger = logger or logging.getLogger(self.__class__.__name__)
@@ -145,7 +146,6 @@ class PerformanceTracker:
         self.recent_alerts: List[Dict] = []
         
         # Session tracking - make unique per instance to avoid conflicts
-        import os
         process_id = os.getpid()
         self.session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{process_id}"
         self.session_start_time = datetime.now(timezone.utc)

@@ -1618,7 +1618,7 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                 try:
                     # Get current account equity for risk calculations
                     try:
-                        balance_info = exchange.get_balance()
+                        balance_info = exchange.fetch_balance()
                         account_equity = float(balance_info.get('totalEquity', 10000))  # Default fallback
                     except Exception as balance_error:
                         bot_logger.warning(f"Could not get account equity: {balance_error}, using default 10000")

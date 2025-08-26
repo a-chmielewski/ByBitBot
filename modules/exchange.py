@@ -618,7 +618,7 @@ class ExchangeConnector:
         try:
             if not self.client:
                 raise ExchangeError("Client not authenticated")
-            response = self._api_call_with_backoff(self.client.get_wallet_balance, coin="USDT")
+            response = self._api_call_with_backoff(self.client.get_wallet_balance, accountType="UNIFIED", coin="USDT")
             checked = self._check_response(response, context="fetch_balance")
             self.logger.info(f"Fetched balance: {checked}")
             return checked
