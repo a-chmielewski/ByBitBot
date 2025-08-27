@@ -348,11 +348,14 @@ class OrderManager:
             self.logger.debug(f"Placing main order: {main_order_params}")
             main_order_response = self._retry_with_backoff(self.exchange.place_order, **main_order_params)
             self._raise_on_retcode(main_order_response, "Main order placement")
-            self.log_order_status(main_order_response, "Main order")
             order_responses['main_order'] = main_order_response
             
             res_result = main_order_response.get('result', {})
             main_order_id = res_result.get('orderId') or res_result.get('order_id')
+            
+            # Log essential order info immediately
+            if main_order_id:
+                self.logger.info(f"Order placed: id={main_order_id}")
 
             if not main_order_id:
                 raise OrderExecutionError("Main order placement did not return an order_id.")
@@ -563,9 +566,10 @@ class OrderManager:
                                 try:
                                     stop_loss_response = self._retry_with_backoff(self.exchange.place_order, **sl_params)
                                     self._raise_on_retcode(stop_loss_response, "Stop-loss order placement")
-                                    self.log_order_status(stop_loss_response, "Stop-loss order")
                                     order_responses['stop_loss_order'] = stop_loss_response
                                     sl_order_id = stop_loss_response.get('result', {}).get('orderId')
+                                    if sl_order_id:
+                                        self.logger.info(f"Stop-loss order placed: id={sl_order_id}")
                                     if sl_order_id:
                                         self.active_orders[sl_order_id] = {
                                             'type': 'sl',
@@ -632,9 +636,10 @@ class OrderManager:
                                 try:
                                     take_profit_response = self._retry_with_backoff(self.exchange.place_order, **tp_params)
                                     self._raise_on_retcode(take_profit_response, "Take-profit order placement")
-                                    self.log_order_status(take_profit_response, "Take-profit order")
                                     order_responses['take_profit_order'] = take_profit_response
                                     tp_order_id = take_profit_response.get('result', {}).get('orderId')
+                                    if tp_order_id:
+                                        self.logger.info(f"Take-profit order placed: id={tp_order_id}")
                                     if tp_order_id:
                                         self.active_orders[tp_order_id] = {
                                             'type': 'tp',
@@ -1077,10 +1082,11 @@ class OrderManager:
 
             exit_order_response = self._retry_with_backoff(self.exchange.place_order, **exit_market_order_params)
             self._raise_on_retcode(exit_order_response, "Strategy exit market order")
-            self.log_order_status(exit_order_response, "Strategy Exit Market Order")
             exit_order_responses['exit_market_order'] = exit_order_response
             
             exit_order_id = exit_order_response.get('result', {}).get('orderId')
+            if exit_order_id:
+                self.logger.info(f"Exit order placed: id={exit_order_id}")
             # Wait for this exit market order to be confirmed filled before cancelling SL/TP.
             # This is important to prevent cancelling SL/TP if the exit market order itself fails or is rejected.
             if exit_order_id:

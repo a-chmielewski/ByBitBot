@@ -391,7 +391,12 @@ class RealTimeMonitor:
             for strategy in self.tracked_strategies:
                 if hasattr(strategy, 'position') and strategy.position:
                     for symbol, position_info in strategy.position.items():
-                        if position_info and float(position_info.get('size', 0)) != 0:
+                        # Skip None positions (cleared positions)
+                        if position_info is None:
+                            continue
+                        # Check if position has valid size
+                        position_size = float(position_info.get('size', 0))
+                        if position_size != 0:
                             active_count += 1
                             current_positions[symbol] = True  # Mark as currently active
                             
@@ -400,7 +405,7 @@ class RealTimeMonitor:
                                 'strategy': type(strategy).__name__,
                                 'symbol': symbol,
                                 'side': position_info.get('side', 'unknown'),
-                                'size': float(position_info.get('size', 0)),
+                                'size': position_size,
                                 'entry_price': float(position_info.get('entry_price', 0)),
                                 'entry_time': position_info.get('timestamp', datetime.now(timezone.utc).isoformat()),
                                 'unrealized_pnl': position_info.get('unrealized_pnl', 0),

@@ -835,6 +835,13 @@ class ExchangeConnector:
                 found_order_data = order_list[0]
                 if found_order_data.get('orderId') == order_id:
                     self.logger.info(f"Order {order_id} found in order history.")
+                    # Log meaningful order details now that we have them
+                    status = found_order_data.get('orderStatus', 'Unknown')
+                    side = found_order_data.get('side', 'Unknown')
+                    order_type = found_order_data.get('orderType', 'Unknown')
+                    qty = found_order_data.get('qty', 'N/A')
+                    avg_price = found_order_data.get('avgPrice', 'N/A')
+                    self.logger.info(f"Order details: id={order_id}, status={status}, side={side}, type={order_type}, qty={qty}, price={avg_price}")
                     self.logger.debug(f"Order {order_id} found in order history. Data: {found_order_data}")
                     return {
                         "retCode": checked_response.get("retCode", 0),

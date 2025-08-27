@@ -2695,19 +2695,24 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                         prev_position_snapshot and prev_position_snapshot.get('size')):
 
                         entry_price   = safe_float_convert(prev_position_snapshot.get('entry_price', 0))
-                        exit_price    = safe_float_convert(prev_position_snapshot.get('exit_price', entry_price))  # Fallback
                         size          = safe_float_convert(prev_position_snapshot.get('size', 0))
                         side          = prev_position_snapshot.get('side', '')
 
-                        # PnL estimation – if we don't have exit_price, use 0 so metrics at least
-                        # reflect a closed trade; more precise calculation can be added later.
-                        if exit_price == entry_price:
+                        # Get actual exit price and PnL from exchange
+                        try:
+                            # Try to get actual realized PnL from exchange position history
+                            current_price = exchange.get_current_price(symbol.replace('/', ''))
+                            exit_price = current_price if current_price else entry_price
+                            
+                            # Calculate PnL using current market price (best estimate for SL/TP closure)
+                            calculated_pnl = calculate_pnl_from_prices(entry_price, exit_price, size, side)
+                            
+                            bot_logger.info(f"Calculated PnL for auto-closed position {symbol}: entry=${entry_price:.4f}, exit=${exit_price:.4f}, size={size}, side={side}, PnL=${calculated_pnl:.2f}")
+                            
+                        except Exception as e:
+                            bot_logger.warning(f"Could not get current price for {symbol}, estimating minimal PnL: {e}")
+                            exit_price = entry_price
                             calculated_pnl = 0.0
-                        else:
-                            if side.lower() == 'buy':
-                                calculated_pnl = (exit_price - entry_price) * size
-                            else:
-                                calculated_pnl = (entry_price - exit_price) * size
 
                         trade_summary = {
                             'strategy': current_strategy_name,
@@ -2839,18 +2844,26 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                             exit_market_order = exit_order_responses.get('exit_market_order', {})
                             exit_result = exit_market_order.get('result', {})
                             
-                            if exit_order_responses and exit_result.get('orderStatus', '').lower() == 'filled':
+                            # Always record trade if we have exit order response, regardless of status confirmation
+                            if exit_order_responses:
                                 # Calculate PnL based on entry vs exit price and position size
                                 entry_price = safe_float_convert(position_to_close.get('entry_price', 0))
+                                # Try to get actual exit price, fallback to current price if not available
                                 exit_price = safe_float_convert(exit_result.get('avgPrice', 0))
+                                if exit_price == 0:
+                                    try:
+                                        current_price = exchange.get_current_price(symbol.replace('/', ''))
+                                        exit_price = current_price if current_price else entry_price
+                                        bot_logger.info(f"Using current market price as exit price: ${exit_price:.4f}")
+                                    except:
+                                        exit_price = entry_price
+                                        bot_logger.warning(f"Could not get exit price, using entry price: ${exit_price:.4f}")
+                                
                                 size = safe_float_convert(position_to_close.get('size', 0))
                                 side = position_to_close.get('side', '')
                                 
                                 # Calculate PnL: (exit_price - entry_price) * size for buy, (entry_price - exit_price) * size for sell
-                                if side.lower() == 'buy':
-                                    calculated_pnl = (exit_price - entry_price) * size
-                                else:  # sell
-                                    calculated_pnl = (entry_price - exit_price) * size
+                                calculated_pnl = calculate_pnl_from_prices(entry_price, exit_price, size, side)
                                 
                                 # CREATE ENHANCED TRADE RECORD with full context
                                 enhanced_trade_record = create_enhanced_trade_record(
@@ -2874,14 +2887,14 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                                 )
                                 
                                 perf_tracker.record_trade(enhanced_trade_record)
-                                bot_logger.info(f"✅ Enhanced trade recorded for {current_strategy_name}: PnL=${calculated_pnl:.2f}, Entry=${entry_price}, Exit=${exit_price}")
+                                bot_logger.info(f"✅ Enhanced trade recorded for {current_strategy_name}: PnL=${calculated_pnl:.2f}, Entry=${entry_price:.4f}, Exit=${exit_price:.4f}")
                                 
                                 # Immediately update real-time monitor to reflect the new trade
                                 if 'real_time_monitor' in locals() and real_time_monitor:
                                     real_time_monitor.update_metrics(force_update=True)
                                     bot_logger.debug("Triggered immediate dashboard update after trade recording")
                             else:
-                                bot_logger.warning(f"Exit order not filled or missing data - trade not recorded. Status: {exit_result.get('orderStatus', 'UNKNOWN')}")
+                                bot_logger.warning(f"No exit order response - trade not recorded")
                                 bot_logger.debug(f"Exit order response structure: {exit_order_responses}")
                             
                             # Update strategy on successful exit
