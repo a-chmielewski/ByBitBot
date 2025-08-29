@@ -256,15 +256,18 @@ class PerformanceTracker:
         market_context = None
         if 'market_context' in trade:
             mc = trade['market_context']
-            market_context = MarketContext(
-                market_5m=mc.get('market_5m', 'UNKNOWN'),
-                market_1m=mc.get('market_1m', 'UNKNOWN'),
-                strategy_selection_reason=mc.get('strategy_selection_reason', ''),
-                execution_timeframe=mc.get('execution_timeframe', '1m'),
-                volatility_regime=mc.get('volatility_regime'),
-                trend_strength=mc.get('trend_strength'),
-                market_session=mc.get('market_session')
-            )
+            if isinstance(mc, MarketContext):
+                market_context = mc
+            else:
+                market_context = MarketContext(
+                    market_5m=mc.get('market_5m', 'UNKNOWN'),
+                    market_1m=mc.get('market_1m', 'UNKNOWN'),
+                    strategy_selection_reason=mc.get('strategy_selection_reason', ''),
+                    execution_timeframe=mc.get('execution_timeframe', '1m'),
+                    volatility_regime=mc.get('volatility_regime'),
+                    trend_strength=mc.get('trend_strength'),
+                    market_session=mc.get('market_session')
+                )
         
         # Extract order details
         order_details = None
