@@ -2880,7 +2880,7 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                                     order_response_data=exit_order_responses,
                                     position_data=position_to_close,
                                     leverage=leverage if 'leverage' in locals() else None,
-                                    session_id=session_manager.get_active_session_id() if session_manager else None,
+                                    session_id=session_manager.get_current_session_id() if session_manager else None,
                                     exit_reason='strategy_exit_signal',
                                     sl_pct=position_to_close.get('planned_sl_pct'),
                                     tp_pct=position_to_close.get('planned_tp_pct')
