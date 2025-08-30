@@ -82,7 +82,7 @@ class ExchangeConnector:
         try:
             # Perform multiple time sync attempts for better accuracy
             offsets = []
-            for attempt in range(3):
+            for attempt in range(5):  # Increased attempts for better accuracy
                 start_local = time.time()
                 resp = self.client.get_server_time()
                 end_local = time.time()
@@ -120,12 +120,17 @@ class ExchangeConnector:
                 offsets.append(offset)
                 
                 # Small delay between attempts
-                if attempt < 2:
-                    time.sleep(0.1)
+                if attempt < 4:
+                    time.sleep(0.05)  # Reduced delay for faster sync
             
             if offsets:
-                # Use median offset for better accuracy
+                # Use median offset for better accuracy, discard outliers
                 offsets.sort()
+                # Remove extreme outliers (top and bottom 20% if we have enough samples)
+                if len(offsets) >= 5:
+                    trim_count = max(1, len(offsets) // 5)
+                    offsets = offsets[trim_count:-trim_count]
+                
                 if len(offsets) % 2 == 0:
                     self._time_offset = (offsets[len(offsets)//2-1] + offsets[len(offsets)//2]) / 2
                 else:
@@ -148,19 +153,19 @@ class ExchangeConnector:
         
         # Apply offset with additional conservative adjustment for network latency
         # Subtract a small buffer to ensure we're not ahead of server time
-        conservative_offset = self._time_offset - 0.5  # Subtract 500ms buffer
+        conservative_offset = self._time_offset - 0.2  # Reduced buffer to 200ms
         adjusted_time = current_time + conservative_offset
         timestamp_ms = int(adjusted_time * 1000)
         
         # Safeguard: ensure timestamp is reasonable (not in far future or past)
         current_ms = int(current_time * 1000)
-        max_offset_ms = 300000  # 5 minutes in milliseconds
+        max_offset_ms = 60000  # 1 minute in milliseconds (more reasonable)
         
         if abs(timestamp_ms - current_ms) > max_offset_ms:
             self.logger.warning(f"Adjusted timestamp {timestamp_ms} seems unreasonable. Using current time with small buffer.")
             self.logger.debug(f"  current_ms={current_ms}, offset={self._time_offset}, adjusted={timestamp_ms}")
             # Use current time minus small buffer as fallback
-            timestamp_ms = current_ms - 1000  # 1 second behind current time
+            timestamp_ms = current_ms - 500  # 500ms behind current time
             
         self.logger.debug(f"Generated timestamp: {timestamp_ms} (offset: {self._time_offset:.3f}s, conservative_offset: {conservative_offset:.3f}s)")
         return timestamp_ms
@@ -432,7 +437,8 @@ class ExchangeConnector:
                 # Some ByBit methods (like set_leverage) don't accept timestamp parameters
                 timestamp_required_methods = {
                     'place_order', 'cancel_order', 'cancel_all_orders', 'amend_order',
-                    'get_open_orders', 'get_order_history', 'get_trade_history'
+                    'get_open_orders', 'get_order_history', 'get_trade_history',
+                    'get_positions', 'get_wallet_balance', 'get_kline', 'get_instruments_info', 'get_tickers'
                 }
                 
                 if method_name in timestamp_required_methods and 'timestamp' not in kwargs:
@@ -538,11 +544,23 @@ class ExchangeConnector:
                             "time": int(time.time() * 1000)
                         }
                 
-                # Handle timestamp errors
-                if "timestamp" in err_msg_lower and retries < self.max_retries:
+                # Handle timestamp errors with improved detection
+                timestamp_error_indicators = [
+                    "timestamp", "10002", "recv_window", "time", "invalid timestamp",
+                    "timestamp is too early", "timestamp is too late", "bad request"
+                ]
+                
+                is_timestamp_error = any(indicator in err_msg_lower for indicator in timestamp_error_indicators)
+                
+                if is_timestamp_error and retries < self.max_retries:
                     self._record_api_call(method_name, False, 'server_errors')  # Timestamp is usually a server sync issue
                     self.logger.warning(f"Timestamp error detected for '{method_name}'. Resyncing time with server...")
                     self._sync_time()  # Resync time
+                    
+                    # Force regenerate timestamp for next attempt
+                    if 'timestamp' in kwargs:
+                        del kwargs['timestamp']
+                    
                     wait = self._calculate_backoff_with_jitter(retries)
                     self.logger.warning(
                         f"Retrying '{method_name}' after timestamp resync. Attempt {retries + 1}/{self.max_retries}. "
