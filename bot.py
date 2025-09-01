@@ -719,20 +719,36 @@ def enhanced_order_placement_with_validation(
         
         try:
             order_responses = order_manager.place_order_with_risk(
-                symbol=symbol,
-                side=final_order_params['side'],
-                order_type=final_order_params.get('order_type', 'market'),
-                size=final_order_params['size'],
-                signal_price=final_order_params.get('price'),
-                sl_pct=final_order_params['sl_pct'],
-                tp_pct=final_order_params['tp_pct'],
-                params=final_order_params.get('params'),
-                reduce_only=final_order_params.get('reduce_only', False),
-                time_in_force=final_order_params.get('time_in_force', 'GoodTillCancel')
+            symbol=symbol,
+            side=final_order_params['side'],
+            order_type=final_order_params.get('order_type', 'market'),
+            size=final_order_params['size'],
+            signal_price=final_order_params.get('price'),
+            sl_pct=final_order_params['sl_pct'],
+            tp_pct=final_order_params['tp_pct'],
+            params=final_order_params.get('params'),
+            reduce_only=final_order_params.get('reduce_only', False),
+            time_in_force=final_order_params.get('time_in_force', 'GoodTillCancel')
             )
-            
+        
             logger.info("✅ Order executed successfully via OrderManager")
             logger.info(f"   Order responses: {order_responses}")
+                        
+            # Update real-time monitor immediately after successful order placement
+            try:
+                # Try to get real_time_monitor from calling context
+                import inspect
+                frame = inspect.currentframe()
+                while frame:
+                    if 'real_time_monitor' in frame.f_locals:
+                        real_time_monitor = frame.f_locals['real_time_monitor']
+                        if real_time_monitor:
+                            real_time_monitor.update_metrics(force_update=True)
+                            logger.info("📊 Dashboard updated after order placement")
+                        break
+                    frame = frame.f_back
+            except Exception as e:
+                logger.debug(f"Could not update dashboard after order placement: {e}")
             
             # ===== STEP 4: Initialize Trailing TP Tracking =====
             if trailing_handler and order_responses and 'main_order' in order_responses:
@@ -794,6 +810,28 @@ def enhanced_order_placement_with_validation(
             logger.info(f"   Volatility Regime: {validated_order_details['volatility_regime']}")
             logger.info(f"   Portfolio Factor: {validated_order_details['risk_metadata']['strategy_factor']}")
             logger.info(f"   Correlation Group: {validated_order_details['risk_metadata']['correlation_group']}")
+            
+            # Record entry trade for dashboard tracking
+            entry_trade_record = {
+                'strategy': strategy_name,
+                'symbol': symbol,
+                'entry_price': entry_price,
+                'exit_price': 0.0,  # Will be updated on exit
+                'size': validated_order_details['size'],
+                'side': side,
+                'pnl': 0.0,  # Will be calculated on exit
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'status': 'ACTIVE'  # Mark as active position
+            }
+            
+            # Try to access perf_tracker through global scope or passed parameters
+            try:
+                # This will be available in the main trading loop context
+                if 'perf_tracker' in globals():
+                    globals()['perf_tracker'].record_trade(entry_trade_record)
+                    logger.info("📊 Active position recorded for dashboard tracking")
+            except Exception as e:
+                logger.debug(f"Could not record active position for dashboard: {e}")
             
             success_message = (
                 f"Enhanced order placement successful: "
@@ -1512,8 +1550,12 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
     last_market_check = datetime.now()
     market_check_interval = timedelta(minutes=60)  # Check every 60 minutes
     
+    # Initialize loss cooldown mechanism
+    loss_cooldown_until = None
+    
     bot_logger.info(f"Periodic market analysis will run every {market_check_interval.total_seconds()/60:.0f} minutes")
     bot_logger.info(f"Current strategy tags: {primary_strategy_tags}")
+    bot_logger.info("Loss cooldown mechanism initialized: 15 minutes after losing trades")
     
     # Wrap strategy in list for compatibility with existing loop logic
     strategies = [strategy_instance]
@@ -1590,6 +1632,13 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
 
             # Debug: log the latest row's indicator values
             # latest_row = strat.data.iloc[-1].to_dict()
+            # Check loss cooldown before looking for entry signals
+            current_time = datetime.now()
+            if loss_cooldown_until and current_time < loss_cooldown_until:
+                remaining_cooldown = (loss_cooldown_until - current_time).total_seconds()
+                bot_logger.debug(f"Loss cooldown active: {remaining_cooldown/60:.1f} minutes remaining")
+                continue
+            
             entry_signal = strat.check_entry(symbol=symbol)
             if entry_signal:
                 # Validate required fields are present in entry_signal
@@ -1799,18 +1848,40 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                         
                         # Update performance tracker after successful exit
                         if exit_order_response and exit_order_response.get('exit_order', {}).get('result', {}).get('orderStatus', '').lower() == 'filled':
+                            entry_price = safe_float_convert(current_position_details.get('entry_price', 0))
+                            exit_price = safe_float_convert(exit_order_response['exit_order']['result'].get('avgPrice', 0))
+                            size = safe_float_convert(current_position_details.get('size', 0))
+                            side = current_position_details.get('side')
+                            
+                            # Calculate PnL from entry/exit prices instead of relying on OrderManager
+                            calculated_pnl = calculate_pnl_from_prices(entry_price, exit_price, size, side)
+                            
                             trade_summary = {
                                 'strategy': type(strat).__name__,
                                 'symbol': symbol,
-                                'entry_price': safe_float_convert(current_position_details.get('entry_price', 0)),
-                                'exit_price': safe_float_convert(exit_order_response['exit_order']['result'].get('avgPrice', 0)),
-                                'size': safe_float_convert(current_position_details.get('size', 0)),
-                                'side': current_position_details.get('side'),
-                                'pnl': safe_float_convert(exit_order_response.get('pnl', 0)), # Assuming OrderManager calculates this
+                                'entry_price': entry_price,
+                                'exit_price': exit_price,
+                                'size': size,
+                                'side': side,
+                                'pnl': calculated_pnl,
                                 'timestamp': datetime.now(timezone.utc).isoformat()
                             }
                             perf_tracker.record_trade(trade_summary)
-                            bot_logger.info(f"Trade recorded for {type(strat).__name__}: {trade_summary}")
+                            bot_logger.info(f"Trade recorded for {type(strat).__name__}: PnL=${calculated_pnl:.2f}, Entry=${entry_price:.4f}, Exit=${exit_price:.4f}")
+                            
+                            # Update real-time monitor immediately after trade recording
+                            if 'real_time_monitor' in locals() and real_time_monitor:
+                                real_time_monitor.update_metrics(force_update=True)
+                                bot_logger.debug("Dashboard updated after trade recording")
+                            
+                            # Implement loss cooldown mechanism
+                            if calculated_pnl < 0:  # Loss
+                                loss_cooldown_until = datetime.now() + timedelta(minutes=15)
+                                bot_logger.info(f"❄️ Loss detected (${calculated_pnl:.2f}). Activating 15-minute cooldown until {loss_cooldown_until.strftime('%H:%M:%S')}")
+                            else:  # Win or breakeven
+                                loss_cooldown_until = None
+                                if calculated_pnl > 0:
+                                    bot_logger.info(f"✅ Win detected (${calculated_pnl:.2f}). Continuing with normal trading.")
                         
                         # Clear position from strategy after successful exit and recording
                         strat_instance.clear_position(symbol)
@@ -2312,6 +2383,9 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
     last_strategy_check = time.time()
     strategy_check_interval = 15 * 60  # 15 minutes in seconds
     
+    # Initialize loss cooldown mechanism
+    loss_cooldown_until = None
+    
     current_strategy = strategy_instance
     current_strategy_name = current_strategy_class
     
@@ -2324,6 +2398,7 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
     bot_logger.info(f"Initial strategy: {current_strategy_name}")
     bot_logger.info(f"Initial directional bias: {directional_bias} ({bias_strength})")
     bot_logger.info(f"Strategy check interval: {strategy_check_interval / 60:.0f} minutes")
+    bot_logger.info("Loss cooldown mechanism initialized: 15 minutes after losing trades")
     
     while True:
         try:
@@ -2526,6 +2601,14 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
             
             # Regular trading logic - check for entry
             if not hasattr(current_strategy, 'position') or not current_strategy.position.get(symbol):
+                # Check loss cooldown before looking for entry signals
+                current_datetime = datetime.now()
+                if loss_cooldown_until and current_datetime < loss_cooldown_until:
+                    remaining_cooldown = (loss_cooldown_until - current_datetime).total_seconds()
+                    bot_logger.debug(f"Loss cooldown active: {remaining_cooldown/60:.1f} minutes remaining")
+                    time.sleep(5)  # Short sleep to avoid busy loop
+                    continue
+                
                 entry_signal = current_strategy.check_entry(symbol)
                 if entry_signal:
                     bot_logger.info(f"Entry signal detected by {current_strategy_name}: {entry_signal}")
@@ -2888,6 +2971,15 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                                 
                                 perf_tracker.record_trade(enhanced_trade_record)
                                 bot_logger.info(f"✅ Enhanced trade recorded for {current_strategy_name}: PnL=${calculated_pnl:.2f}, Entry=${entry_price:.4f}, Exit=${exit_price:.4f}")
+                                
+                                # Implement loss cooldown mechanism
+                                if calculated_pnl < 0:  # Loss
+                                    loss_cooldown_until = datetime.now() + timedelta(minutes=15)
+                                    bot_logger.info(f"❄️ Loss detected (${calculated_pnl:.2f}). Activating 15-minute cooldown until {loss_cooldown_until.strftime('%H:%M:%S')}")
+                                else:  # Win or breakeven
+                                    loss_cooldown_until = None
+                                    if calculated_pnl > 0:
+                                        bot_logger.info(f"✅ Win detected (${calculated_pnl:.2f}). Continuing with normal trading.")
                                 
                                 # Immediately update real-time monitor to reflect the new trade
                                 if 'real_time_monitor' in locals() and real_time_monitor:
