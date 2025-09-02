@@ -1633,7 +1633,7 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
             # Debug: log the latest row's indicator values
             # latest_row = strat.data.iloc[-1].to_dict()
             # Check loss cooldown before looking for entry signals
-            current_time = datetime.now()
+            current_time = datetime.now(timezone.utc)
             if perf_tracker.trades and perf_tracker.trades[-1].pnl < 0:
                 if next_allowed_entry_time is None:
                     last_trade = perf_tracker.trades[-1]
@@ -2609,7 +2609,7 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
             # Regular trading logic - check for entry
             if not hasattr(current_strategy, 'position') or not current_strategy.position.get(symbol):
                 # Check loss cooldown before looking for entry signals
-                current_datetime = datetime.now()
+                current_datetime = datetime.now(timezone.utc)
                 if perf_tracker.trades and perf_tracker.trades[-1].pnl < 0:
                     if next_allowed_entry_time is None:
                         last_trade = perf_tracker.trades[-1]

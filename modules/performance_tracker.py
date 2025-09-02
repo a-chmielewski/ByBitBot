@@ -273,20 +273,24 @@ class PerformanceTracker:
         order_details = None
         if 'order_details' in trade:
             od = trade['order_details']
-            order_details = OrderDetails(
-                main_order_id=od.get('main_order_id'),
-                sl_order_id=od.get('sl_order_id'),
-                tp_order_id=od.get('tp_order_id'),
-                retry_attempts=od.get('retry_attempts', 0),
-                slippage_pct=od.get('slippage_pct'),
-                spread_at_entry=od.get('spread_at_entry'),
-                spread_at_exit=od.get('spread_at_exit'),
-                signal_to_execution_delay_ms=od.get('signal_to_execution_delay_ms'),
-                execution_quality_score=od.get('execution_quality_score'),
-                order_type=od.get('order_type', 'market'),
-                time_in_force=od.get('time_in_force', 'GoodTillCancel'),
-                reduce_only=od.get('reduce_only', False)
-            )
+            # Handle case where od is already an OrderDetails object
+            if isinstance(od, OrderDetails):
+                order_details = od
+            else:
+                order_details = OrderDetails(
+                    main_order_id=od.get('main_order_id'),
+                    sl_order_id=od.get('sl_order_id'),
+                    tp_order_id=od.get('tp_order_id'),
+                    retry_attempts=od.get('retry_attempts', 0),
+                    slippage_pct=od.get('slippage_pct'),
+                    spread_at_entry=od.get('spread_at_entry'),
+                    spread_at_exit=od.get('spread_at_exit'),
+                    signal_to_execution_delay_ms=od.get('signal_to_execution_delay_ms'),
+                    execution_quality_score=od.get('execution_quality_score'),
+                    order_type=od.get('order_type', 'market'),
+                    time_in_force=od.get('time_in_force', 'GoodTillCancel'),
+                    reduce_only=od.get('reduce_only', False)
+                )
         
         # Extract risk metrics
         risk_metrics = None
