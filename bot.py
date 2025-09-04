@@ -1564,6 +1564,7 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
     
     # Initialize loss cooldown mechanism
     next_allowed_entry_time = None
+    cooldown_message_logged = False
     
     bot_logger.info(f"Periodic market analysis will run every {market_check_interval.total_seconds()/60:.0f} minutes")
     bot_logger.info(f"Current strategy tags: {primary_strategy_tags}")
@@ -1651,7 +1652,10 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                     last_trade = perf_tracker.trades[-1]
                     exit_time = datetime.fromisoformat(last_trade.exit_timestamp.replace('Z', '+00:00')) if last_trade.exit_timestamp else datetime.now(timezone.utc)
                     next_allowed_entry_time = exit_time + timedelta(minutes=15)
-                    bot_logger.info(f"❄️ Last trade was a loss (${perf_tracker.trades[-1].pnl:.2f}). Activating 15-minute cooldown until {next_allowed_entry_time.strftime('%H:%M:%S')}")
+                    cooldown_message_logged = False
+                    if not cooldown_message_logged:
+                        bot_logger.info(f"❄️ Last trade was a loss (${perf_tracker.trades[-1].pnl:.2f}). Activating 15-minute cooldown until {next_allowed_entry_time.strftime('%H:%M:%S')}")
+                        cooldown_message_logged = True
                 
                 if current_time < next_allowed_entry_time:
                     remaining_cooldown = (next_allowed_entry_time - current_time).total_seconds()
@@ -1659,8 +1663,10 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                     continue
                 else:
                     next_allowed_entry_time = None
+                    cooldown_message_logged = False
             else:
                 next_allowed_entry_time = None
+                cooldown_message_logged = False
             
             entry_signal = strat.check_entry(symbol=symbol, directional_bias=current_directional_bias, bias_strength=current_bias_strength)
             if entry_signal:
@@ -1919,6 +1925,7 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                             
                             # Reset cooldown on trade completion (will be set again on next loop if needed)
                             next_allowed_entry_time = None
+                            cooldown_message_logged = False
                             if calculated_pnl > 0:
                                 bot_logger.info(f"✅ Win detected (${calculated_pnl:.2f}). Continuing with normal trading.")
                         
@@ -2424,6 +2431,7 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
     
     # Initialize loss cooldown mechanism
     next_allowed_entry_time = None
+    cooldown_message_logged = False
     
     current_strategy = strategy_instance
     current_strategy_name = current_strategy_class
@@ -2647,7 +2655,10 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                         last_trade = perf_tracker.trades[-1]
                         exit_time = datetime.fromisoformat(last_trade.exit_timestamp.replace('Z', '+00:00')) if last_trade.exit_timestamp else datetime.now(timezone.utc)
                         next_allowed_entry_time = exit_time + timedelta(minutes=15)
-                        bot_logger.info(f"❄️ Last trade was a loss (${perf_tracker.trades[-1].pnl:.2f}). Activating 15-minute cooldown until {next_allowed_entry_time.strftime('%H:%M:%S')}")
+                        cooldown_message_logged = False
+                        if not cooldown_message_logged:
+                            bot_logger.info(f"❄️ Last trade was a loss (${perf_tracker.trades[-1].pnl:.2f}). Activating 15-minute cooldown until {next_allowed_entry_time.strftime('%H:%M:%S')}")
+                            cooldown_message_logged = True
                     
                     if current_datetime < next_allowed_entry_time:
                         remaining_cooldown = (next_allowed_entry_time - current_datetime).total_seconds()
@@ -2656,8 +2667,10 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                         continue
                     else:
                         next_allowed_entry_time = None
+                        cooldown_message_logged = False
                 else:
                     next_allowed_entry_time = None
+                    cooldown_message_logged = False
                 
                 entry_signal = current_strategy.check_entry(symbol, directional_bias, bias_strength)
                 if entry_signal:
@@ -3044,6 +3057,7 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                                 
                                 # Reset cooldown on trade completion (will be set again on next loop if needed)
                                 next_allowed_entry_time = None
+                                cooldown_message_logged = False
                                 if calculated_pnl > 0:
                                     bot_logger.info(f"✅ Win detected (${calculated_pnl:.2f}). Continuing with normal trading.")
                                 

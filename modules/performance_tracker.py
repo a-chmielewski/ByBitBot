@@ -296,17 +296,22 @@ class PerformanceTracker:
         risk_metrics = None
         if 'risk_metrics' in trade:
             rm = trade['risk_metrics']
-            risk_metrics = RiskMetrics(
-                planned_sl_pct=rm.get('planned_sl_pct'),
-                actual_sl_pct=rm.get('actual_sl_pct'),
-                planned_tp_pct=rm.get('planned_tp_pct'),
-                actual_tp_pct=rm.get('actual_tp_pct'),
-                risk_reward_ratio=rm.get('risk_reward_ratio'),
-                position_size_pct=rm.get('position_size_pct'),
-                leverage_used=rm.get('leverage_used'),
-                max_adverse_excursion=rm.get('max_adverse_excursion'),
-                max_favorable_excursion=rm.get('max_favorable_excursion')
-            )
+            # Handle both dict and RiskMetrics object
+            if isinstance(rm, dict):
+                risk_metrics = RiskMetrics(
+                    planned_sl_pct=rm.get('planned_sl_pct'),
+                    actual_sl_pct=rm.get('actual_sl_pct'),
+                    planned_tp_pct=rm.get('planned_tp_pct'),
+                    actual_tp_pct=rm.get('actual_tp_pct'),
+                    risk_reward_ratio=rm.get('risk_reward_ratio'),
+                    position_size_pct=rm.get('position_size_pct'),
+                    leverage_used=rm.get('leverage_used'),
+                    max_adverse_excursion=rm.get('max_adverse_excursion'),
+                    max_favorable_excursion=rm.get('max_favorable_excursion')
+                )
+            else:
+                # Already a RiskMetrics object
+                risk_metrics = rm
         
         return TradeRecord(
             trade_id=trade_id,
