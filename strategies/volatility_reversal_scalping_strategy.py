@@ -823,16 +823,16 @@ class StrategyVolatilityReversalScalping(StrategyTemplate):
                 self.entry_price):
                 
                 current_price = self.data['close'].iloc[-1]
-                stop_buffer_pct = self.config.get('stop_buffer_pct', 0.002)
+                stop_buffer_pct = self.config.get('stop_buffer_pct', 0.004)  # Widened from 0.002
                 
                 # Very tight stops for contrarian trades
                 if self.entry_side == 'long':
                     # Stop below recent low or entry with buffer
-                    sl_pct = stop_buffer_pct + 0.001  # Extra buffer for volatility
+                    sl_pct = stop_buffer_pct + 0.002  # Extra buffer for volatility - widened
                     tp_pct = sl_pct * 1.5  # 1.5:1 reward/risk for quick scalps
                 elif self.entry_side == 'short':
                     # Stop above recent high or entry with buffer
-                    sl_pct = stop_buffer_pct + 0.001
+                    sl_pct = stop_buffer_pct + 0.002  # Widened buffer
                     tp_pct = sl_pct * 1.5
                 else:
                     sl_pct = stop_buffer_pct
@@ -851,8 +851,8 @@ class StrategyVolatilityReversalScalping(StrategyTemplate):
             
             # Fallback to config defaults
             return {
-                "sl_pct": self.config.get('stop_buffer_pct', 0.002) + 0.001,
-                "tp_pct": (self.config.get('stop_buffer_pct', 0.002) + 0.001) * 1.5,
+                "sl_pct": self.config.get('stop_buffer_pct', 0.004) + 0.002,  # Widened from 0.002+0.001
+                "tp_pct": (self.config.get('stop_buffer_pct', 0.004) + 0.002) * 1.5,
                 "max_position_pct": self.config.get('max_position_pct', 2.0) * self.config.get('position_size_reduction', 0.7),
                 "risk_reward_ratio": 1.5
             }
@@ -860,7 +860,7 @@ class StrategyVolatilityReversalScalping(StrategyTemplate):
         except Exception as e:
             self.logger.error(f"Error in get_risk_parameters: {str(e)}")
             return {
-                "sl_pct": 0.003,
+                "sl_pct": 0.006,  # Widened from 0.003
                 "tp_pct": 0.0045,
                 "max_position_pct": 1.4,
                 "risk_reward_ratio": 1.5

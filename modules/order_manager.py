@@ -34,7 +34,7 @@ class OrderManager:
         
         # Track order placement times for minimum hold logic
         self.order_placement_times = {}  # symbol -> timestamp
-        self.MIN_HOLD_TIME_SECONDS = 120  # 2 minutes minimum hold time
+        self.MIN_HOLD_TIME_SECONDS = 0  # No minimum hold time - allow immediate exits
 
     POLL_INTERVAL_SECONDS = 1
     FILL_TIMEOUT_SECONDS = 30
@@ -244,7 +244,9 @@ class OrderManager:
     def place_order_with_risk(self, symbol: str, side: str, order_type: str, size: float, 
                               signal_price: Optional[float], sl_pct: Optional[float], tp_pct: Optional[float],
                               params: Optional[Dict[str, Any]] = None, 
-                              reduce_only: bool = False, time_in_force: str = "GoodTillCancel") -> Dict[str, Any]:
+                              reduce_only: bool = False, time_in_force: str = "GoodTillCancel",
+                              market_condition: str = "UNKNOWN", urgency: str = "NORMAL",
+                              slippage_tolerance: float = 0.002) -> Dict[str, Any]:
         """
         Place a main order and, after it is filled, place associated stop-loss and take-profit orders.
         SL/TP are calculated based on actual fill price and provided percentages.
@@ -280,6 +282,23 @@ class OrderManager:
 
         try:
             order_link_id = params.get('orderLinkId') if params else None
+
+            # Slippage guard for market orders
+            if order_type.lower() == 'market' and signal_price is not None:
+                if not self._check_slippage_tolerance(symbol, signal_price, side, slippage_tolerance):
+                    if market_condition in ['RANGING', 'LOW_VOLATILITY']:
+                        # Convert to limit order in calm conditions
+                        order_type = 'limit'
+                        self.logger.warning(f"Excessive slippage detected, converting to limit order for {symbol}")
+                    else:
+                        # Skip trade in volatile conditions
+                        self.logger.warning(f"Excessive slippage detected, skipping trade for {symbol}")
+                        return {'main_order': None, 'stop_loss_order': None, 'take_profit_order': None, 'slippage_rejected': True}
+
+            # Intelligent order type selection based on market conditions
+            if order_type.lower() == 'market' and market_condition in ['RANGING', 'LOW_VOLATILITY'] and urgency == 'NORMAL':
+                order_type = 'limit'
+                self.logger.info(f"Converting to limit order due to {market_condition} market condition")
 
             min_order_qty, min_notional_value, qty_step = \
                 self.exchange.get_min_order_amount(symbol, category=category)
@@ -334,9 +353,26 @@ class OrderManager:
                 'reduceOnly': reduce_only,
                 'timeInForce': time_in_force,
             }
-            if order_type.lower() == 'limit' and signal_price is not None:
+            
+            # Enhanced limit price calculation for better entries
+            if order_type.lower() == 'limit':
                 price_precision = self.exchange.get_price_precision(symbol, category)
-                main_order_params['price'] = str(round(signal_price, price_precision))
+                
+                if signal_price is not None:
+                    limit_price = self._calculate_optimal_limit_price(symbol, side, signal_price, market_condition)
+                    main_order_params['price'] = str(round(limit_price, price_precision))
+                    self.logger.info(f"Using optimized limit price: {limit_price} (original: {signal_price})")
+                else:
+                    # Fallback to current market price with slight improvement
+                    try:
+                        current_price = self.exchange.get_current_price(symbol)
+                        if current_price:
+                            limit_price = self._calculate_optimal_limit_price(symbol, side, current_price, market_condition)
+                            main_order_params['price'] = str(round(limit_price, price_precision))
+                            self.logger.info(f"Using current price-based limit: {limit_price}")
+                    except Exception as e:
+                        self.logger.error(f"Failed to get current price for limit order: {e}")
+                        raise OrderExecutionError("Cannot place limit order without price reference")
             if order_link_id:
                 main_order_params['orderLinkId'] = order_link_id
             if params: # Merge other params
@@ -421,9 +457,12 @@ class OrderManager:
 
             elif order_type.lower() == 'limit':
                 self.logger.info(f"Limit order {main_order_id} placed. Waiting for fill...")
-                actual_fill_price = signal_price # For limit, SL/TP are based on the limit price
+                actual_fill_price = float(main_order_params.get('price', signal_price)) # Use actual limit price set
                 elapsed = 0
-                while elapsed < self.FILL_TIMEOUT_SECONDS:
+                timeout_seconds = self.FILL_TIMEOUT_SECONDS if market_condition not in ['RANGING', 'LOW_VOLATILITY'] else 60
+                self.logger.info(f"Using {timeout_seconds}s timeout for limit order in {market_condition} conditions")
+                
+                while elapsed < timeout_seconds:
                     order_status_resp = self._retry_with_backoff(
                         self.exchange.fetch_order,
                         symbol=symbol,
@@ -476,7 +515,50 @@ class OrderManager:
                     elapsed += self.POLL_INTERVAL_SECONDS
                 
                 if not filled:
-                    return self._cancel_unfilled_main_and_return(symbol, main_order_id, order_responses)
+                    # For limit orders in calm conditions, try market order fallback
+                    if market_condition in ['RANGING', 'LOW_VOLATILITY'] and urgency != 'HIGH':
+                        self.logger.info(f"Limit order unfilled, attempting market order fallback for {symbol}")
+                        try:
+                            # Cancel the unfilled limit order first
+                            self._retry_with_backoff(
+                                self.exchange.cancel_order,
+                                symbol=symbol,
+                                order_id=main_order_id
+                            )
+                            
+                            # Place market order fallback
+                            main_order_params['orderType'] = 'Market'
+                            main_order_params.pop('price', None)  # Remove price for market order
+                            
+                            fallback_response = self._retry_with_backoff(self.exchange.place_order, **main_order_params)
+                            self._raise_on_retcode(fallback_response, "Market order fallback")
+                            order_responses['main_order'] = fallback_response
+                            
+                            fallback_order_id = fallback_response.get('result', {}).get('orderId')
+                            if fallback_order_id:
+                                main_order_id = fallback_order_id
+                                self.logger.info(f"Market fallback order placed: {main_order_id}")
+                                
+                                # Quick check for market order fill
+                                time.sleep(2)
+                                order_status_resp = self._retry_with_backoff(
+                                    self.exchange.fetch_order,
+                                    symbol=symbol,
+                                    order_id=main_order_id,
+                                    category=category
+                                )
+                                order_data = order_status_resp.get('result', {})
+                                if order_data.get('avgPrice') and float(order_data['avgPrice']) > 0:
+                                    actual_fill_price = float(order_data['avgPrice'])
+                                    filled_qty = float(order_data.get('cumExecQty', size))
+                                    filled = True
+                                    self.logger.info(f"Market fallback filled at {actual_fill_price}")
+                                
+                        except Exception as fallback_error:
+                            self.logger.error(f"Market order fallback failed: {fallback_error}")
+                    
+                    if not filled:
+                        return self._cancel_unfilled_main_and_return(symbol, main_order_id, order_responses)
             
             if not actual_fill_price or actual_fill_price <= 0: # Final check for a valid fill price
                 self.logger.error(f"Could not determine a valid fill price for order {main_order_id}. Signal price: {signal_price}. Cannot proceed with SL/TP.")
@@ -1430,4 +1512,86 @@ class OrderManager:
                    '110001' in error_message or '30034' in error_message or '10001' in error_message: # 10001: "order not found" general
                     self.logger.info(f"Order {actual_id_to_use_for_cancel} likely already closed/cancelled for {symbol}: {e}")
                 else:
-                    self.logger.error(f"Failed to cancel orphaned conditional order {actual_id_to_use_for_cancel} for {symbol}: {e}") 
+                    self.logger.error(f"Failed to cancel orphaned conditional order {actual_id_to_use_for_cancel} for {symbol}: {e}")
+
+    def _calculate_optimal_limit_price(self, symbol: str, side: str, reference_price: float, market_condition: str) -> float:
+        """Calculate optimal limit price for better entries with minimal slippage"""
+        try:
+            # Get order book for spread analysis
+            order_book = self.exchange.fetch_order_book(symbol, limit=5)
+            bid = order_book['bids'][0][0] if order_book['bids'] else reference_price
+            ask = order_book['asks'][0][0] if order_book['asks'] else reference_price
+            spread = ask - bid
+            spread_pct = (spread / reference_price) * 100
+            
+            # Aggressive improvement factors based on market conditions
+            if market_condition in ['RANGING', 'LOW_VOLATILITY']:
+                improvement_factor = 0.6  # Aggressive improvement in calm markets
+            elif market_condition == 'TRANSITIONAL':
+                improvement_factor = 0.3  # Moderate improvement
+            else:
+                improvement_factor = 0.15  # Conservative in volatile markets
+            
+            # Calculate optimal limit price
+            if side.lower() in ['buy', 'long']:
+                # For buys: improve from ask towards bid
+                if spread_pct > 0.1:  # Only improve if spread is meaningful
+                    optimal_price = ask - (spread * improvement_factor)
+                    optimal_price = max(optimal_price, bid + (spread * 0.1))  # Don't cross spread too much
+                else:
+                    # Tight spread: small tick improvement
+                    tick_size = reference_price * 0.0001  # 0.01% tick
+                    optimal_price = reference_price - tick_size
+                    
+            else:  # sell/short
+                # For sells: improve from bid towards ask
+                if spread_pct > 0.1:
+                    optimal_price = bid + (spread * improvement_factor)
+                    optimal_price = min(optimal_price, ask - (spread * 0.1))
+                else:
+                    tick_size = reference_price * 0.0001
+                    optimal_price = reference_price + tick_size
+            
+            # Safety bounds: don't deviate too much from reference
+            max_deviation = reference_price * 0.002  # 0.2% max deviation
+            optimal_price = max(min(optimal_price, reference_price + max_deviation), reference_price - max_deviation)
+            
+            improvement_pct = abs(optimal_price - reference_price) / reference_price * 100
+            self.logger.debug(f"Price optimization for {symbol}: {reference_price} -> {optimal_price} ({improvement_pct:.3f}% improvement)")
+            
+            return optimal_price
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to optimize limit price for {symbol}: {e}. Using reference price.")
+            return reference_price
+
+    def _check_slippage_tolerance(self, symbol: str, signal_price: float, side: str, tolerance: float) -> bool:
+        """Check if current market price is within slippage tolerance of signal price"""
+        try:
+            current_price = self.exchange.get_current_price(symbol)
+            if not current_price:
+                self.logger.warning(f"Could not get current price for slippage check on {symbol}")
+                return True  # Allow trade if price check fails
+            
+            price_diff_pct = abs(current_price - signal_price) / signal_price
+            
+            # Additional directional slippage check
+            if side.lower() in ['buy', 'long']:
+                # For buys, unfavorable slippage is when price moved up
+                unfavorable_slippage = (current_price > signal_price) and (price_diff_pct > tolerance)
+            else:
+                # For sells, unfavorable slippage is when price moved down  
+                unfavorable_slippage = (current_price < signal_price) and (price_diff_pct > tolerance)
+            
+            if unfavorable_slippage:
+                self.logger.warning(f"Slippage check failed for {symbol}: signal={signal_price}, current={current_price}, diff={price_diff_pct:.4f} > {tolerance}")
+                return False
+            
+            if price_diff_pct > tolerance * 0.5:  # Log moderate slippage
+                self.logger.info(f"Moderate slippage detected for {symbol}: {price_diff_pct:.4f}, proceeding")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error checking slippage tolerance for {symbol}: {e}")
+            return True  # Allow trade if check fails 

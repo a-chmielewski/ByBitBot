@@ -628,7 +628,7 @@ class StrategyATRMomentumBreakout(StrategyTemplate):
                 
                 if not pd.isna(atr_value) and current_price > 0:
                     # Calculate ATR-based stops and targets
-                    atr_stop_multiplier = self.config.get('atr_stop_multiplier', 1.5)
+                    atr_stop_multiplier = self.config.get('atr_stop_multiplier', 2.5)  # Wider trailing from 1.5x
                     atr_target_multiplier = self.config.get('atr_target_multiplier', 2.0)
                     
                     sl_pct = (atr_value * atr_stop_multiplier) / current_price
@@ -643,8 +643,8 @@ class StrategyATRMomentumBreakout(StrategyTemplate):
             
             # Fallback to config defaults
             return {
-                "sl_pct": self.config.get('sl_pct', 0.025),
-                "tp_pct": self.config.get('tp_pct', 0.05),
+                "sl_pct": self.config.get('sl_pct', 0.05),  # Widened from 0.025
+                "tp_pct": self.config.get('tp_pct', 0.03),  # Quicker from 0.05
                 "max_position_pct": self.config.get('max_position_pct', 3.0),
                 "risk_reward_ratio": 2.0
             }
@@ -652,8 +652,8 @@ class StrategyATRMomentumBreakout(StrategyTemplate):
         except Exception as e:
             self.logger.error(f"Error in get_risk_parameters: {str(e)}")
             return {
-                "sl_pct": 0.025,
-                "tp_pct": 0.05,
+                "sl_pct": 0.05,  # Widened from 0.025
+                "tp_pct": 0.03,  # Quicker from 0.05
                 "max_position_pct": 3.0,
                 "risk_reward_ratio": 2.0
             } 

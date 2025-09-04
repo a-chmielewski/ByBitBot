@@ -107,13 +107,14 @@ class StrategyRSIRangeScalping(StrategyTemplate):
     def __init__(self, data: Any, config: Dict[str, Any], logger: Optional[logging.Logger] = None):
         super().__init__(data, config, logger)
         
-        # Range detection state
+        # Range detection state - Enhanced for more selective entries
         self.range_active = False
         self.support_level = 0
         self.resistance_level = 0
         self.range_middle = 0
         self.range_width = 0
         self.last_range_update = 0
+        self.min_range_stability_bars = self.config.get('min_range_stability_bars', 8)  # Minimum bars for range stability
         
         # Range trading performance tracking
         self.consecutive_stops = 0
@@ -469,8 +470,12 @@ class StrategyRSIRangeScalping(StrategyTemplate):
                 self.logger.debug("Volume breakout detected, avoiding range trades")
                 return None
             
-            # Only trade if we have an active range and not in middle zone
-            if not self.range_active or self.is_in_range_middle(current_price):
+            # Enhanced range stability check
+            range_stable = (self.last_range_update is not None and 
+                           idx - self.last_range_update >= self.min_range_stability_bars)
+            
+            # Only trade if we have an active, stable range and not in middle zone
+            if not self.range_active or not range_stable or self.is_in_range_middle(current_price):
                 return None
             
             # Check for entry conditions
@@ -608,8 +613,8 @@ class StrategyRSIRangeScalping(StrategyTemplate):
                 self.entry_level):
                 
                 current_price = self.data['close'].iloc[-1]
-                stop_loss_pct = self.config.get('stop_loss_pct', 0.002)
-                take_profit_ratio = self.config.get('take_profit_ratio', 1.2)
+                stop_loss_pct = self.config.get('stop_loss_pct', 0.004)  # Widened from 0.002
+                take_profit_ratio = self.config.get('take_profit_ratio', 1.0)  # Quicker 1:1 from 1.2:1
                 
                 if self.entry_side == 'long':
                     # Stop just below support
@@ -638,8 +643,8 @@ class StrategyRSIRangeScalping(StrategyTemplate):
             
             # Fallback to config defaults
             return {
-                "sl_pct": self.config.get('stop_loss_pct', 0.002),
-                "tp_pct": self.config.get('stop_loss_pct', 0.002) * self.config.get('take_profit_ratio', 1.2),
+                "sl_pct": self.config.get('stop_loss_pct', 0.004),  # Widened from 0.002
+                "tp_pct": self.config.get('stop_loss_pct', 0.002) * self.config.get('take_profit_ratio', 1.0),  # Quicker 1:1
                 "max_position_pct": self.config.get('max_position_pct', 2.0),
                 "risk_reward_ratio": self.config.get('take_profit_ratio', 1.2)
             }
@@ -647,8 +652,8 @@ class StrategyRSIRangeScalping(StrategyTemplate):
         except Exception as e:
             self.logger.error(f"Error in get_risk_parameters: {str(e)}")
             return {
-                "sl_pct": 0.002,
-                "tp_pct": 0.0024,
+                "sl_pct": 0.004,  # Widened from 0.002
+                "tp_pct": 0.004,  # Quicker 1:1 ratio
                 "max_position_pct": 2.0,
                 "risk_reward_ratio": 1.2
             } 

@@ -429,7 +429,7 @@ class StrategyRangeBreakoutMomentum(StrategyTemplate):
                 avg_volume = self.data['volume_sma'].iloc[idx]
                 
                 if not pd.isna(current_volume) and not pd.isna(avg_volume) and avg_volume > 0:
-                    volume_multiplier = self.config.get('volume_surge_multiplier', 1.2)
+                    volume_multiplier = self.config.get('volume_surge_multiplier', 1.8)  # Enhanced from 1.2 to 1.8
                     volume_condition = current_volume > avg_volume * volume_multiplier
                     confirmations.append(f"Volume: {volume_condition}")
             
@@ -798,8 +798,8 @@ class StrategyRangeBreakoutMomentum(StrategyTemplate):
             
             # Fallback to config defaults
             return {
-                "sl_pct": self.config.get('sl_pct', 0.02),
-                "tp_pct": self.config.get('tp_pct', 0.04),
+                "sl_pct": self.config.get('sl_pct', 0.04),  # Widened from 0.02
+                "tp_pct": self.config.get('tp_pct', 0.025),  # Quicker from 0.04
                 "max_position_pct": self.config.get('max_position_pct', 3.0),
                 "risk_reward_ratio": 2.0
             }
@@ -807,8 +807,8 @@ class StrategyRangeBreakoutMomentum(StrategyTemplate):
         except Exception as e:
             self.logger.error(f"Error in get_risk_parameters: {str(e)}")
             return {
-                "sl_pct": 0.02,
-                "tp_pct": 0.04,
+                "sl_pct": 0.04,  # Widened from 0.02
+                "tp_pct": 0.025,  # Quicker from 0.04
                 "max_position_pct": 3.0,
                 "risk_reward_ratio": 2.0
             } 

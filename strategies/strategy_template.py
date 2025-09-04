@@ -116,12 +116,14 @@ class StrategyTemplate(ABC):
         # self.logger.debug(f"{self.__class__.__name__} _base_check_entry for {symbol}: Returning True (ok to check entry conditions)")
         return True
 
-    def check_entry(self, symbol: str) -> Optional[Dict[str, Any]]:
+    def check_entry(self, symbol: str, directional_bias: str = 'NEUTRAL', bias_strength: str = 'WEAK') -> Optional[Dict[str, Any]]:
         """
         Public method to check entry conditions for a specific symbol.
         Wraps _check_entry_conditions with checks for existing positions or pending orders.
         Args:
             symbol: The trading symbol (e.g., 'BTC/USDT')
+            directional_bias: Higher timeframe directional bias ('BULLISH', 'BEARISH', 'NEUTRAL', etc.)
+            bias_strength: Strength of the bias ('STRONG', 'MODERATE', 'WEAK')
         Returns:
             dict | None: Order details if entry signal, else None.
         """
@@ -131,6 +133,11 @@ class StrategyTemplate(ABC):
         entry_signal = self._check_entry_conditions(symbol)
         
         if entry_signal:
+            # Multi-timeframe bias alignment filter
+            if not self._check_bias_alignment(entry_signal, directional_bias, bias_strength):
+                self.logger.info(f"Entry signal for {symbol} filtered out due to bias misalignment: signal={entry_signal.get('side')} vs bias={directional_bias}")
+                return None
+            
             # Make a shallow copy to avoid mutating the original dict
             entry_signal = entry_signal.copy()
             # Ensure essential keys are present, and add risk parameters
@@ -537,14 +544,14 @@ class StrategyTemplate(ABC):
         
         # Take profit configuration
         self.take_profit_mode = risk_config.get('take_profit_mode', 'fixed_pct')  # 'fixed_pct' | 'progressive_levels'
-        self.take_profit_fixed_pct = risk_config.get('take_profit_fixed_pct', 0.04)  # 4% default (2:1 RR)
-        self.take_profit_progressive_levels = risk_config.get('take_profit_progressive_levels', [0.02, 0.04, 0.06])  # 2%, 4%, 6%
+        self.take_profit_fixed_pct = risk_config.get('take_profit_fixed_pct', 0.02)  # 2% default for quicker profits
+        self.take_profit_progressive_levels = risk_config.get('take_profit_progressive_levels', [0.015, 0.035, 0.08])  # 1.5%, 3.5%, 8% - quicker first target
         
         # Trailing stop configuration
         self.trailing_stop_enabled = risk_config.get('trailing_stop_enabled', False)
         self.trailing_stop_mode = risk_config.get('trailing_stop_mode', 'price_pct')  # 'price_pct' | 'atr_mult'
-        self.trailing_stop_offset_pct = risk_config.get('trailing_stop_offset_pct', 0.015)  # 1.5% trailing offset
-        self.trailing_stop_atr_multiplier = risk_config.get('trailing_stop_atr_multiplier', 1.5)  # 1.5x ATR trailing offset
+        self.trailing_stop_offset_pct = risk_config.get('trailing_stop_offset_pct', 0.025)  # 2.5% trailing offset - wider
+        self.trailing_stop_atr_multiplier = risk_config.get('trailing_stop_atr_multiplier', 2.5)  # 2.5x ATR trailing offset - wider
         
         # Position sizing configuration
         self.position_sizing_mode = risk_config.get('position_sizing_mode', 'fixed_notional')  # 'fixed_notional' | 'vol_normalized' | 'kelly_capped'
@@ -1017,6 +1024,33 @@ class StrategyTemplate(ABC):
         if not hasattr(self, '_market_data'):
             self._market_data = {}
         self._market_data[symbol] = market_data
+
+    def _check_bias_alignment(self, entry_signal: Dict[str, Any], directional_bias: str, bias_strength: str) -> bool:
+        """
+        Check if entry signal aligns with higher timeframe directional bias.
+        
+        Args:
+            entry_signal: Entry signal dictionary containing 'side'
+            directional_bias: Higher timeframe bias ('BULLISH', 'BEARISH', 'NEUTRAL', etc.)
+            bias_strength: Strength of bias ('STRONG', 'MODERATE', 'WEAK')
+            
+        Returns:
+            True if signal aligns with bias or bias is weak/neutral
+        """
+        signal_side = entry_signal.get('side', '').lower()
+        
+        # Always allow if bias is neutral or weak
+        if directional_bias == 'NEUTRAL' or bias_strength == 'WEAK':
+            return True
+            
+        # For moderate/strong bias, enforce alignment
+        if bias_strength in ['MODERATE', 'STRONG']:
+            if directional_bias in ['BULLISH', 'BULLISH_BIASED']:
+                return signal_side == 'buy'
+            elif directional_bias in ['BEARISH', 'BEARISH_BIASED']:
+                return signal_side == 'sell'
+                
+        return True
 
     def update_trailing_stops(self, symbol: str, current_price: float) -> None:
         """

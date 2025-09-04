@@ -449,7 +449,7 @@ class StrategyMicroRangeScalping(StrategyTemplate):
             
             # Profit target exits
             if self.entry_price:
-                take_profit_pct = self.config.get('take_profit_pct', 0.0015)
+                take_profit_pct = self.config.get('take_profit_pct', 0.001)  # Quicker from 0.0015
                 break_even_buffer_pct = self.config.get('break_even_buffer_pct', 0.0003)
                 
                 if self.entry_side == 'long':
@@ -658,8 +658,8 @@ class StrategyMicroRangeScalping(StrategyTemplate):
                 self.entry_price):
                 
                 current_price = self.data['close'].iloc[-1]
-                stop_loss_buffer_pct = self.config.get('stop_loss_buffer_pct', 0.0005)
-                take_profit_pct = self.config.get('take_profit_pct', 0.0015)
+                stop_loss_buffer_pct = self.config.get('stop_loss_buffer_pct', 0.001)  # Widened from 0.0005
+                take_profit_pct = self.config.get('take_profit_pct', 0.001)  # Quicker from 0.0015
                 
                 if self.entry_side == 'long':
                     # Stop just below support
@@ -688,8 +688,8 @@ class StrategyMicroRangeScalping(StrategyTemplate):
             
             # Fallback to config defaults
             return {
-                "sl_pct": self.config.get('stop_loss_buffer_pct', 0.0005),
-                "tp_pct": self.config.get('take_profit_pct', 0.0015),
+                "sl_pct": self.config.get('stop_loss_buffer_pct', 0.001),  # Widened from 0.0005
+                "tp_pct": self.config.get('take_profit_pct', 0.001),  # Quicker from 0.0015
                 "max_position_pct": self.config.get('max_position_pct', 2.0) * self.config.get('position_size_reduction', 0.7),
                 "risk_reward_ratio": 3.0
             }
@@ -697,8 +697,8 @@ class StrategyMicroRangeScalping(StrategyTemplate):
         except Exception as e:
             self.logger.error(f"Error in get_risk_parameters: {str(e)}")
             return {
-                "sl_pct": 0.0005,
-                "tp_pct": 0.0015,
+                "sl_pct": 0.001,  # Widened from 0.0005
+                "tp_pct": 0.001,  # Quicker from 0.0015
                 "max_position_pct": 1.4,
                 "risk_reward_ratio": 3.0
             } 

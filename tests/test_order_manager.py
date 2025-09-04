@@ -33,7 +33,8 @@ def test_place_order_with_risk_market_success(manager):
     # Should place main, SL, and TP orders
     result = manager.place_order_with_risk(
         symbol='BTCUSDT', side='buy', order_type='market', size=1, signal_price=100,
-        sl_pct=0.01, tp_pct=0.02, params=None, reduce_only=False, time_in_force='GoodTillCancel'
+        sl_pct=0.01, tp_pct=0.02, params=None, reduce_only=False, time_in_force='GoodTillCancel',
+        market_condition='UNKNOWN', urgency='NORMAL', slippage_tolerance=0.002
     )
     assert 'main_order' in result
     assert 'stop_loss_order' in result
@@ -45,7 +46,8 @@ def test_place_order_with_risk_limit_success(manager):
     manager.exchange.fetch_order.return_value = {'retCode': 0, 'retMsg': 'OK', 'result': {'orderId': 'oid', 'orderStatus': 'Filled', 'avgPrice': 100, 'cumExecQty': 1}, 'time': 1234567890}
     result = manager.place_order_with_risk(
         symbol='BTCUSDT', side='buy', order_type='limit', size=1, signal_price=100,
-        sl_pct=0.01, tp_pct=0.02, params=None, reduce_only=False, time_in_force='GoodTillCancel'
+        sl_pct=0.01, tp_pct=0.02, params=None, reduce_only=False, time_in_force='GoodTillCancel',
+        market_condition='UNKNOWN', urgency='NORMAL', slippage_tolerance=0.002
     )
     assert 'main_order' in result
     assert 'stop_loss_order' in result
@@ -57,7 +59,8 @@ def test_place_order_with_risk_main_order_error(manager):
     with pytest.raises(OrderExecutionError):
         manager.place_order_with_risk(
             symbol='BTCUSDT', side='buy', order_type='market', size=1, signal_price=100,
-            sl_pct=0.01, tp_pct=0.02, params=None, reduce_only=False, time_in_force='GoodTillCancel'
+            sl_pct=0.01, tp_pct=0.02, params=None, reduce_only=False, time_in_force='GoodTillCancel',
+            market_condition='UNKNOWN', urgency='NORMAL', slippage_tolerance=0.002
         )
     print('test_place_order_with_risk_main_order_error PASSED')
 

@@ -579,7 +579,7 @@ class StrategyLowVolatilityTrendPullback(StrategyTemplate):
                 return
                 
             current_price = self.data['close'].iloc[idx]
-            trailing_threshold = self.config.get('trailing_profit_threshold', 0.001)
+            trailing_threshold = self.config.get('trailing_profit_threshold', 0.003)  # Delayed activation from 0.1% to 0.3%
             trailing_step = self.config.get('trailing_step', 0.0005)
             
             # Determine position direction from trend
@@ -752,8 +752,8 @@ class StrategyLowVolatilityTrendPullback(StrategyTemplate):
     def get_risk_parameters(self) -> Dict[str, Any]:
         """Get tight pullback scalping risk management parameters"""
         return {
-            "sl_pct": self.config.get('stop_loss_pct', 0.0015),    # 0.15% tight stop
-            "tp_pct": self.config.get('profit_target_pct', 0.003), # 0.3% quick target
+            "sl_pct": self.config.get('stop_loss_pct', 0.003),    # 0.3% stop - widened from 0.15%
+            "tp_pct": self.config.get('profit_target_pct', 0.002), # 0.2% quicker target
             "max_position_pct": self.config.get('max_position_pct', 2.0),  # Conservative position sizing
             "risk_reward_ratio": self.config.get('profit_target_pct', 0.003) / self.config.get('stop_loss_pct', 0.0015)  # 2:1 ratio
         } 

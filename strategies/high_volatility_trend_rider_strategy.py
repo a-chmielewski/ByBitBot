@@ -82,14 +82,14 @@ class StrategyHighVolatilityTrendRider(StrategyTemplate):
         self.ema_fast_period = strategy_specific_params.get("ema_fast_period", 20)
         self.ema_slow_period = strategy_specific_params.get("ema_slow_period", 50)
         
-        # ADX parameters for trend strength
+        # ADX parameters for trend strength - Enhanced for stricter trend confirmation
         self.adx_period = strategy_specific_params.get("adx_period", 14)
-        self.adx_threshold = strategy_specific_params.get("adx_threshold", 25)
-        self.adx_strong_threshold = strategy_specific_params.get("adx_strong_threshold", 30)
+        self.adx_threshold = strategy_specific_params.get("adx_threshold", 30)  # Raised from 25 to 30 for stronger trend confirmation
+        self.adx_strong_threshold = strategy_specific_params.get("adx_strong_threshold", 35)  # Raised from 30 to 35
         
         # ATR parameters for volatility and stops
         self.atr_period = strategy_specific_params.get("atr_period", 14)
-        self.atr_stop_multiplier = strategy_specific_params.get("atr_stop_multiplier", 2.0)
+        self.atr_stop_multiplier = strategy_specific_params.get("atr_stop_multiplier", 3.0)  # Wider trailing from 2.0x
         self.atr_target_multiplier = strategy_specific_params.get("atr_target_multiplier", 2.0)
         
         # Volatility regime detection
@@ -104,15 +104,16 @@ class StrategyHighVolatilityTrendRider(StrategyTemplate):
         self.rsi_bull_threshold = strategy_specific_params.get("rsi_bull_threshold", 50)
         self.rsi_bear_threshold = strategy_specific_params.get("rsi_bear_threshold", 50)
         
-        # Volume parameters
+        # Volume parameters - Enhanced for stricter volume confirmation
         self.volume_period = strategy_specific_params.get("volume_period", 20)
-        self.volume_multiplier = strategy_specific_params.get("volume_multiplier", 1.5)
+        self.volume_multiplier = strategy_specific_params.get("volume_multiplier", 2.0)  # Raised from 1.5 to 2.0 for stronger volume confirmation
         
-        # Pullback and breakout parameters
+        # Pullback and breakout parameters - Enhanced for deeper pullbacks
         self.pullback_bars = strategy_specific_params.get("pullback_bars", 5)
-        self.min_pullback_pct = strategy_specific_params.get("min_pullback_pct", 0.002)
+        self.min_pullback_pct = strategy_specific_params.get("min_pullback_pct", 0.004)  # Increased from 0.2% to 0.4%
         self.breakout_bars = strategy_specific_params.get("breakout_bars", 50)
         self.breakout_range_multiplier = strategy_specific_params.get("breakout_range_multiplier", 1.5)
+        self.min_consolidation_bars = strategy_specific_params.get("min_consolidation_bars", 3)  # Minimum consolidation period
         
         # Risk management
         self.max_trade_duration = strategy_specific_params.get("max_trade_duration", 100)
@@ -121,7 +122,7 @@ class StrategyHighVolatilityTrendRider(StrategyTemplate):
         
         # Cache risk parameters for get_risk_parameters()
         self.sl_pct = strategy_specific_params.get('sl_pct', 0.03)  # 3% default for high volatility
-        self.tp_pct = strategy_specific_params.get('tp_pct', 0.06)  # 6% default target
+        self.tp_pct = strategy_specific_params.get('tp_pct', 0.04)  # 4% quicker target from 6%
         
         # State tracking variables
         self.trend_direction = 0  # 1 for bullish, -1 for bearish, 0 for neutral
@@ -133,7 +134,8 @@ class StrategyHighVolatilityTrendRider(StrategyTemplate):
         self.partial_profit_taken = False
 
         self.logger.info(f"{self.__class__.__name__} parameters: EMA={self.ema_fast_period}/{self.ema_slow_period}, "
-                        f"ADX threshold={self.adx_threshold}, ATR percentile={self.atr_volatility_percentile}")
+                        f"ADX threshold={self.adx_threshold} (enhanced), Volume multiplier={self.volume_multiplier} (enhanced), "
+                        f"ATR percentile={self.atr_volatility_percentile}")
 
     def init_indicators(self) -> None:
         """Initialize indicators for high-volatility trend detection"""
@@ -677,7 +679,7 @@ class StrategyHighVolatilityTrendRider(StrategyTemplate):
     def get_risk_parameters(self) -> Dict[str, Any]:
         """Return risk parameters for high-volatility trend trading"""
         return {
-            "sl_pct": self.sl_pct,  # Configured stop loss percentage
+            "sl_pct": min(self.sl_pct * 2, 0.08),  # Widened stops for high volatility
             "tp_pct": self.tp_pct   # Configured take profit percentage
         }
 

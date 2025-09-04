@@ -14,9 +14,9 @@ from dataclasses import dataclass, asdict
 class StopLossConfig:
     """Stop loss configuration for strategies"""
     mode: str = 'atr_mult'  # 'fixed_pct' | 'atr_mult'
-    fixed_pct: float = 0.015  # Fixed percentage (1.5%) - widened from 0.5%
-    atr_multiplier: float = 2.5  # ATR multiplier for dynamic stops - widened from 1.5x
-    max_loss_pct: float = 0.08  # Maximum loss percentage (8%) - increased from 5%
+    fixed_pct: float = 0.025  # Fixed percentage (2.5%) - widened to reduce premature stops
+    atr_multiplier: float = 3.5  # ATR multiplier for dynamic stops - widened for market noise
+    max_loss_pct: float = 0.16  # Maximum loss percentage (16%) - widened for volatile markets
 
 @dataclass
 class TakeProfitConfig:
@@ -28,9 +28,9 @@ class TakeProfitConfig:
     
     def __post_init__(self):
         if self.progressive_levels is None:
-            self.progressive_levels = [0.025, 0.05, 0.10]  # Widened: 2.5%, 5%, 10%
+            self.progressive_levels = [0.015, 0.035, 0.08]  # Quicker: 1.5%, 3.5%, 8%
         if self.partial_exit_sizes is None:
-            self.partial_exit_sizes = [0.3, 0.3, 0.4]  # Let 40% run to final target
+            self.partial_exit_sizes = [0.5, 0.25, 0.25]  # Take 50% at first target, 25% at second
 
 @dataclass
 class TrailingStopConfig:
@@ -39,7 +39,7 @@ class TrailingStopConfig:
     mode: str = 'atr_mult'  # 'price_pct' | 'atr_mult'
     offset_pct: float = 0.02  # 2% trailing offset - widened
     atr_multiplier: float = 2.0  # ATR multiplier for trailing offset - widened
-    activation_pct: float = 0.015  # Activate after 1.5% profit - slightly higher threshold
+    activation_pct: float = 0.035  # Activate after 3.5% profit - after second TP target hit
 
 @dataclass
 class PositionSizingConfig:
@@ -115,7 +115,7 @@ class StrategyMatrix:
     STRATEGY_RISK_PROFILES = {
         'StrategyEMATrendRider': StrategyRiskProfile(
             strategy_name='StrategyEMATrendRider',
-            description='EMA Trend Rider with ADX Filter - Stable trend-following on 5m timeframe',
+            description='EMA Trend Rider with Enhanced ADX Filter (30+) & Volume Confirmation (1.8x) - Stable trend-following on 5m timeframe',
             market_type_tags=['TRENDING'],
             execution_timeframe='5m',
             stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=3.0, max_loss_pct=0.08),
@@ -145,7 +145,7 @@ class StrategyMatrix:
         
         'StrategyBreakoutAndRetest': StrategyRiskProfile(
             strategy_name='StrategyBreakoutAndRetest',
-            description='Breakout and Retest for trend continuation trades',
+            description='Breakout and Retest with Enhanced Volume Confirmation (2.0x) for trend continuation trades',
             market_type_tags=['TRENDING', 'TRANSITIONAL'],
             execution_timeframe='1m',
             stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=3.2, max_loss_pct=0.08),
@@ -220,7 +220,7 @@ class StrategyMatrix:
         
         'StrategyHighVolatilityTrendRider': StrategyRiskProfile(
             strategy_name='StrategyHighVolatilityTrendRider',
-            description='High-Volatility Trend Rider for volatile trending markets',
+            description='High-Volatility Trend Rider with Enhanced ADX Filter (30+) & Volume Confirmation (2.0x) for volatile trending markets',
             market_type_tags=['HIGH_VOLATILITY', 'TRENDING'],
             execution_timeframe='1m',
             stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=3.5, max_loss_pct=0.10),

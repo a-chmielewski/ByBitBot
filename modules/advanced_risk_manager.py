@@ -64,7 +64,7 @@ class RiskLimits:
     max_daily_loss_pct: float = 5.0  # Maximum daily loss percentage
     max_daily_loss_amount: Optional[float] = None  # Maximum daily loss amount
     max_drawdown_pct: float = 10.0  # Maximum drawdown percentage
-    max_consecutive_losses: int = 5  # Maximum consecutive losses
+    max_consecutive_losses: int = 3  # Maximum consecutive losses - tightened to prevent cascades
     
     # Position limits
     max_position_size_pct: float = 10.0  # Maximum position size as % of account
@@ -72,7 +72,7 @@ class RiskLimits:
     max_leverage: float = 25.0  # Maximum leverage allowed
     
     # Risk management
-    min_risk_reward_ratio: float = 1.5  # Minimum risk/reward ratio
+    min_risk_reward_ratio: float = 1.2  # Minimum risk/reward ratio - lowered for high-probability scalps
     max_correlation_threshold: float = 0.7  # Maximum correlation between positions
     volatility_multiplier: float = 1.5  # Volatility-based position sizing multiplier
     

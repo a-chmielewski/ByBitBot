@@ -583,7 +583,7 @@ class StrategyAdaptiveTransitionalMomentum(StrategyTemplate):
                 volume_curr = self.data['volume'].iloc[idx]
                 volume_avg = self.data['volume_sma'].iloc[idx]
                 if not pd.isna(volume_avg) and volume_avg > 0:
-                    volume_surge_multiplier = self.config.get('volume_surge_multiplier', 1.5)
+                    volume_surge_multiplier = self.config.get('volume_surge_multiplier', 2.0)  # Enhanced from 1.5 to 2.0
                     if volume_curr > volume_avg * volume_surge_multiplier:
                         bullish_signals += 1
                 
@@ -616,7 +616,7 @@ class StrategyAdaptiveTransitionalMomentum(StrategyTemplate):
                 volume_curr = self.data['volume'].iloc[idx]
                 volume_avg = self.data['volume_sma'].iloc[idx]
                 if not pd.isna(volume_avg) and volume_avg > 0:
-                    volume_surge_multiplier = self.config.get('volume_surge_multiplier', 1.5)
+                    volume_surge_multiplier = self.config.get('volume_surge_multiplier', 2.0)  # Enhanced from 1.5 to 2.0
                     if volume_curr > volume_avg * volume_surge_multiplier:
                         bearish_signals += 1
                 
@@ -884,8 +884,8 @@ class StrategyAdaptiveTransitionalMomentum(StrategyTemplate):
             
             # Fallback to config defaults
             return {
-                "sl_pct": self.config.get('sl_pct', 0.025),
-                "tp_pct": self.config.get('tp_pct', 0.05),
+                "sl_pct": self.config.get('sl_pct', 0.05),  # Widened from 0.025
+                "tp_pct": self.config.get('tp_pct', 0.03),  # Quicker from 0.05
                 "max_position_pct": max_position_pct,
                 "risk_reward_ratio": self.config.get('risk_reward_ratio', 2.0)
             }
@@ -893,8 +893,8 @@ class StrategyAdaptiveTransitionalMomentum(StrategyTemplate):
         except Exception as e:
             self.logger.error(f"Error in get_risk_parameters: {str(e)}")
             return {
-                "sl_pct": 0.025,
-                "tp_pct": 0.05,
+                "sl_pct": 0.05,  # Widened from 0.025
+                "tp_pct": 0.03,  # Quicker from 0.05
                 "max_position_pct": 1.0,
                 "risk_reward_ratio": 2.0
             }

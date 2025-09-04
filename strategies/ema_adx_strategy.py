@@ -107,10 +107,10 @@ class StrategyEMATrendRider(StrategyTemplate):
         self.ema_fast_period = strategy_specific_params.get("ema_fast_period", 20)
         self.ema_slow_period = strategy_specific_params.get("ema_slow_period", 50)
         
-        # ADX parameters
+        # ADX parameters - Enhanced for stricter trend confirmation
         self.adx_period = strategy_specific_params.get("adx_period", 14)
-        self.adx_threshold = strategy_specific_params.get("adx_threshold", 25)
-        self.adx_strong_threshold = strategy_specific_params.get("adx_strong_threshold", 30)
+        self.adx_threshold = strategy_specific_params.get("adx_threshold", 30)  # Raised from 25 to 30 for stronger trend confirmation
+        self.adx_strong_threshold = strategy_specific_params.get("adx_strong_threshold", 35)  # Raised from 30 to 35
         
         # RSI parameters
         self.rsi_period = strategy_specific_params.get("rsi_period", 14)
@@ -119,17 +119,18 @@ class StrategyEMATrendRider(StrategyTemplate):
         
         # ATR parameters
         self.atr_period = strategy_specific_params.get("atr_period", 14)
-        self.atr_stop_multiplier = strategy_specific_params.get("atr_stop_multiplier", 2.0)
+        self.atr_stop_multiplier = strategy_specific_params.get("atr_stop_multiplier", 3.0)  # Wider trailing from 2.0x
         self.atr_target_multiplier = strategy_specific_params.get("atr_target_multiplier", 2.0)
         
-        # Pullback parameters
+        # Pullback parameters - Enhanced for deeper pullbacks
         self.pullback_bars = strategy_specific_params.get("pullback_bars", 5)
-        self.min_pullback_pct = strategy_specific_params.get("min_pullback_pct", 0.002)  # 0.2%
+        self.min_pullback_pct = strategy_specific_params.get("min_pullback_pct", 0.005)  # 0.5% (increased from 0.2%)
         self.pullback_timeout_bars = strategy_specific_params.get("pullback_timeout_bars", 20)
+        self.min_consolidation_bars = strategy_specific_params.get("min_consolidation_bars", 3)  # Minimum bars for consolidation
         
-        # Volume parameters
+        # Volume parameters - Enhanced for stricter volume confirmation
         self.volume_period = strategy_specific_params.get("volume_period", 20)
-        self.volume_spike_multiplier = strategy_specific_params.get("volume_spike_multiplier", 1.2)
+        self.volume_spike_multiplier = strategy_specific_params.get("volume_spike_multiplier", 1.8)  # Raised from 1.2 to 1.8 for stronger volume confirmation
         
         # Risk parameters
         self.time_stop_bars = strategy_specific_params.get("time_stop_bars", 50)
@@ -153,7 +154,8 @@ class StrategyEMATrendRider(StrategyTemplate):
         self.entry_bar_index: Optional[int] = None
 
         self.logger.info(f"{self.__class__.__name__} parameters: EMA Fast={self.ema_fast_period}, "
-                        f"EMA Slow={self.ema_slow_period}, ADX threshold={self.adx_threshold}, "
+                        f"EMA Slow={self.ema_slow_period}, ADX threshold={self.adx_threshold} (enhanced), "
+                        f"Volume multiplier={self.volume_spike_multiplier} (enhanced), "
                         f"ATR multipliers: SL={self.atr_stop_multiplier}, TP={self.atr_target_multiplier}")
 
     def init_indicators(self) -> None:
@@ -470,6 +472,10 @@ class StrategyEMATrendRider(StrategyTemplate):
             self._reset_trend_state()
             return False, None
         
+        # Check consolidation period before entry
+        if not self._check_consolidation_period(vals, current_bar):
+            return False, None
+        
         if self.trend_direction == 1:  # Bullish trend
             # Look for bounce from pullback
             bounce_threshold = self.pullback_extreme_price * 1.001  # 0.1% bounce
@@ -499,6 +505,33 @@ class StrategyEMATrendRider(StrategyTemplate):
                     return True, 'short'
         
         return False, None
+
+    def _check_consolidation_period(self, vals: Dict[str, Any], current_bar: int) -> bool:
+        """Check if price has consolidated for minimum period before entry."""
+        if current_bar < self.min_consolidation_bars:
+            return False
+            
+        current_price = vals["current_price"]
+        ema_fast = vals["ema_fast"]
+        
+        # Check if price has been on correct side of EMA for required bars
+        consolidation_bars_count = 0
+        for i in range(self.min_consolidation_bars):
+            check_idx = current_bar - i
+            if check_idx < 0:
+                break
+                
+            check_price = self.data['close'].iloc[check_idx]
+            check_ema = self.data['ema_fast'].iloc[check_idx]
+            
+            if self.trend_direction == 1 and check_price > check_ema:
+                consolidation_bars_count += 1
+            elif self.trend_direction == -1 and check_price < check_ema:
+                consolidation_bars_count += 1
+            else:
+                break
+                
+        return consolidation_bars_count >= self.min_consolidation_bars
 
     def _reset_trend_state(self) -> None:
         """Reset all trend and pullback state variables."""
@@ -593,7 +626,7 @@ class StrategyEMATrendRider(StrategyTemplate):
             atr_tp_pct = (vals["atr"] * self.atr_target_multiplier) / vals["current_price"]
             
             # Use ATR-based if reasonable, otherwise fall back to fixed
-            sl_pct = min(atr_sl_pct, self.sl_pct * 2)  # Cap at 2x fixed SL
+            sl_pct = min(atr_sl_pct, self.sl_pct * 4)  # Cap at 4x fixed SL for wider stops
             tp_pct = max(atr_tp_pct, self.tp_pct * 0.5)  # Minimum 0.5x fixed TP
             
             return {

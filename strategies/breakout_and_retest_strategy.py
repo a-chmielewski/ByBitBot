@@ -110,9 +110,9 @@ class StrategyBreakoutAndRetest(StrategyTemplate):
         self.sr_min_touches = strategy_specific_params.get("sr_min_touches", 3)
         self.sr_tolerance_pct = strategy_specific_params.get("sr_tolerance_pct", 0.002)  # 0.2%
         
-        # Breakout parameters
+        # Breakout parameters - Enhanced for stricter breakout confirmation
         self.breakout_min_pct = strategy_specific_params.get("breakout_min_pct", 0.003)  # 0.3%
-        self.volume_breakout_multiplier = strategy_specific_params.get("volume_breakout_multiplier", 1.5)
+        self.volume_breakout_multiplier = strategy_specific_params.get("volume_breakout_multiplier", 2.0)  # Raised from 1.5 to 2.0 for stronger volume confirmation
         self.volume_avg_period = strategy_specific_params.get("volume_avg_period", 20)
         
         # Trend filter parameters
@@ -166,7 +166,7 @@ class StrategyBreakoutAndRetest(StrategyTemplate):
         self.reversal_start_bar = None
 
         self.logger.info(f"{self.__class__.__name__} parameters: SR_lookback={self.sr_lookback_period}, "
-                        f"Volume_mult={self.volume_breakout_multiplier}, EMA_trend={self.ema_trend_period}")
+                        f"Volume_mult={self.volume_breakout_multiplier} (enhanced), EMA_trend={self.ema_trend_period}")
 
     def init_indicators(self) -> None:
         """Initialize indicators required by the strategy."""

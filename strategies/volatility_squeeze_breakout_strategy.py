@@ -843,7 +843,7 @@ class StrategyVolatilitySqueezeBreakout(StrategyTemplate):
                 hasattr(self, 'entry_side') and self.entry_side):
                 
                 current_price = self.data['close'].iloc[-1]
-                initial_stop_buffer_pct = self.config.get('initial_stop_buffer_pct', 0.002)
+                initial_stop_buffer_pct = self.config.get('initial_stop_buffer_pct', 0.004)  # Widened from 0.002
                 
                 if self.entry_side == 'long':
                     # Stop just inside range resistance
@@ -873,8 +873,8 @@ class StrategyVolatilitySqueezeBreakout(StrategyTemplate):
             
             # Fallback to config defaults
             return {
-                "sl_pct": self.config.get('sl_pct', 0.015),
-                "tp_pct": self.config.get('tp_pct', 0.03),
+                "sl_pct": self.config.get('sl_pct', 0.03),  # Widened from 0.015
+                "tp_pct": self.config.get('tp_pct', 0.02),  # Quicker from 0.03
                 "max_position_pct": self.config.get('max_position_pct', 2.0) * self.config.get('position_size_reduction', 0.9),
                 "risk_reward_ratio": 2.0
             }
@@ -882,8 +882,8 @@ class StrategyVolatilitySqueezeBreakout(StrategyTemplate):
         except Exception as e:
             self.logger.error(f"Error in get_risk_parameters: {str(e)}")
             return {
-                "sl_pct": 0.015,
-                "tp_pct": 0.03,
+                "sl_pct": 0.03,  # Widened from 0.015
+                "tp_pct": 0.02,  # Quicker from 0.03
                 "max_position_pct": 1.8,
                 "risk_reward_ratio": 2.0
             }

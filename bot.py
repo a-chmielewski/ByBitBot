@@ -718,6 +718,10 @@ def enhanced_order_placement_with_validation(
         logger.info("📤 Executing order via OrderManager...")
         
         try:
+            # Get market conditions for intelligent order routing
+            market_regime = validated_order_details.get('market_regime', 'UNKNOWN')
+            urgency_level = entry_signal.get('urgency', 'NORMAL')
+            
             order_responses = order_manager.place_order_with_risk(
             symbol=symbol,
             side=final_order_params['side'],
@@ -728,9 +732,17 @@ def enhanced_order_placement_with_validation(
             tp_pct=final_order_params['tp_pct'],
             params=final_order_params.get('params'),
             reduce_only=final_order_params.get('reduce_only', False),
-            time_in_force=final_order_params.get('time_in_force', 'GoodTillCancel')
+            time_in_force=final_order_params.get('time_in_force', 'GoodTillCancel'),
+            market_condition=market_regime,
+            urgency=urgency_level,
+            slippage_tolerance=entry_signal.get('slippage_tolerance', 0.002)
             )
         
+            # Check if order was rejected due to slippage
+            if order_responses.get('slippage_rejected'):
+                logger.warning("❌ Order rejected due to excessive slippage")
+                return False, None, "Order rejected due to slippage tolerance exceeded"
+            
             logger.info("✅ Order executed successfully via OrderManager")
             logger.info(f"   Order responses: {order_responses}")
                         
@@ -1650,7 +1662,7 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
             else:
                 next_allowed_entry_time = None
             
-            entry_signal = strat.check_entry(symbol=symbol)
+            entry_signal = strat.check_entry(symbol=symbol, directional_bias=current_directional_bias, bias_strength=current_bias_strength)
             if entry_signal:
                 # Validate required fields are present in entry_signal
                 required_fields = ['side', 'size', 'sl_pct', 'tp_pct']
@@ -1744,6 +1756,23 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                     bot_logger.warning("Falling back to original order placement system...")
                     
                     try:
+                        # Get market conditions for fallback order routing
+                        fallback_market_condition = "UNKNOWN"
+                        fallback_urgency = "NORMAL"
+                        fallback_slippage_tolerance = 0.002
+                        
+                        # Try to get market conditions from available context
+                        if market_analyzer is not None:
+                            try:
+                                current_conditions = market_analyzer.get_current_market_conditions(symbol)
+                                fallback_market_condition = current_conditions.get('5m_condition', 'UNKNOWN')
+                            except Exception as e:
+                                bot_logger.debug(f"Could not get market conditions for fallback: {e}")
+                        
+                        # Extract urgency and slippage from order details if available
+                        fallback_urgency = order_details.get('urgency', 'NORMAL')
+                        fallback_slippage_tolerance = order_details.get('slippage_tolerance', 0.002)
+                        
                         order_responses = order_manager.place_order_with_risk(
                          symbol=symbol,
                          side=order_details['side'],
@@ -1754,7 +1783,10 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                          tp_pct=order_details['tp_pct'],
                          params=order_details.get('params'), # Pass any extra params from strategy
                          reduce_only=order_details.get('reduce_only', False),
-                         time_in_force=order_details.get('time_in_force', 'GoodTillCancel')
+                         time_in_force=order_details.get('time_in_force', 'GoodTillCancel'),
+                         market_condition=fallback_market_condition,
+                         urgency=fallback_urgency,
+                         slippage_tolerance=fallback_slippage_tolerance
                         )
                         bot_logger.info("✅ Fallback order placement successful")
                         
@@ -2627,7 +2659,7 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                 else:
                     next_allowed_entry_time = None
                 
-                entry_signal = current_strategy.check_entry(symbol)
+                entry_signal = current_strategy.check_entry(symbol, directional_bias, bias_strength)
                 if entry_signal:
                     bot_logger.info(f"Entry signal detected by {current_strategy_name}: {entry_signal}")
                     
@@ -2752,6 +2784,23 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                             if key not in ['side', 'type', 'size', 'price', 'sl_pct', 'tp_pct']:
                                 params[key] = value
                         
+                        # Get market conditions for intelligent order routing
+                        market_condition = "UNKNOWN"
+                        urgency_level = "NORMAL"
+                        slippage_tolerance = 0.002
+                        
+                        # Try to get market conditions from available context
+                        if market_analyzer_enhanced is not None:
+                            try:
+                                current_conditions = market_analyzer_enhanced.get_current_market_conditions(symbol)
+                                market_condition = current_conditions.get('5m_condition', 'UNKNOWN')
+                            except Exception as e:
+                                bot_logger.debug(f"Could not get market conditions: {e}")
+                        
+                        # Extract urgency and slippage from entry signal if available
+                        urgency_level = entry_signal.get('urgency', 'NORMAL')
+                        slippage_tolerance = entry_signal.get('slippage_tolerance', 0.002)
+                        
                         order_responses = order_manager.place_order_with_risk(
                             symbol=symbol,
                             side=side,
@@ -2760,7 +2809,10 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                             signal_price=signal_price,
                             sl_pct=sl_pct,
                             tp_pct=tp_pct,
-                            params=params if params else None
+                            params=params if params else None,
+                            market_condition=market_condition,
+                            urgency=urgency_level,
+                            slippage_tolerance=slippage_tolerance
                         )
                         current_strategy.on_order_update(order_responses, symbol)
                         bot_logger.info(f"Orders placed successfully for {symbol}")
