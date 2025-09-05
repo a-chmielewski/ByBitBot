@@ -257,7 +257,7 @@ class ExchangeConnector:
                 return True
             else:
                 # Circuit is open, reject non-critical calls
-                critical_methods = {'get_positions', 'cancel_order', 'get_wallet_balance'}
+                critical_methods = {'get_positions', 'cancel_order', 'get_wallet_balance', 'get_open_orders', 'get_kline'}
                 if method_name not in critical_methods:
                     self.logger.warning(f"Circuit breaker open - rejecting non-critical API call: {method_name}")
                     return False
