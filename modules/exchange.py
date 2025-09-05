@@ -140,6 +140,14 @@ class ExchangeConnector:
                     f"Time synchronized with ByBit server. Offset: {self._time_offset:.3f}s (median of {len(offsets)} attempts)"
                 )
                 self.logger.debug(f"  All offsets: {[f'{o:.3f}s' for o in offsets]}")
+                
+                # Reset circuit breaker if sync was successful and offset is reasonable
+                if abs(self._time_offset) < 5.0:  # Less than 5 seconds offset
+                    self._circuit_failure_count = 0
+                    self._circuit_success_count = 0
+                    if self._circuit_state != "closed":
+                        self.logger.info("Circuit breaker reset after successful time sync")
+                        self._circuit_state = "closed"
             else:
                 self.logger.error("Failed to get any valid time sync responses")
 
@@ -557,14 +565,23 @@ class ExchangeConnector:
                     self.logger.warning(f"Timestamp error detected for '{method_name}'. Resyncing time with server...")
                     self._sync_time()  # Resync time
                     
-                    # Force regenerate timestamp for next attempt
+                    # Force regenerate timestamp for next attempt with larger recv_window
                     if 'timestamp' in kwargs:
                         del kwargs['timestamp']
                     
-                    wait = self._calculate_backoff_with_jitter(retries)
+                    # Use larger recv_window for timestamp error retries
+                    if 'recv_window' not in kwargs:
+                        kwargs['recv_window'] = 60000  # Maximum allowed
+                    
+                    # Reset exponential backoff after timestamp sync
+                    if retries == 0:  # First retry after sync
+                        wait = 1.0  # Fixed 1 second wait after sync
+                    else:
+                        wait = self._calculate_backoff_with_jitter(retries)
+                    
                     self.logger.warning(
                         f"Retrying '{method_name}' after timestamp resync. Attempt {retries + 1}/{self.max_retries}. "
-                        f"Retrying in {wait:.2f}s..."
+                        f"Retrying in {wait:.2f}s... (recv_window: {kwargs.get('recv_window', 'default')})"
                     )
                     time.sleep(wait)
                     retries += 1
