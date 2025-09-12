@@ -1652,10 +1652,10 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                     last_trade = perf_tracker.trades[-1]
                     exit_time = datetime.fromisoformat(last_trade.exit_timestamp.replace('Z', '+00:00')) if last_trade.exit_timestamp else datetime.now(timezone.utc)
                     next_allowed_entry_time = exit_time + timedelta(minutes=15)
-                    cooldown_message_logged = False
-                    if not cooldown_message_logged:
-                        bot_logger.info(f"❄️ Last trade was a loss (${perf_tracker.trades[-1].pnl:.2f}). Activating 15-minute cooldown until {next_allowed_entry_time.strftime('%H:%M:%S')}")
-                        cooldown_message_logged = True
+                    # cooldown_message_logged = False
+                    # if not cooldown_message_logged:
+                    #     bot_logger.info(f"❄️ Last trade was a loss (${perf_tracker.trades[-1].pnl:.2f}). Activating 15-minute cooldown until {next_allowed_entry_time.strftime('%H:%M:%S')}")
+                    #     cooldown_message_logged = True
                 
                 if current_time < next_allowed_entry_time:
                     remaining_cooldown = (next_allowed_entry_time - current_time).total_seconds()
@@ -2656,9 +2656,9 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                         exit_time = datetime.fromisoformat(last_trade.exit_timestamp.replace('Z', '+00:00')) if last_trade.exit_timestamp else datetime.now(timezone.utc)
                         next_allowed_entry_time = exit_time + timedelta(minutes=15)
                         cooldown_message_logged = False
-                        if not cooldown_message_logged:
-                            bot_logger.info(f"❄️ Last trade was a loss (${perf_tracker.trades[-1].pnl:.2f}). Activating 15-minute cooldown until {next_allowed_entry_time.strftime('%H:%M:%S')}")
-                            cooldown_message_logged = True
+                        # if not cooldown_message_logged:
+                        #     bot_logger.info(f"❄️ Last trade was a loss (${perf_tracker.trades[-1].pnl:.2f}). Activating 15-minute cooldown until {next_allowed_entry_time.strftime('%H:%M:%S')}")
+                        #     cooldown_message_logged = True
                     
                     if current_datetime < next_allowed_entry_time:
                         remaining_cooldown = (next_allowed_entry_time - current_datetime).total_seconds()
