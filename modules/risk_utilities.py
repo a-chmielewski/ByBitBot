@@ -28,7 +28,7 @@ class RiskUtilitiesError(Exception):
     pass
 
 
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+def compute_atr(df: pd.DataFrame, period: int = 14, adaptive: bool = False) -> pd.Series:
     """
     Calculate Average True Range (ATR) for a given DataFrame.
     
@@ -41,6 +41,7 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     Args:
         df: DataFrame with 'high', 'low', 'close' columns
         period: Number of periods for ATR calculation (default: 14)
+        adaptive: If True, use adaptive smoothing for faster response to volatility spikes
     
     Returns:
         pd.Series: ATR values indexed by DataFrame index
@@ -81,10 +82,26 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
         # True Range is the maximum of the three components
         true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         
-        # ATR is the exponential moving average of True Range
-        # Use pandas ewm with alpha = 2/(period+1) for consistency with TA libraries
-        alpha = 2.0 / (period + 1)
-        atr = true_range.ewm(alpha=alpha, min_periods=period).mean()
+        if adaptive:
+            # Adaptive ATR: faster response to volatility spikes
+            # Use shorter period during high volatility periods
+            volatility_ratio = true_range / true_range.rolling(window=period).mean()
+            dynamic_period = period / (1 + volatility_ratio.fillna(1) * 0.5)
+            dynamic_period = dynamic_period.clip(lower=period//3, upper=period)
+            
+            # Calculate ATR with dynamic smoothing
+            atr = pd.Series(index=df.index, dtype=float)
+            for i in range(len(df)):
+                if i == 0:
+                    atr.iloc[i] = true_range.iloc[i]
+                else:
+                    alpha = 2.0 / (dynamic_period.iloc[i] + 1)
+                    atr.iloc[i] = alpha * true_range.iloc[i] + (1 - alpha) * atr.iloc[i-1]
+        else:
+            # ATR is the exponential moving average of True Range
+            # Use pandas ewm with alpha = 2/(period+1) for consistency with TA libraries
+            alpha = 2.0 / (period + 1)
+            atr = true_range.ewm(alpha=alpha, min_periods=period).mean()
         
         return atr
         

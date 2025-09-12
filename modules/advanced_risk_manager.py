@@ -292,8 +292,25 @@ class AdvancedRiskManager:
             # Stop-Loss Calculation
             stop_loss_price = 0.0
             if sl_config.mode == 'atr_mult':
-                atr = latest_data['atr_14'].iloc[-1]
-                offset = atr * sl_config.atr_multiplier
+                # Use higher timeframe ATR for better noise filtering
+                atr_key = 'atr_14_5m' if 'atr_14_5m' in latest_data.columns else 'atr_14'
+                atr = latest_data[atr_key].iloc[-1] if atr_key in latest_data.columns else latest_data['atr_14'].iloc[-1]
+                
+                # Dynamic multiplier based on volatility regime
+                volatility_regime = latest_data.get('volatility_regime', 'normal') if hasattr(latest_data, 'get') else 'normal'
+                if isinstance(volatility_regime, pd.Series):
+                    volatility_regime = volatility_regime.iloc[-1] if not volatility_regime.empty else 'normal'
+                
+                # Adjust multiplier based on regime
+                base_multiplier = sl_config.atr_multiplier
+                if volatility_regime == 'high':
+                    multiplier = base_multiplier * 1.3  # Wider stops in high volatility
+                elif volatility_regime == 'low':
+                    multiplier = base_multiplier * 0.9  # Slightly tighter in low volatility
+                else:
+                    multiplier = base_multiplier
+                
+                offset = atr * multiplier
             else: # fixed_pct
                 offset = entry_price * sl_config.fixed_pct
 

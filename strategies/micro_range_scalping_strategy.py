@@ -437,10 +437,27 @@ class StrategyMicroRangeScalping(StrategyTemplate):
             current_price = self.data['close'].iloc[idx]
             bars_held = idx - self.entry_bar
             
-            # Time-based exit
+            # Dynamic time-based exit with profit consideration
             max_hold_bars = self.config.get('max_hold_bars', 10)
-            if bars_held >= max_hold_bars:
-                return True, "time_exit"
+            
+            # Check current profit status
+            profit_pct = 0
+            if self.entry_price and self.entry_side:
+                if self.entry_side == 'long':
+                    profit_pct = (current_price - self.entry_price) / self.entry_price
+                else:
+                    profit_pct = (self.entry_price - current_price) / self.entry_price
+            
+            # If profitable, extend time; if not, exit earlier
+            if profit_pct > 0:
+                # Profitable - allow up to full time
+                time_limit = max_hold_bars
+            else:
+                # Unprofitable - cut time short
+                time_limit = max(3, max_hold_bars // 2)
+            
+            if bars_held >= time_limit:
+                return True, "dynamic_time_exit"
             
             # Check for range breakout (exit immediately)
             breakout, direction = self.check_range_breakout(idx)

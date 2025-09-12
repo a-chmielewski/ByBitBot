@@ -672,12 +672,23 @@ class StrategyTemplate(ABC):
             elif self.stop_loss_mode == 'atr_mult' and RISK_UTILITIES_AVAILABLE:
                 current_atr = self._get_current_atr(symbol)
                 if current_atr and current_atr > 0:
+                    # Dynamic multiplier based on volatility regime
+                    base_multiplier = self.stop_loss_atr_multiplier
+                    volatility_regime = getattr(self, 'current_volatility_regime', 'normal')
+                    
+                    if volatility_regime == 'high':
+                        adjusted_multiplier = base_multiplier * 1.3  # Wider stops in high volatility
+                    elif volatility_regime == 'low':
+                        adjusted_multiplier = base_multiplier * 0.9  # Slightly tighter in low volatility
+                    else:
+                        adjusted_multiplier = base_multiplier
+                    
                     stop_levels = atr_stop_levels(
                         entry_price=entry_price,
                         side=side.lower(),
                         atr=current_atr,
-                        atr_mult_sl=self.stop_loss_atr_multiplier,
-                        atr_mult_tp=self.stop_loss_atr_multiplier  # Use same multiplier for TP calculation, we only use SL result
+                        atr_mult_sl=adjusted_multiplier,
+                        atr_mult_tp=adjusted_multiplier  # Use same multiplier for TP calculation, we only use SL result
                     )
                     return stop_levels.get('stop_loss')
                 else:

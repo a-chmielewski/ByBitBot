@@ -602,7 +602,7 @@ class OrderManager:
                     if current_price:
                         # Check if stop-loss configuration is valid with minimum buffer
                         sl_valid = True
-                        min_buffer_pct = 0.003  # 0.3% minimum buffer (increased from 0.1%)
+                        min_buffer_pct = 0.008  # 0.8% minimum buffer (increased from 0.3%)
                         min_buffer = current_price * min_buffer_pct
                         
                         if side.lower() == 'buy':

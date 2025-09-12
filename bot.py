@@ -1659,7 +1659,8 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                 
                 if current_time < next_allowed_entry_time:
                     remaining_cooldown = (next_allowed_entry_time - current_time).total_seconds()
-                    bot_logger.debug(f"Loss cooldown active: {remaining_cooldown/60:.1f} minutes remaining")
+                    if remaining_cooldown > 60:  # Only log if more than 1 minute remaining
+                        bot_logger.debug(f"Loss cooldown active: {remaining_cooldown/60:.1f} minutes remaining")
                     continue
                 else:
                     next_allowed_entry_time = None
@@ -1873,7 +1874,7 @@ def run_trading_loop(strategy_instance, symbol, timeframe, leverage, category, d
                 
                 # Check minimum hold time before allowing exits
                 if not order_manager.can_close_position(symbol):
-                    bot_logger.debug(f"Position {symbol} in minimum hold period - skipping exit check")
+                    # Reduce frequency of this debug message
                     continue
                 
                 exit_signal = strat.check_exit(symbol=symbol)
@@ -2646,28 +2647,168 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                 bot_logger.info("STRATEGY EVALUATION CHECK COMPLETED")
                 bot_logger.info("="*60)
             
-            # Regular trading logic - check for entry
-            if not hasattr(current_strategy, 'position') or not current_strategy.position.get(symbol):
-                # Check loss cooldown before looking for entry signals
-                current_datetime = datetime.now(timezone.utc)
-                if perf_tracker.trades and perf_tracker.trades[-1].pnl < 0:
-                    if next_allowed_entry_time is None:
-                        last_trade = perf_tracker.trades[-1]
-                        exit_time = datetime.fromisoformat(last_trade.exit_timestamp.replace('Z', '+00:00')) if last_trade.exit_timestamp else datetime.now(timezone.utc)
-                        next_allowed_entry_time = exit_time + timedelta(minutes=15)
-                        cooldown_message_logged = False
-                        # if not cooldown_message_logged:
-                        #     bot_logger.info(f"❄️ Last trade was a loss (${perf_tracker.trades[-1].pnl:.2f}). Activating 15-minute cooldown until {next_allowed_entry_time.strftime('%H:%M:%S')}")
-                        #     cooldown_message_logged = True
+                # Check for early breakeven moves on existing positions
+                if hasattr(current_strategy, 'position') and current_strategy.position.get(symbol):
+                    position_data = current_strategy.position.get(symbol)
+                    if position_data and not position_data.get('breakeven_moved', False):
+                        current_price = exchange.get_current_price(symbol)
+                        if current_price:
+                            entry_price = position_data.get('entry_price', 0)
+                            side = position_data.get('side', '').lower()
+                            
+                            # Check if position is +0.5% in profit
+                            if entry_price > 0:
+                                profit_pct = 0
+                                if side == 'buy':
+                                    profit_pct = (current_price - entry_price) / entry_price
+                                elif side == 'sell':
+                                    profit_pct = (entry_price - current_price) / entry_price
+                                
+                                if profit_pct >= 0.005:  # 0.5% profit
+                                    bot_logger.info(f"Moving stop to breakeven at +{profit_pct*100:.2f}% profit")
+                                    # Move stop to breakeven
+                                    try:
+                                        order_manager.update_stop_loss(
+                                            symbol=symbol,
+                                            new_stop_price=entry_price,
+                                            reason="early_breakeven"
+                                        )
+                                        position_data['breakeven_moved'] = True
+                                    except Exception as e:
+                                        bot_logger.warning(f"Failed to move stop to breakeven: {e}")
+                                
+                                # Time-based stop tightening for small profits
+                                entry_time = position_data.get('entry_time')
+                                if entry_time and isinstance(entry_time, str):
+                                    try:
+                                        entry_dt = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
+                                        trade_duration_minutes = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 60
+                                        
+                                        # If trade is 3+ minutes old with small profit (0.2-0.8%), tighten stop
+                                        if (trade_duration_minutes >= 3 and 0.002 <= profit_pct < 0.008 and 
+                                            not position_data.get('stop_tightened', False)):
+                                            
+                                            # Tighten stop to 50% of current profit
+                                            if side == 'buy':
+                                                tight_stop = entry_price + (current_price - entry_price) * 0.5
+                                            else:
+                                                tight_stop = entry_price - (entry_price - current_price) * 0.5
+                                            
+                                            bot_logger.info(f"Tightening stop after {trade_duration_minutes:.1f}min with {profit_pct*100:.2f}% profit")
+                                            try:
+                                                order_manager.update_stop_loss(
+                                                    symbol=symbol,
+                                                    new_stop_price=tight_stop,
+                                                    reason="time_based_tightening"
+                                                )
+                                                position_data['stop_tightened'] = True
+                                            except Exception as e:
+                                                bot_logger.warning(f"Failed to tighten stop: {e}")
+                                    except Exception as e:
+                                        bot_logger.debug(f"Time-based tightening check failed: {e}")
                     
-                    if current_datetime < next_allowed_entry_time:
-                        remaining_cooldown = (next_allowed_entry_time - current_datetime).total_seconds()
-                        bot_logger.debug(f"Loss cooldown active: {remaining_cooldown/60:.1f} minutes remaining")
-                        time.sleep(5)  # Short sleep to avoid busy loop
-                        continue
-                    else:
-                        next_allowed_entry_time = None
-                        cooldown_message_logged = False
+                    # Duration-based management for existing positions
+                    if hasattr(current_strategy, 'position') and current_strategy.position.get(symbol):
+                        position_data = current_strategy.position.get(symbol)
+                        entry_time = position_data.get('entry_time')
+                        if entry_time and isinstance(entry_time, str):
+                            try:
+                                entry_dt = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
+                                trade_duration_minutes = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 60
+                                
+                                # For trend strategies: check unprofitable trades after 30 minutes
+                                if (current_strategy_name in ['StrategyEMATrendRider', 'StrategyHighVolatilityTrendRider'] and 
+                                    trade_duration_minutes >= 30 and not position_data.get('duration_check_done', False)):
+                                    
+                                    current_price = exchange.get_current_price(symbol)
+                                    if current_price and entry_price > 0:
+                                        side = position_data.get('side', '').lower()
+                                        profit_pct = 0
+                                        if side == 'buy':
+                                            profit_pct = (current_price - entry_price) / entry_price
+                                        elif side == 'sell':
+                                            profit_pct = (entry_price - current_price) / entry_price
+                                        
+                                        if profit_pct < 0.002:  # Less than 0.2% profit after 30 min
+                                            bot_logger.info(f"Trend trade unprofitable after {trade_duration_minutes:.1f}min, tightening stop")
+                                            try:
+                                                # Tighten stop to 50% of original distance
+                                                original_stop = position_data.get('stop_loss_price', 0)
+                                                if original_stop > 0:
+                                                    if side == 'buy':
+                                                        tight_stop = entry_price - (entry_price - original_stop) * 0.5
+                                                    else:
+                                                        tight_stop = entry_price + (original_stop - entry_price) * 0.5
+                                                    
+                                                    order_manager.update_stop_loss(
+                                                        symbol=symbol,
+                                                        new_stop_price=tight_stop,
+                                                        reason="duration_based_tightening"
+                                                    )
+                                            except Exception as e:
+                                                bot_logger.warning(f"Failed to tighten stop for duration: {e}")
+                                        
+                                        position_data['duration_check_done'] = True
+                                
+                                # For scalping strategies: conditional time exits based on profit
+                                scalping_strategies = ['StrategyRSIRangeScalping', 'StrategyMicroRangeScalping', 'StrategyVolatilityReversalScalping']
+                                if (current_strategy_name in scalping_strategies and 
+                                    trade_duration_minutes >= 5 and not position_data.get('time_exit_checked', False)):
+                                    
+                                    current_price = exchange.get_current_price(symbol)
+                                    if current_price and entry_price > 0:
+                                        side = position_data.get('side', '').lower()
+                                        profit_pct = 0
+                                        if side == 'buy':
+                                            profit_pct = (current_price - entry_price) / entry_price
+                                        elif side == 'sell':
+                                            profit_pct = (entry_price - current_price) / entry_price
+                                        
+                                        # If unprofitable after 5 min, exit; if profitable, extend time
+                                        if profit_pct < 0:
+                                            bot_logger.info(f"Scalp trade unprofitable after {trade_duration_minutes:.1f}min, closing")
+                                            try:
+                                                exit_signal = current_strategy.check_exit(symbol)
+                                                if not exit_signal:
+                                                    # Force exit
+                                                    current_strategy.position[symbol] = None
+                                                    order_manager.close_position(symbol, reason="time_exit_unprofitable")
+                                            except Exception as e:
+                                                bot_logger.warning(f"Failed to close unprofitable scalp: {e}")
+                                        else:
+                                            # Profitable - extend time by not setting time_exit_checked yet
+                                            if trade_duration_minutes >= 10:  # But cap at 10 minutes max
+                                                position_data['time_exit_checked'] = True
+                                        
+                                        if profit_pct < 0:  # Only mark checked if we're closing
+                                            position_data['time_exit_checked'] = True
+                                            
+                            except Exception as e:
+                                bot_logger.debug(f"Duration management check failed: {e}")
+                
+                # Regular trading logic - check for entry
+                if not hasattr(current_strategy, 'position') or not current_strategy.position.get(symbol):
+                    # Check loss cooldown before looking for entry signals
+                    current_datetime = datetime.now(timezone.utc)
+                    if perf_tracker.trades and perf_tracker.trades[-1].pnl < 0:
+                        if next_allowed_entry_time is None:
+                            last_trade = perf_tracker.trades[-1]
+                            exit_time = datetime.fromisoformat(last_trade.exit_timestamp.replace('Z', '+00:00')) if last_trade.exit_timestamp else datetime.now(timezone.utc)
+                            next_allowed_entry_time = exit_time + timedelta(minutes=15)
+                            cooldown_message_logged = False
+                            # if not cooldown_message_logged:
+                            #     bot_logger.info(f"❄️ Last trade was a loss (${perf_tracker.trades[-1].pnl:.2f}). Activating 15-minute cooldown until {next_allowed_entry_time.strftime('%H:%M:%S')}")
+                            #     cooldown_message_logged = True
+                    
+                        if current_datetime < next_allowed_entry_time:
+                            remaining_cooldown = (next_allowed_entry_time - current_datetime).total_seconds()
+                            if remaining_cooldown > 60:  # Only log if more than 1 minute remaining
+                                bot_logger.debug(f"Loss cooldown active: {remaining_cooldown/60:.1f} minutes remaining")
+                            time.sleep(5)  # Short sleep to avoid busy loop
+                            continue
+                        else:
+                            next_allowed_entry_time = None
+                            cooldown_message_logged = False
                 else:
                     next_allowed_entry_time = None
                     cooldown_message_logged = False
@@ -2945,7 +3086,7 @@ def run_trading_loop_with_auto_strategy(strategy_instance, current_strategy_clas
                 
                 # Check minimum hold time before allowing exits
                 if not order_manager.can_close_position(symbol):
-                    bot_logger.debug(f"Position {symbol} in minimum hold period - skipping exit check")
+                    # Reduce frequency of this debug message
                     continue
                 
                 exit_signal = current_strategy.check_exit(symbol)
