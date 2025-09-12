@@ -195,7 +195,7 @@ class StrategyMatrix:
             execution_timeframe='1m',
             stop_loss=StopLossConfig(mode='fixed_pct', fixed_pct=0.0005, max_loss_pct=0.001),
             take_profit=TakeProfitConfig(mode='progressive_levels', progressive_levels=[0.0015, 0.003, 0.005]),
-            trailing_stop=TrailingStopConfig(enabled=True, mode='fixed_pct', fixed_pct=0.0008, activation_pct=0.0008),
+            trailing_stop=TrailingStopConfig(enabled=True, mode='atr_mult', atr_multiplier=1.5, activation_pct=0.0008),
             position_sizing=PositionSizingConfig(mode='fixed_notional', fixed_notional=1200.0, max_position_pct=4.0),
             leverage_by_regime=LeverageByRegimeConfig(low=1.5, normal=1.3, high=1.0),
             portfolio_tags=PortfolioTagsConfig(factor='mean_reversion', correlation_group='micro_scalping'),
