@@ -84,8 +84,8 @@ class StrategyHighVolatilityTrendRider(StrategyTemplate):
         
         # ADX parameters for trend strength - Enhanced for stricter trend confirmation
         self.adx_period = strategy_specific_params.get("adx_period", 14)
-        self.adx_threshold = strategy_specific_params.get("adx_threshold", 30)  # Raised from 25 to 30 for stronger trend confirmation
-        self.adx_strong_threshold = strategy_specific_params.get("adx_strong_threshold", 35)  # Raised from 30 to 35
+        self.adx_threshold = strategy_specific_params.get("adx_threshold", 23)  
+        self.adx_strong_threshold = strategy_specific_params.get("adx_strong_threshold", 33)  
         
         # ATR parameters for volatility and stops
         self.atr_period = strategy_specific_params.get("atr_period", 14)
@@ -106,7 +106,7 @@ class StrategyHighVolatilityTrendRider(StrategyTemplate):
         
         # Volume parameters - Enhanced for stricter volume confirmation
         self.volume_period = strategy_specific_params.get("volume_period", 20)
-        self.volume_multiplier = strategy_specific_params.get("volume_multiplier", 2.0)  # Raised from 1.5 to 2.0 for stronger volume confirmation
+        self.volume_multiplier = strategy_specific_params.get("volume_multiplier", 1.5)  # Raised from 1.5 to 2.0 for stronger volume confirmation
         
         # Pullback and breakout parameters - Enhanced for deeper pullbacks
         self.pullback_bars = strategy_specific_params.get("pullback_bars", 5)

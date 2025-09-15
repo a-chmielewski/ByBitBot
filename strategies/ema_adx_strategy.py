@@ -109,7 +109,7 @@ class StrategyEMATrendRider(StrategyTemplate):
         
         # ADX parameters - Enhanced for stricter trend confirmation
         self.adx_period = strategy_specific_params.get("adx_period", 14)
-        self.adx_threshold = strategy_specific_params.get("adx_threshold", 30)  # Raised from 25 to 30 for stronger trend confirmation
+        self.adx_threshold = strategy_specific_params.get("adx_threshold", 25)  # Reverted from 30 to 25
         self.adx_strong_threshold = strategy_specific_params.get("adx_strong_threshold", 35)  # Raised from 30 to 35
         
         # RSI parameters
@@ -130,7 +130,7 @@ class StrategyEMATrendRider(StrategyTemplate):
         
         # Volume parameters - Enhanced for stricter volume confirmation
         self.volume_period = strategy_specific_params.get("volume_period", 20)
-        self.volume_spike_multiplier = strategy_specific_params.get("volume_spike_multiplier", 1.8)  # Raised from 1.2 to 1.8 for stronger volume confirmation
+        self.volume_spike_multiplier = strategy_specific_params.get("volume_spike_multiplier", 1.5)  # Raised from 1.2 to 1.5 for stronger volume confirmation
         
         # Risk parameters
         self.time_stop_bars = strategy_specific_params.get("time_stop_bars", 50)

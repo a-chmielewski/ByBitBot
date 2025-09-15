@@ -2149,10 +2149,10 @@ def check_strategy_needs_change(analysis_results: dict, selected_symbol: str, cu
     market_5min = symbol_analysis.get('5m', {}).get('market_type', 'UNKNOWN')
     market_1min = symbol_analysis.get('1m', {}).get('market_type', 'UNKNOWN')
     
-    # PERSISTENCE CHECK 1: Minimum session duration (90 minutes)
+    # PERSISTENCE CHECK 1: Minimum session duration (30 minutes)
     if session_start_time:
         session_duration = (datetime.now() - session_start_time).total_seconds() / 60  # minutes
-        min_session_duration = 90  # 90 minutes minimum
+        min_session_duration = 30  # 30 minutes minimum
         
         if session_duration < min_session_duration:
             logger_instance.info(f"Strategy persistence: Session duration {session_duration:.1f}min < {min_session_duration}min minimum. Checking for opposite conditions only...")

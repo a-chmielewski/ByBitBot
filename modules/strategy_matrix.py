@@ -115,7 +115,7 @@ class StrategyMatrix:
     STRATEGY_RISK_PROFILES = {
         'StrategyEMATrendRider': StrategyRiskProfile(
             strategy_name='StrategyEMATrendRider',
-            description='EMA Trend Rider with Enhanced ADX Filter (30+) & Volume Confirmation (1.8x) - Stable trend-following on 5m timeframe',
+            description='EMA Trend Rider with Enhanced ADX Filter (25+) & Volume Confirmation (1.5x) - Stable trend-following on 5m timeframe',
             market_type_tags=['TRENDING'],
             execution_timeframe='5m',
             stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=4.5, max_loss_pct=0.08),
@@ -220,7 +220,7 @@ class StrategyMatrix:
         
         'StrategyHighVolatilityTrendRider': StrategyRiskProfile(
             strategy_name='StrategyHighVolatilityTrendRider',
-            description='High-Volatility Trend Rider with Enhanced ADX Filter (30+) & Volume Confirmation (2.0x) for volatile trending markets',
+            description='High-Volatility Trend Rider with Enhanced ADX Filter (25+) & Volume Confirmation (1.5x) for volatile trending markets',
             market_type_tags=['HIGH_VOLATILITY', 'TRENDING'],
             execution_timeframe='1m',
             stop_loss=StopLossConfig(mode='atr_mult', atr_multiplier=3.5, max_loss_pct=0.10),
