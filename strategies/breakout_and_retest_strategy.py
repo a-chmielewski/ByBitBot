@@ -112,7 +112,7 @@ class StrategyBreakoutAndRetest(StrategyTemplate):
         
         # Breakout parameters - Enhanced for stricter breakout confirmation
         self.breakout_min_pct = strategy_specific_params.get("breakout_min_pct", 0.003)  # 0.3%
-        self.volume_breakout_multiplier = strategy_specific_params.get("volume_breakout_multiplier", 2.0)  # Raised from 1.5 to 2.0 for stronger volume confirmation
+        self.volume_breakout_multiplier = strategy_specific_params.get("volume_breakout_multiplier", 1.4)  # Reduced from 2.0 to 1.4 for less restrictive volume confirmation
         self.volume_avg_period = strategy_specific_params.get("volume_avg_period", 20)
         
         # Trend filter parameters

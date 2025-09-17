@@ -264,8 +264,15 @@ def enhanced_order_validation(
                 if expected_move_pct < min_expected_move_pct:
                     return False, {}, f"BLOCKED: Expected move ({expected_move_pct:.2f}%) too small vs fees ({min_expected_move_pct:.2f}% required)"
                 
-                # Additional check: avoid trading in extremely low volatility
-                min_volatility_threshold = 0.3  # 0.3% minimum volatility
+                # Additional check: avoid trading in extremely low volatility (strategy-dependent)
+                # Micro-range & scalping strategies need lower thresholds
+                micro_range_strategies = ['StrategyMicroRangeScalping', 'StrategyRSIRangeScalping', 'StrategyVolatilityReversalScalping']
+                
+                if any(micro_strategy in strategy_name for micro_strategy in micro_range_strategies):
+                    min_volatility_threshold = 0.15  # 0.15% for micro-range/scalping strategies
+                else:
+                    min_volatility_threshold = 0.25   # 0.25% for trend/breakout strategies
+                
                 if expected_move_pct < min_volatility_threshold:
                     return False, {}, f"BLOCKED: Market too quiet ({expected_move_pct:.2f}% < {min_volatility_threshold}%) - avoid noise trades"
                 
@@ -2161,24 +2168,25 @@ def check_strategy_needs_change(analysis_results: dict, selected_symbol: str, cu
             current_5min = last_market_conditions.get('5m') if last_market_conditions else 'UNKNOWN'
             current_1min = last_market_conditions.get('1m') if last_market_conditions else 'UNKNOWN'
             
-            # Define opposite condition pairs
-            opposite_conditions = {
-                'TRENDING': 'RANGING',
-                'RANGING': 'TRENDING',
-                'HIGH_VOLATILITY': 'LOW_VOLATILITY',
-                'LOW_VOLATILITY': 'HIGH_VOLATILITY'
+            # Define regime shift conditions (allow more transitions)
+            significant_shifts = {
+                'TRENDING': ['RANGING', 'TRANSITIONAL', 'HIGH_VOLATILITY'],
+                'RANGING': ['TRENDING', 'TRANSITIONAL', 'HIGH_VOLATILITY', 'LOW_VOLATILITY'],
+                'HIGH_VOLATILITY': ['LOW_VOLATILITY', 'RANGING', 'TRENDING'],
+                'LOW_VOLATILITY': ['HIGH_VOLATILITY', 'TRANSITIONAL', 'TRENDING'],
+                'TRANSITIONAL': ['TRENDING', 'RANGING', 'HIGH_VOLATILITY', 'LOW_VOLATILITY']
             }
             
-            # Check if 5m condition is truly opposite (more weight on 5m)
-            is_opposite_5m = (current_5min in opposite_conditions and 
-                            opposite_conditions[current_5min] == market_5min)
+            # Check if 5m condition shows significant regime shift
+            is_significant_shift = (current_5min in significant_shifts and 
+                                  market_5min in significant_shifts[current_5min])
             
-            if not is_opposite_5m:
+            if not is_significant_shift:
                 reason = f"Strategy persistence: Maintaining {current_strategy_class} (session {session_duration:.1f}min < {min_session_duration}min). Market: {market_5min}(5m) + {market_1min}(1m) not opposite to previous {current_5min}(5m) + {current_1min}(1m)"
                 logger_instance.info(reason)
                 return False, current_strategy_class, current_timeframe, reason
             else:
-                logger_instance.warning(f"Opposite condition detected: {current_5min}(5m) -> {market_5min}(5m). Allowing immediate switch despite short session.")
+                logger_instance.warning(f"Significant regime shift detected: {current_5min}(5m) -> {market_5min}(5m). Allowing immediate switch despite short session.")
     
     # PERSISTENCE CHECK 2: Confirmation filter - weight 5m conditions more heavily
     if last_market_conditions:

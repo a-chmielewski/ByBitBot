@@ -125,7 +125,7 @@ class StrategyMatrix:
             leverage_by_regime=LeverageByRegimeConfig(low=1.3, normal=1.0, high=0.7),
             portfolio_tags=PortfolioTagsConfig(factor='trend_following', correlation_group='trend_momentum'),
             trading_limits=TradingLimitsConfig(max_concurrent_trades=2, min_time_between_trades=900),
-            min_volatility_pct=0.3, max_volatility_pct=3.0
+            min_volatility_pct=0.2, max_volatility_pct=4.5
         ),
         
         'StrategyATRMomentumBreakout': StrategyRiskProfile(
@@ -140,7 +140,7 @@ class StrategyMatrix:
             leverage_by_regime=LeverageByRegimeConfig(low=1.0, normal=0.9, high=0.6),
             portfolio_tags=PortfolioTagsConfig(factor='momentum', correlation_group='high_vol_breakout'),
             trading_limits=TradingLimitsConfig(max_concurrent_trades=4, min_time_between_trades=180),
-            min_volatility_pct=1.5, max_volatility_pct=15.0
+            min_volatility_pct=1.0, max_volatility_pct=20.0
         ),
         
         'StrategyBreakoutAndRetest': StrategyRiskProfile(
@@ -155,7 +155,7 @@ class StrategyMatrix:
             leverage_by_regime=LeverageByRegimeConfig(low=1.2, normal=1.0, high=0.8),
             portfolio_tags=PortfolioTagsConfig(factor='momentum', correlation_group='breakout_momentum'),
             trading_limits=TradingLimitsConfig(max_concurrent_trades=3, min_time_between_trades=300),
-            min_volatility_pct=0.8, max_volatility_pct=8.0
+            min_volatility_pct=0.5, max_volatility_pct=12.0
         ),
         
         'StrategyRSIRangeScalping': StrategyRiskProfile(
@@ -170,7 +170,7 @@ class StrategyMatrix:
             leverage_by_regime=LeverageByRegimeConfig(low=1.4, normal=1.2, high=0.8),
             portfolio_tags=PortfolioTagsConfig(factor='mean_reversion', correlation_group='range_scalping'),
             trading_limits=TradingLimitsConfig(max_concurrent_trades=5, min_time_between_trades=120, daily_trade_limit=30),
-            min_volatility_pct=0.2, max_volatility_pct=2.5
+            min_volatility_pct=0.1, max_volatility_pct=3.5
         ),
         
         'StrategyVolatilityReversalScalping': StrategyRiskProfile(
@@ -185,7 +185,7 @@ class StrategyMatrix:
             leverage_by_regime=LeverageByRegimeConfig(low=1.1, normal=0.9, high=0.6),
             portfolio_tags=PortfolioTagsConfig(factor='mean_reversion', correlation_group='vol_reversal'),
             trading_limits=TradingLimitsConfig(max_concurrent_trades=4, min_time_between_trades=150),
-            min_volatility_pct=1.0, max_volatility_pct=12.0
+            min_volatility_pct=0.7, max_volatility_pct=18.0
         ),
         
         'StrategyMicroRangeScalping': StrategyRiskProfile(
@@ -200,7 +200,7 @@ class StrategyMatrix:
             leverage_by_regime=LeverageByRegimeConfig(low=1.5, normal=1.3, high=1.0),
             portfolio_tags=PortfolioTagsConfig(factor='mean_reversion', correlation_group='micro_scalping'),
             trading_limits=TradingLimitsConfig(max_concurrent_trades=6, min_time_between_trades=60, daily_trade_limit=40),
-            min_volatility_pct=0.1, max_volatility_pct=1.0
+            min_volatility_pct=0.05, max_volatility_pct=1.5
         ),
         
         'StrategyAdaptiveTransitionalMomentum': StrategyRiskProfile(
@@ -215,7 +215,7 @@ class StrategyMatrix:
             leverage_by_regime=LeverageByRegimeConfig(low=1.1, normal=1.0, high=0.7),
             portfolio_tags=PortfolioTagsConfig(factor='adaptive', correlation_group='transitional_momentum'),
             trading_limits=TradingLimitsConfig(max_concurrent_trades=3, min_time_between_trades=240),
-            min_volatility_pct=0.5, max_volatility_pct=8.0
+            min_volatility_pct=0.3, max_volatility_pct=12.0
         ),
         
         'StrategyHighVolatilityTrendRider': StrategyRiskProfile(
@@ -230,7 +230,7 @@ class StrategyMatrix:
             leverage_by_regime=LeverageByRegimeConfig(low=1.0, normal=0.8, high=0.5),
             portfolio_tags=PortfolioTagsConfig(factor='trend_following', correlation_group='high_vol_trend'),
             trading_limits=TradingLimitsConfig(max_concurrent_trades=2, min_time_between_trades=600),
-            min_volatility_pct=2.0, max_volatility_pct=20.0
+            min_volatility_pct=1.5, max_volatility_pct=30.0
         ),
         
         'StrategyLowVolatilityTrendPullback': StrategyRiskProfile(
@@ -245,7 +245,7 @@ class StrategyMatrix:
             leverage_by_regime=LeverageByRegimeConfig(low=1.4, normal=1.2, high=0.9),
             portfolio_tags=PortfolioTagsConfig(factor='trend_following', correlation_group='low_vol_trend'),
             trading_limits=TradingLimitsConfig(max_concurrent_trades=4, min_time_between_trades=180),
-            min_volatility_pct=0.2, max_volatility_pct=1.5
+            min_volatility_pct=0.1, max_volatility_pct=2.2
         ),
         
         'StrategyRangeBreakoutMomentum': StrategyRiskProfile(
@@ -260,7 +260,7 @@ class StrategyMatrix:
             leverage_by_regime=LeverageByRegimeConfig(low=1.2, normal=1.0, high=0.8),
             portfolio_tags=PortfolioTagsConfig(factor='momentum', correlation_group='range_breakout'),
             trading_limits=TradingLimitsConfig(max_concurrent_trades=3, min_time_between_trades=300),
-            min_volatility_pct=0.6, max_volatility_pct=6.0
+            min_volatility_pct=0.4, max_volatility_pct=9.0
         ),
         
         'StrategyVolatilitySqueezeBreakout': StrategyRiskProfile(
@@ -275,7 +275,7 @@ class StrategyMatrix:
             leverage_by_regime=LeverageByRegimeConfig(low=1.3, normal=1.1, high=0.8),
             portfolio_tags=PortfolioTagsConfig(factor='volatility', correlation_group='squeeze_breakout'),
             trading_limits=TradingLimitsConfig(max_concurrent_trades=3, min_time_between_trades=420),
-            min_volatility_pct=0.3, max_volatility_pct=4.0
+            min_volatility_pct=0.2, max_volatility_pct=6.0
         )
     }
     

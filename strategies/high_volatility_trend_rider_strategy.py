@@ -106,7 +106,7 @@ class StrategyHighVolatilityTrendRider(StrategyTemplate):
         
         # Volume parameters - Enhanced for stricter volume confirmation
         self.volume_period = strategy_specific_params.get("volume_period", 20)
-        self.volume_multiplier = strategy_specific_params.get("volume_multiplier", 1.5)  # Raised from 1.5 to 2.0 for stronger volume confirmation
+        self.volume_multiplier = strategy_specific_params.get("volume_multiplier", 1.4)  # Reduced from 1.5 to 1.4 for less restrictive volume confirmation
         
         # Pullback and breakout parameters - Enhanced for deeper pullbacks
         self.pullback_bars = strategy_specific_params.get("pullback_bars", 5)

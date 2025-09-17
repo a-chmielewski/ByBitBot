@@ -288,7 +288,7 @@ class StrategyRangeBreakoutMomentum(StrategyTemplate):
                 return True  # Assume ranging if not enough data
             
             # ADX should be low (indicating no strong trend)
-            adx_threshold = self.config.get('adx_range_threshold', 28)
+            adx_threshold = self.config.get('adx_range_threshold', 25)
             adx_condition = True
             if idx >= self.config.get('adx_period', 14):
                 adx_value = self.data['adx'].iloc[idx]
@@ -429,7 +429,7 @@ class StrategyRangeBreakoutMomentum(StrategyTemplate):
                 avg_volume = self.data['volume_sma'].iloc[idx]
                 
                 if not pd.isna(current_volume) and not pd.isna(avg_volume) and avg_volume > 0:
-                    volume_multiplier = self.config.get('volume_surge_multiplier', 1.8)  # Enhanced from 1.2 to 1.8
+                    volume_multiplier = self.config.get('volume_surge_multiplier', 1.4)  # Reduced from 1.8 to 1.4
                     volume_condition = current_volume > avg_volume * volume_multiplier
                     confirmations.append(f"Volume: {volume_condition}")
             
