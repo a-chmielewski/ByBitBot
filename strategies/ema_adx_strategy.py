@@ -130,7 +130,7 @@ class StrategyEMATrendRider(StrategyTemplate):
         
         # Volume parameters - Enhanced for stricter volume confirmation
         self.volume_period = strategy_specific_params.get("volume_period", 20)
-        self.volume_spike_multiplier = strategy_specific_params.get("volume_spike_multiplier", 1.4)  # Reduced from 1.5 to 1.4 for less restrictive volume confirmation
+        self.volume_spike_multiplier = strategy_specific_params.get("volume_spike_multiplier", 1.2)  
         
         # Risk parameters
         self.time_stop_bars = strategy_specific_params.get("time_stop_bars", 50)

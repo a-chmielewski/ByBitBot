@@ -288,7 +288,7 @@ class StrategyRangeBreakoutMomentum(StrategyTemplate):
                 return True  # Assume ranging if not enough data
             
             # ADX should be low (indicating no strong trend)
-            adx_threshold = self.config.get('adx_range_threshold', 25)
+            adx_threshold = self.config.get('adx_range_threshold', 23)
             adx_condition = True
             if idx >= self.config.get('adx_period', 14):
                 adx_value = self.data['adx'].iloc[idx]
